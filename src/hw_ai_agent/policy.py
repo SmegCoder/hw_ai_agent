@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from enum import Enum
 from fnmatch import fnmatchcase
@@ -76,6 +77,36 @@ class Policy:
             chosen = max(matches, key=lambda r: priority[r.action])
             return Decision(chosen.action, chosen.reason)
         return Decision(dict(self.defaults).get(tool, Action.DENY), f"Default permission for {tool}")
+
+    def sandbox_read_condition(self, root: Path) -> str | None:
+        rules = [r for r in self.rules if r.tool in {"*", "read_file"} and r.command is None]
+        restrictions = [r for r in rules if r.action != Action.ALLOW]
+        allowed = [r for r in rules if r.action == Action.ALLOW]
+        default = dict(self.defaults).get("read_file", Action.DENY)
+
+        def pattern(rule: Rule) -> str:
+            if rule.path == ".":
+                return f"(literal {json.dumps(str(root), ensure_ascii=False)})"
+            if rule.path is None or rule.path == "*":
+                return f"(subpath {json.dumps(str(root), ensure_ascii=False)})"
+            if any(c in rule.path for c in "[]\x00"):
+                raise PolicyError("Bash read rules support literals, '*' and '?' only; unsupported patterns fail closed")
+            relative = "".join("(.|\n)*" if c == "*" else "(.|\n)" if c == "?" else re.escape(c)
+                               for c in rule.path)
+            regex = "^" + re.escape(str(root)) + "/" + relative + "$"
+            return f"(regex {json.dumps(regex, ensure_ascii=False)})"
+
+        def any_of(items: list[str]) -> str:
+            return items[0] if len(items) == 1 else "(require-any " + " ".join(items) + ")"
+
+        conditions = [f"(subpath {json.dumps(str(root), ensure_ascii=False)})"]
+        if default != Action.ALLOW:
+            if not allowed:
+                return None
+            conditions.append(any_of([pattern(r) for r in allowed]))
+        if restrictions:
+            conditions.append("(require-not " + any_of([pattern(r) for r in restrictions]) + ")")
+        return conditions[0] if len(conditions) == 1 else "(require-all " + " ".join(conditions) + ")"
 
     @classmethod
     def from_dict(cls, data: Any) -> Policy:

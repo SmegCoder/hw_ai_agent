@@ -13,7 +13,8 @@ import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
-from .policy import Action, ApprovalRequest, Policy
+from .policy import Action, ApprovalRequest, Policy, PolicyError
+from .filesystem import TargetChangedError, capture_target, write_target
 
 class ToolError(RuntimeError):
     pass
@@ -72,13 +73,21 @@ class ToolRuntime:
         except ToolError as exc:
             self._policy_event(name, "deny", "blocked", str(exc), "runtime_boundary")
             raise
+        target = None
+        if name == "write_file":
+            try:
+                target = capture_target(self.root, self.root / path, arguments["path"])
+            except OSError:
+                raise ToolError("TARGET_CHANGED: cannot capture a stable write target") from None
         decision = self.policy.decide(name, path=path, command=command)
         if decision.action == Action.DENY:
             self._policy_event(name, "deny", "blocked", decision.reason, "policy")
             raise ToolError(f"POLICY_DENIED: {decision.reason}")
         if decision.action == Action.ASK:
             fingerprint = hashlib.sha256(json.dumps(
-                {"tool": name, "arguments": arguments}, sort_keys=True, ensure_ascii=False
+                {"tool": name, "arguments": arguments, "target": path,
+                 "file_signature": target.file_signature if target else None},
+                sort_keys=True, ensure_ascii=False
             ).encode()).hexdigest()
             preview = ""
             if name == "write_file":
@@ -105,7 +114,18 @@ class ToolRuntime:
             self._policy_event(name, "allow", "permitted", decision.reason, "policy")
         handler = self.bash if name == "Bash" else getattr(self, name)
         try:
+            if target is not None:
+                write_target(target, arguments["content"])
+                return f"wrote {len(arguments['content'])} characters to {path}"
+            if path is not None:
+                if self._safe_path(arguments.get("path", ".")).relative_to(self.root).as_posix() != path:
+                    raise ToolError("TARGET_CHANGED: path changed after permission checking")
+                # Execute against the checked canonical path, not its mutable alias.
+                arguments = {**arguments, "path": path}
             return handler(**dict(arguments))
+        except TargetChangedError:
+            self._policy_event(name, "deny", "blocked", "Write target changed", "runtime_boundary")
+            raise ToolError("TARGET_CHANGED: file or parent changed; a new request and approval are required") from None
         except (OSError, UnicodeError) as exc:
             raise ToolError(f"{name} failed: {type(exc).__name__}") from None
 
@@ -156,7 +176,10 @@ class ToolRuntime:
         candidate = Path(value)
         if candidate.is_absolute():
             raise ToolError("Absolute paths are not allowed")
-        resolved = (self.root / candidate).resolve()
+        try:
+            resolved = (self.root / candidate).resolve()
+        except (OSError, RuntimeError):
+            raise ToolError("Cannot resolve path safely") from None
         if not resolved.is_relative_to(self.root):
             raise ToolError("Path escapes the workspace")
         if protected(candidate) or protected(resolved.relative_to(self.root)):
@@ -199,8 +222,10 @@ class ToolRuntime:
             raise ToolError("Test files are read-only")
         if not isinstance(content, str) or len(content) > self.max_file_chars:
             raise ToolError("Content must be a string within the file size limit")
-        file.parent.mkdir(parents=True, exist_ok=True)
-        file.write_text(content, encoding="utf-8")
+        try:
+            write_target(capture_target(self.root, file, path), content)
+        except TargetChangedError:
+            raise ToolError("TARGET_CHANGED: cannot write the same target safely") from None
         return f"wrote {len(content)} characters to {file.relative_to(self.root)}"
 
     def _argv(self, command: str) -> list[str]:
@@ -229,16 +254,24 @@ class ToolRuntime:
     def _sandbox(self, argv: list[str]) -> list[str]:
         if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").exists():
             raise ToolError("Bash requires macOS sandbox-exec; there is no unsafe fallback")
-        quoted = lambda value: json.dumps(str(value))
+        quoted = lambda value: json.dumps(str(value), ensure_ascii=False)
         read_roots = ["/System", "/usr", "/bin", "/sbin", "/Library", "/opt", "/dev",
                       "/private/preboot",
-                      "/private/etc", "/private/var/db", str(Path(sys.executable).parent.parent), str(self.root)]
+                      "/private/etc", "/private/var/db", str(Path(sys.executable).parent.parent)]
         profile = ["(version 1)", "(allow default)", "(deny network*)",
                    "(deny file-read* file-write*)", "(allow file-read-metadata)",
                    '(allow file-read* (literal "/"))']
-        profile += [f"(allow file-read* (subpath {quoted(p)}))" for p in read_roots]
-        profile += [f"(allow file-write* (subpath {quoted(self.root)}))",
-                    '(allow file-write* (literal "/dev/null"))']
+        profile += [f"(allow file-read* (require-all (subpath {quoted(p)}) (require-not (subpath {quoted(self.root)}))))"
+                    for p in read_roots]
+        try:
+            read_condition = self.policy.sandbox_read_condition(self.root)
+        except PolicyError as exc:
+            raise ToolError(f"POLICY_DENIED: {exc}") from None
+        if read_condition:
+            profile.append(f"(allow file-read* {read_condition})")
+        # Bash never writes workspace files, even when write_file has an allow rule.
+        # Every write must pass through the explicit, approved file tool.
+        profile += ['(allow file-write* (literal "/dev/null"))']
         root_pattern = re_escape(str(self.root))
         test_pattern = root_pattern + r"/.*(test_[^/]*\.py|[^/]*_test\.py)$"
         test_dir_pattern = root_pattern + r"/(.*/)?tests(/.*)?$"
