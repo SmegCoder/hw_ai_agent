@@ -11,7 +11,7 @@ class ToolRuntimeTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name).resolve()
-        self.runtime = ToolRuntime(self.root)
+        self.runtime = ToolRuntime(self.root, approve=lambda request: True)
 
     def tearDown(self):
         self.temporary.cleanup()

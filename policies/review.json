@@ -1,0 +1,22 @@
+{
+  "defaults": {
+    "list_files": "allow",
+    "read_file": "allow",
+    "write_file": "ask",
+    "Bash": "ask"
+  },
+  "rules": [
+    {
+      "tool": "read_file",
+      "path": "private/**",
+      "action": "deny",
+      "reason": "Private files are not available to the model"
+    },
+    {
+      "tool": "Bash",
+      "command": "python -m unittest discover -v",
+      "action": "allow",
+      "reason": "Standard sandboxed test run is pre-approved"
+    }
+  ]
+}

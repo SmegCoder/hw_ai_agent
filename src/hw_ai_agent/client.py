@@ -1,4 +1,3 @@
-"""Bounded OpenAI-compatible Chat Completions transport."""
 from __future__ import annotations
 import json
 import socket

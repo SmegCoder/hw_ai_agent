@@ -40,7 +40,7 @@ class CodingAgentTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary_directory.name)
-        self.runtime = ToolRuntime(self.root)
+        self.runtime = ToolRuntime(self.root, approve=lambda request: True)
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()

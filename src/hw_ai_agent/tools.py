@@ -1,6 +1,7 @@
-"""Validated workspace tools and bounded, OS-sandboxed command execution."""
 from __future__ import annotations
 import fnmatch
+import difflib
+import hashlib
 import json
 import os
 import selectors
@@ -9,9 +10,10 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
+from .policy import Action, ApprovalRequest, Policy
 
 class ToolError(RuntimeError):
     pass
@@ -25,7 +27,10 @@ def is_test(relative: Path) -> bool:
 
 class ToolRuntime:
     def __init__(self, root: str | Path, *, command_timeout: float = 10,
-                 max_output_chars: int = 20_000, max_file_chars: int = 100_000) -> None:
+                 max_output_chars: int = 20_000, max_file_chars: int = 100_000,
+                 policy: Policy | None = None,
+                 approve: Callable[[ApprovalRequest], bool] | None = None,
+                 on_policy_event: Callable[[dict[str, Any]], None] | None = None) -> None:
         self.root = Path(root).expanduser().resolve()
         if not self.root.is_dir():
             raise ValueError(f"Workspace does not exist: {self.root}")
@@ -34,6 +39,10 @@ class ToolRuntime:
         self.command_timeout = command_timeout
         self.max_output_chars = max_output_chars
         self.max_file_chars = max_file_chars
+        self.policy = policy or Policy()
+        self.approve = approve
+        self.on_policy_event = on_policy_event
+        self.policy_events: list[dict[str, Any]] = []
 
     @property
     def tool_schemas(self) -> list[dict[str, Any]]:
@@ -53,7 +62,54 @@ class ToolRuntime:
         }} for name, description, props, required in definitions]
 
     def execute(self, name: str, arguments: Mapping[str, Any]) -> str:
+        """Single entry point for all model calls; approval is per invocation."""
         name = "Bash" if name == "bash" else name
+        # Own an immutable-value snapshot: an approval callback cannot alter the call.
+        if isinstance(arguments, Mapping):
+            arguments = dict(arguments)
+        try:
+            path, command = self._validate_call(name, arguments)
+        except ToolError as exc:
+            self._policy_event(name, "deny", "blocked", str(exc), "runtime_boundary")
+            raise
+        decision = self.policy.decide(name, path=path, command=command)
+        if decision.action == Action.DENY:
+            self._policy_event(name, "deny", "blocked", decision.reason, "policy")
+            raise ToolError(f"POLICY_DENIED: {decision.reason}")
+        if decision.action == Action.ASK:
+            fingerprint = hashlib.sha256(json.dumps(
+                {"tool": name, "arguments": arguments}, sort_keys=True, ensure_ascii=False
+            ).encode()).hexdigest()
+            preview = ""
+            if name == "write_file":
+                file = self._safe_path(arguments["path"])
+                try:
+                    original = self.read_file(arguments["path"]) if file.is_file() else ""
+                    preview = "".join(difflib.unified_diff(original.splitlines(True),
+                                arguments["content"].splitlines(True), fromfile="current", tofile="proposed"))
+                except (ToolError, OSError, UnicodeError):
+                    preview = "Existing content could not be previewed. Proposed content:\n" + arguments["content"]
+                preview = preview[:4000] + ("\n... preview truncated ..." if len(preview) > 4000 else "")
+            request = ApprovalRequest(name, path or command or ".", decision.reason, preview, fingerprint)
+            approved = False
+            try:
+                approved = self.approve is not None and self.approve(request) is True
+            except Exception:
+                # Broken approval callbacks never authorize execution.
+                approved = False
+            self._policy_event(name, "ask", "approved" if approved else "refused",
+                               decision.reason, "policy", fingerprint)
+            if not approved:
+                raise ToolError("APPROVAL_REQUIRED: operator approval was not granted")
+        else:
+            self._policy_event(name, "allow", "permitted", decision.reason, "policy")
+        handler = self.bash if name == "Bash" else getattr(self, name)
+        try:
+            return handler(**dict(arguments))
+        except (OSError, UnicodeError) as exc:
+            raise ToolError(f"{name} failed: {type(exc).__name__}") from None
+
+    def _validate_call(self, name: str, arguments: Mapping[str, Any]) -> tuple[str | None, str | None]:
         schema = next((s["function"] for s in self.tool_schemas if s["function"]["name"] == name), None)
         if schema is None:
             raise ToolError(f"Unknown tool: {name}")
@@ -68,11 +124,31 @@ class ToolRuntime:
             expected = bool if properties[key]["type"] == "boolean" else str
             if type(value) is not expected:
                 raise ToolError(f"{key} must be {properties[key]['type']}")
-        handler = self.bash if name == "Bash" else getattr(self, name)
-        try:
-            return handler(**dict(arguments))
-        except (OSError, UnicodeError) as exc:
-            raise ToolError(f"{name} failed: {type(exc).__name__}") from None
+        if name == "Bash":
+            self._argv(arguments["command"])
+            return None, shlex.join(shlex.split(arguments["command"]))
+        raw_path = arguments.get("path", ".")
+        file = self._safe_path(raw_path)
+        if name == "write_file":
+            if is_test(Path(raw_path)) or is_test(file.relative_to(self.root)):
+                raise ToolError("Test files are read-only")
+            if len(arguments["content"]) > self.max_file_chars:
+                raise ToolError("Content exceeds file size limit")
+            if file.is_dir():
+                raise ToolError("Write target is a directory")
+            if file.is_symlink() or (file.is_file() and file.stat().st_nlink > 1):
+                raise ToolError("Writing hard-linked files is not allowed")
+        return file.relative_to(self.root).as_posix(), None
+
+    def _policy_event(self, tool: str, action: str, outcome: str, reason: str,
+                      source: str, fingerprint: str | None = None) -> None:
+        event = {"event": "policy_decision", "tool": tool, "action": action,
+                 "outcome": outcome, "reason": reason, "source": source}
+        if fingerprint:
+            event["fingerprint"] = fingerprint
+        self.policy_events.append(event.copy())
+        if self.on_policy_event:
+            self.on_policy_event(event.copy())
 
     def _safe_path(self, value: str) -> Path:
         if not isinstance(value, str) or not value or "\x00" in value:

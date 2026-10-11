@@ -1,4 +1,3 @@
-"""Provider configuration and a non-executing .env reader."""
 from __future__ import annotations
 import os
 import re

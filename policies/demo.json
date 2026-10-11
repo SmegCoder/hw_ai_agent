@@ -1,0 +1,22 @@
+{
+  "defaults": {
+    "list_files": "allow",
+    "read_file": "allow",
+    "write_file": "deny",
+    "Bash": "deny"
+  },
+  "rules": [
+    {
+      "tool": "write_file",
+      "path": "order.py",
+      "action": "allow",
+      "reason": "The demo explicitly permits editing order.py only"
+    },
+    {
+      "tool": "Bash",
+      "command": "python -m unittest discover -v",
+      "action": "allow",
+      "reason": "The demo explicitly permits this sandboxed test command"
+    }
+  ]
+}

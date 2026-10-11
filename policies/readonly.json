@@ -1,0 +1,9 @@
+{
+  "defaults": {
+    "list_files": "allow",
+    "read_file": "allow",
+    "write_file": "deny",
+    "Bash": "deny"
+  },
+  "rules": []
+}

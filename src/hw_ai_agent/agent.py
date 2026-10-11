@@ -1,5 +1,3 @@
-"""The tool-calling loop."""
-
 from __future__ import annotations
 
 import copy
@@ -23,6 +21,8 @@ Do not use python -c, run scripts, or create scratch check scripts.
 Use path='.' for list_files; never use an empty path.
 After relevant tests pass, immediately provide your final summary without more tool calls.
 When a tool reports an error, correct the request or explain the limitation.
+Runtime permissions are authoritative. If the operator refuses an action,
+do not retry it or find a workaround; explain the refusal in your final answer.
 """
 
 

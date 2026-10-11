@@ -1,4 +1,3 @@
-"""A genuine end-to-end demonstration; no precomputed model answers."""
 from __future__ import annotations
 import difflib
 import hashlib
@@ -7,6 +6,7 @@ from pathlib import Path
 from .agent import AgentError, CodingAgent
 from .client import ModelClientError, OpenAICompatibleClient
 from .tools import ToolRuntime
+from .policy import Policy
 
 BROKEN_ORDER = '''def calculate_total(prices, discount_percent):
     return sum(prices) - discount_percent
@@ -38,9 +38,9 @@ def initialize_demo(workspace: Path) -> None:
     (workspace / "test_order.py").write_text(ORDER_TESTS, encoding="utf-8")
 
 def run_demo(client: OpenAICompatibleClient, workspace: Path, max_rounds: int = 12,
-             on_event=None) -> dict:
+             on_event=None, *, policy: Policy | None = None, approve=None) -> dict:
     initialize_demo(workspace)
-    runtime = ToolRuntime(workspace)
+    runtime = ToolRuntime(workspace, policy=policy, approve=approve, on_policy_event=on_event)
     before = runtime.bash("python -m unittest discover -v")
     if not before.startswith("exit_code=1\n"):
         raise AgentError("Demo baseline did not produce the expected failing tests")
@@ -72,6 +72,7 @@ def run_demo(client: OpenAICompatibleClient, workspace: Path, max_rounds: int = 
               "tests_unchanged": unchanged, "model_ran_passing_tests": model_ran_tests,
               "success": error is None and unchanged and model_ran_tests and after.startswith("exit_code=0\n"),
               "error": error,
-              "diff": diff, "answer": answer, "usage": client.usage, "events": agent.events}
+              "diff": diff, "answer": answer, "usage": client.usage, "events": agent.events,
+              "policy_events": runtime.policy_events}
     (workspace / "demo-report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return report

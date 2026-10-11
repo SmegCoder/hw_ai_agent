@@ -1,4 +1,3 @@
-"""Terminal interface for setup, diagnostics, real demos and arbitrary tasks."""
 from __future__ import annotations
 import argparse
 import getpass
@@ -14,6 +13,8 @@ from .client import ModelClientError, OpenAICompatibleClient
 from .config import ConfigurationError, PROVIDERS, Settings, load_env
 from .demo import run_demo
 from .tools import ToolError, ToolRuntime
+from .policy import ApprovalRequest, Policy, PolicyError
+from .policy_demo import run_policy_demo
 
 def show_event(event: dict) -> None:
     if event["event"] == "model_request":
@@ -22,6 +23,31 @@ def show_event(event: dict) -> None:
         print(f"\n[{event['name']}]\n{event['content']}", flush=True)
     elif event["event"] == "tool_call":
         print(f"Вызов {event['name']}: {event['arguments']}", flush=True)
+    elif event["event"] == "policy_decision":
+        print(f"Policy: {event['tool']} → {event['action']} / {event['outcome']}", flush=True)
+
+def confirm_action(request: ApprovalRequest) -> bool:
+    if not sys.stdin.isatty():
+        return False
+    # Escape terminal control characters in model-provided filenames and diffs.
+    def visible(value: str) -> str:
+        return "".join(c if c.isprintable() or c in "\n\t" else repr(c)[1:-1] for c in value)
+    print(f"\nТребуется подтверждение: {request.tool} {visible(request.target)}")
+    print(f"Причина: {visible(request.reason)}")
+    print(f"SHA-256 запроса: {request.fingerprint}")
+    if request.preview:
+        print(visible(request.preview))
+    try:
+        return input("Разрешить только этот вызов? [y/N]: ").strip().lower() in {"y", "yes", "д", "да"}
+    except EOFError:
+        return False
+
+def load_policy(path: Path | None, workspace: Path) -> Policy:
+    if path is None:
+        return Policy()
+    if path.resolve().is_relative_to(workspace.resolve()):
+        raise PolicyError("Keep policy files outside the model workspace")
+    return Policy.load(path)
 
 def setup(provider: str, model: str | None, path: Path) -> None:
     if path.exists():
@@ -73,6 +99,7 @@ def doctor(settings: Settings) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Coding agent: OpenRouter / OpenAI / Ollama")
     subparsers = parser.add_subparsers(dest="action", required=True)
+    subparsers.add_parser("policy-demo", help="Check allow/ask/deny offline, without an API key")
     for action in ("setup", "doctor", "demo", "run"):
         command = subparsers.add_parser(action)
         command.add_argument("--provider", choices=list(PROVIDERS))
@@ -82,10 +109,18 @@ def main() -> int:
             command.add_argument("--workspace", type=Path, default=None)
             command.add_argument("--max-rounds", type=int, default=12)
             command.add_argument("--max-tokens", type=int, default=2048)
+            command.add_argument("--policy", type=Path, help="Trusted JSON policy outside workspace")
+            command.add_argument("--approvals", choices=["ask", "deny"], default="ask",
+                                 help="Prompt for ask decisions, or refuse them without prompting")
         if action == "run":
             command.add_argument("request", nargs="+")
     args = parser.parse_args()
     try:
+        if args.action == "policy-demo":
+            report = run_policy_demo(show_event)
+            print(json.dumps(report["checks"], ensure_ascii=False, indent=2))
+            print("POLICY DEMO PASS" if report["success"] else "POLICY DEMO FAIL")
+            return 0 if report["success"] else 1
         if args.action == "setup":
             setup(args.provider or "openrouter", args.model, args.env_file)
             return 0
@@ -103,8 +138,10 @@ def main() -> int:
                 return 1
             workspace = args.workspace or Path("workspace") / ("demo-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
             workspace = workspace.resolve()
+            policy = load_policy(args.policy, workspace)
             print(f"Demo workspace: {workspace}")
-            report = run_demo(client, workspace, args.max_rounds, show_event)
+            report = run_demo(client, workspace, args.max_rounds, show_event,
+                              policy=policy, approve=confirm_action if args.approvals == "ask" else None)
             print("\nИзменения:\n" + report["diff"])
             print("Независимая проверка:\n" + report["verification"])
             print(f"Тесты неизменны: {report['tests_unchanged']}")
@@ -115,14 +152,16 @@ def main() -> int:
             print("DEMO PASS" if report["success"] else "DEMO FAIL")
             return 0 if report["success"] else 1
         workspace = args.workspace or Path(os.getenv("AGENT_WORKSPACE", "workspace"))
-        runtime = ToolRuntime(workspace)
+        runtime = ToolRuntime(workspace, policy=load_policy(args.policy, workspace),
+                              approve=confirm_action if args.approvals == "ask" else None,
+                              on_policy_event=show_event)
         preflight = runtime.bash("pwd")
         if not preflight.startswith("exit_code=0\n"):
             raise ToolError("Bash preflight failed")
         agent = CodingAgent(client, runtime, max_rounds=args.max_rounds, on_event=show_event)
         print(agent.run(" ".join(args.request)))
         return 0
-    except (ConfigurationError, ModelClientError, AgentError, ToolError, OSError, ValueError) as exc:
+    except (ConfigurationError, ModelClientError, AgentError, ToolError, PolicyError, OSError, ValueError) as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
         return 1
 
