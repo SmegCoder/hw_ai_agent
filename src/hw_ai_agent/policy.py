@@ -13,18 +13,23 @@ class PolicyError(ValueError):
     pass
 
 
+class ApprovalDeferred(RuntimeError):
+    """No interactive decision is available; keep the saved call waiting."""
+
+
 class Action(str, Enum):
     ALLOW = "allow"
     ASK = "ask"
     DENY = "deny"
 
 
-TOOLS = frozenset({"list_files", "read_file", "write_file", "Bash"})
-FILE_TOOLS = frozenset({"list_files", "read_file", "write_file"})
+TOOLS = frozenset({"list_files", "read_file", "write_file", "delete_file", "Bash"})
+FILE_TOOLS = frozenset({"list_files", "read_file", "write_file", "delete_file"})
 DEFAULTS = {
     "list_files": Action.ALLOW,
     "read_file": Action.ALLOW,
     "write_file": Action.ASK,
+    "delete_file": Action.ASK,
     "Bash": Action.ALLOW,
 }
 
@@ -66,12 +71,28 @@ class Policy:
     rules: tuple[Rule, ...] = ()
     # Tuple instead of a mutable dict: model calls cannot modify active rules.
     defaults: tuple[tuple[str, Action], ...] = tuple(DEFAULTS.items())
+    directory_allow: tuple[str, ...] = (".",)
+    directory_deny: tuple[str, ...] = ()
 
     def as_dict(self) -> dict:
-        return {"defaults": {tool: action.value for tool, action in self.defaults}, "rules": [
+        return {"directories": {"allow": list(self.directory_allow), "deny": list(self.directory_deny)},
+                "defaults": {tool: action.value for tool, action in self.defaults}, "rules": [
             {key: value for key, value in {"tool": r.tool, "action": r.action.value,
              "path": r.path, "command": r.command, "reason": r.reason}.items() if value is not None}
             for r in self.rules]}
+
+    def directory_allowed(self, path: str) -> bool:
+        candidate = Path(path)
+        contains = lambda directory: candidate.is_relative_to(Path(directory))
+        return any(contains(p) for p in self.directory_allow) and not any(contains(p) for p in self.directory_deny)
+
+    @classmethod
+    def restore(cls, data: dict) -> Policy:
+        if not isinstance(data, dict) or not isinstance(data.get("defaults", {}), dict):
+            return cls.from_dict(data)
+        if "delete_file" not in data.get("defaults", {}):
+            data = {**data, "defaults": {**data.get("defaults", {}), "delete_file": "deny"}}
+        return cls.from_dict(data)
 
     def decide(self, tool: str, *, path: str | None = None,
                command: str | None = None) -> Decision:
@@ -106,7 +127,13 @@ class Policy:
         def any_of(items: list[str]) -> str:
             return items[0] if len(items) == 1 else "(require-any " + " ".join(items) + ")"
 
-        conditions = [f"(subpath {json.dumps(str(root), ensure_ascii=False)})"]
+        if not self.directory_allow:
+            return None
+        conditions = [any_of([f"(subpath {json.dumps(str(root / p), ensure_ascii=False)})"
+                              for p in self.directory_allow])]
+        if self.directory_deny:
+            conditions.append("(require-not " + any_of([
+                f"(subpath {json.dumps(str(root / p), ensure_ascii=False)})" for p in self.directory_deny]) + ")")
         if default != Action.ALLOW:
             if not allowed:
                 return None
@@ -117,8 +144,22 @@ class Policy:
 
     @classmethod
     def from_dict(cls, data: Any) -> Policy:
-        if not isinstance(data, dict) or set(data) - {"defaults", "rules"}:
-            raise PolicyError("Policy must contain only defaults and rules")
+        if not isinstance(data, dict) or set(data) - {"defaults", "rules", "directories"}:
+            raise PolicyError("Policy must contain only defaults, rules and directories")
+        directories = data.get("directories", {"allow": ["."], "deny": []})
+        if not isinstance(directories, dict) or set(directories) - {"allow", "deny"}:
+            raise PolicyError("Directories must contain allow and deny lists")
+        paths = {}
+        for kind in ("allow", "deny"):
+            values = directories.get(kind, [])
+            if not isinstance(values, list) or len(values) > 100:
+                raise PolicyError("Directory rules must be lists of at most 100 paths")
+            for value in values:
+                if (not isinstance(value, str) or not value or len(value) > 1000 or
+                        any(c in value for c in "\x00*?[]") or Path(value).is_absolute() or
+                        ".." in Path(value).parts):
+                    raise PolicyError("Directories must be relative workspace paths without patterns or '..'")
+            paths[kind] = tuple(Path(value).as_posix() for value in values)
         defaults = data.get("defaults", {})
         if not isinstance(defaults, dict) or set(defaults) - TOOLS:
             raise PolicyError("Invalid defaults or unknown tool")
@@ -155,7 +196,7 @@ class Policy:
                 raise PolicyError("Rule paths must be relative to workspace without '..'")
             rules.append(Rule(tool, action, item.get("path"), item.get("command"),
                               item.get("reason", "Matched permission rule")))
-        return cls(tuple(rules), tuple(configured.items()))
+        return cls(tuple(rules), tuple(configured.items()), paths["allow"], paths["deny"])
 
     @classmethod
     def load(cls, path: Path) -> Policy:

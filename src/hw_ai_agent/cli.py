@@ -14,7 +14,8 @@ from .client import ModelClientError, OpenAICompatibleClient
 from .config import ConfigurationError, PROVIDERS, Settings, load_env
 from .demo import run_demo, verify_demo
 from .tools import ToolError, ToolRuntime
-from .policy import ApprovalRequest, Policy, PolicyError
+from .filesystem import open_read_file
+from .policy import ApprovalDeferred, ApprovalRequest, Policy, PolicyError
 from .policy_demo import run_policy_demo
 from .session import SessionError, SessionStore
 from .session_demo import run_session_demo
@@ -36,7 +37,7 @@ def show_event(event: dict) -> None:
 
 def confirm_action(request: ApprovalRequest) -> bool:
     if not sys.stdin.isatty():
-        return False
+        raise ApprovalDeferred("Подтверждение требует интерактивного терминала; продолжите эту сессию через resume")
 
     # Escape terminal control characters in model-provided filenames and diffs.
     def visible(value: str) -> str:
@@ -51,7 +52,7 @@ def confirm_action(request: ApprovalRequest) -> bool:
                     if request.scope == "session" else "Разрешить только этот вызов? [y/N]: ")
         return input(question).strip().lower() in {"y", "yes", "д", "да"}
     except EOFError:
-        return False
+        raise ApprovalDeferred("Ответ не получен; продолжите эту сессию через resume") from None
 
 def event_listener(stop_after_tools=None):
     if stop_after_tools is None:
@@ -136,6 +137,10 @@ def report_workflow(report):
     print("\nНезависимая проверка:\n" + report["verification"])
     print("Запросы разрешений: " + json.dumps(report["permission_requests"], ensure_ascii=False))
     print("Попытки записи: " + json.dumps(report["write_attempts"], ensure_ascii=False))
+    print(f"Функциональные тесты: {report['functional_success']}; оптимизация: {report['cleanup_complete']}")
+    print("Убраны неиспользуемые файлы: " + json.dumps(report["removed_optional_files"], ensure_ascii=False))
+    if report.get("error"):
+        print("Ошибка модели: " + report["error"])
     print(f"Отчёт: {Path(report['workspace']) / 'workflow-report.json'}")
     print("WORKFLOW DEMO PASS" if report["success"] else "WORKFLOW DEMO FAIL")
     return 0 if report["success"] else 1
@@ -149,8 +154,8 @@ def saved_runtime(state, db_path: Path, approvals=None, on_event=show_event):
     if policy_path:
         policy = load_policy(Path(policy_path) if policy_path else None, workspace)
     else:
-        policy = Policy.from_dict(metadata["policy"])
-    if policy.as_dict() != metadata["policy"]:
+        policy = Policy.restore(metadata["policy"])
+    if policy.as_dict() != Policy.restore(metadata["policy"]).as_dict():
         raise SessionError("Policy changed since the checkpoint; continuation was refused")
     limits = metadata.get("runtime_limits", {})
     if set(limits) != {"command_timeout", "max_output_chars", "max_file_chars"}:
@@ -160,6 +165,7 @@ def saved_runtime(state, db_path: Path, approvals=None, on_event=show_event):
         raise SessionError("Invalid saved runtime limits")
     mode = approvals or metadata.get("approvals", "ask")
     return ToolRuntime(workspace, policy=policy, mode=metadata.get("execution_mode", "safe"),
+                       trash_dir=metadata.get("trash_dir", str(db_path.resolve().parent / "trash")),
                        approve=confirm_action if mode == "ask" else None,
                        on_policy_event=on_event, **limits)
 
@@ -168,7 +174,11 @@ def verify_applied(runtime, item):
         arguments = json.loads(item["call"]["function"]["arguments"])
         expected = arguments["content"].encode("utf-8")
         path = runtime._safe_path(arguments["path"])
-        return path.is_file() and path.stat().st_size == len(expected) and path.read_bytes() == expected
+        with open_read_file(runtime.root, path) as descriptor:
+            if os.fstat(descriptor).st_size != len(expected):
+                return False
+            with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                return stream.read(len(expected) + 1) == expected
     except (ValueError, KeyError, TypeError, AttributeError, ToolError, OSError):
         return False
 
@@ -195,16 +205,22 @@ def session_command(args):
                 "unfinished_calls": calls}, ensure_ascii=False, indent=2))
             return 0
         listener = event_listener(getattr(args, "stop_after_tools", None))
-        runtime = saved_runtime(state, store.path, getattr(args, "approvals", None), listener)
         if args.action == "resolve":
-            store.resolve(args.session_id, args.call, args.resolution, lambda item: verify_applied(runtime, item))
+            verifier = None
+            if args.resolution == "applied":
+                runtime = saved_runtime(state, store.path, on_event=listener)
+                verifier = lambda item: verify_applied(runtime, item)
+            store.resolve(args.session_id, args.call, args.resolution, verifier)
             if args.resolution == "abort":
                 print("Сессия завершена с ошибкой по решению пользователя. Продолжение запрещено.")
                 return 1
             print("Решение сохранено. Продолжение: hw-ai-agent resume " + args.session_id)
             return 0
+        if state.status == "aborted":
+            raise SessionError("This session was terminated by the operator and cannot be resumed")
+        runtime = saved_runtime(state, store.path, getattr(args, "approvals", None), listener)
         metadata = state.metadata
-        if metadata.get("kind") == "workflow":
+        if metadata.get("kind") == "workflow" and metadata.get("provider") not in PROVIDERS:
             agent = CodingAgent(WorkflowClient(), runtime, store=store, on_event=listener)
             agent.resume(args.session_id)
             return report_workflow(verify_workflow(agent, runtime, metadata))
@@ -216,6 +232,8 @@ def session_command(args):
                                         max_tokens=metadata["max_tokens"])
         agent = CodingAgent(client, runtime, store=store, on_event=listener)
         answer = agent.resume(args.session_id)
+        if metadata.get("kind") == "workflow":
+            return report_workflow(verify_workflow(agent, runtime, metadata))
         if metadata.get("kind") == "demo":
             demo = metadata["demo"]
             report = verify_demo(client, runtime.root, runtime, demo["baseline"], demo["test_hash"],
@@ -229,7 +247,13 @@ def main() -> int:
     subparsers = parser.add_subparsers(dest="action", required=True)
     subparsers.add_parser("policy-demo", help="Check allow/ask/deny offline, without an API key")
     subparsers.add_parser("session-demo", help="Interrupt and resume a scripted session without an API key")
-    workflow = subparsers.add_parser("workflow-demo", help="Multi-file permissions and recovery demo, without an API key")
+    workflow = subparsers.add_parser("workflow-demo", help="Real-model multi-file optimization demo; --offline for scripted recovery")
+    workflow.add_argument("--offline", action="store_true", help="Use the small deterministic recovery scenario without a model")
+    workflow.add_argument("--provider", choices=list(PROVIDERS))
+    workflow.add_argument("--model")
+    workflow.add_argument("--env-file", type=Path, default=Path(".env"))
+    workflow.add_argument("--max-rounds", type=int, default=20)
+    workflow.add_argument("--max-tokens", type=int, default=2048)
     workflow.add_argument("--mode", choices=["safe", "auto"], default="safe")
     workflow.add_argument("--approvals", choices=["ask", "deny"], default="ask")
     workflow.add_argument("--state-db", type=Path, default=Path(".agent/sessions.sqlite3"))
@@ -284,11 +308,22 @@ def main() -> int:
             print("POLICY DEMO PASS" if report["success"] else "POLICY DEMO FAIL")
             return 0 if report["success"] else 1
         if args.action == "workflow-demo":
+            if args.max_rounds < 1 or args.max_tokens < 1:
+                raise ConfigurationError("Limits must be positive")
+            client = None
+            if not args.offline:
+                load_env(args.env_file)
+                settings = Settings.from_env(args.provider, args.model)
+                if not doctor(settings):
+                    return 1
+                client = OpenAICompatibleClient(settings, timeout=180 if settings.provider == "ollama" else 90,
+                                                max_tokens=args.max_tokens)
             workspace = (args.workspace or Path("workspace") / ("workflow-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"))).resolve()
             print(f"Demo workspace: {workspace}", flush=True)
             report = run_workflow_demo(workspace, args.state_db, mode=args.mode,
                 approve=confirm_action if args.approvals == "ask" else None, approvals=args.approvals,
-                on_event=event_listener(args.stop_after_tools), crash_after_write=args.crash_after_write)
+                on_event=event_listener(args.stop_after_tools), crash_after_write=args.crash_after_write,
+                client=client, max_rounds=args.max_rounds)
             return report_workflow(report)
         if args.action == "setup":
             setup(args.provider or "openrouter", args.model, args.env_file)
@@ -318,10 +353,12 @@ def main() -> int:
                     raise SessionError("Session database must be outside workspace")
                 report = run_demo(client, workspace, args.max_rounds, listener,
                     policy=policy, approve=confirm_action if args.approvals == "ask" else None,
-                    store=store, session_metadata=metadata, mode=args.mode)
+                    store=store, session_metadata=metadata, mode=args.mode,
+                    trash_dir=args.state_db.resolve().parent / "trash")
             return report_demo(report)
         workspace = args.workspace or Path(os.getenv("AGENT_WORKSPACE", "workspace"))
         runtime = ToolRuntime(workspace, policy=load_policy(args.policy, workspace), mode=args.mode,
+                              trash_dir=args.state_db.resolve().parent / "trash",
                               approve=confirm_action if args.approvals == "ask" else None,
                               on_policy_event=listener)
         preflight = runtime.bash("pwd")
@@ -335,6 +372,9 @@ def main() -> int:
                                 store=store, session_metadata=metadata)
             print(agent.run(" ".join(args.request)))
         return 0
+    except ApprovalDeferred as exc:
+        print(f"\nОжидается подтверждение: {exc}", file=sys.stderr)
+        return 130
     except KeyboardInterrupt:
         print("\nРабота остановлена. Найдите ID через hw-ai-agent sessions и продолжите через resume.", file=sys.stderr)
         return 130

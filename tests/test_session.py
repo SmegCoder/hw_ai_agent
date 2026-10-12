@@ -60,7 +60,8 @@ class SessionTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def runtime(self, **kwargs):
-        return CountingRuntime(self.workspace, policy=kwargs.pop("policy", self.policy), **kwargs)
+        return CountingRuntime(self.workspace, policy=kwargs.pop("policy", self.policy), mode=kwargs.pop("mode", "auto"),
+                               approve=kwargs.pop("approve", lambda request: True), **kwargs)
 
     def interrupted_after_write(self):
         def interrupt(event):
@@ -74,7 +75,7 @@ class SessionTests(unittest.TestCase):
         return first.session_id
 
     def uncertain_write(self, policy=None, approve=None):
-        runtime = self.runtime(policy=policy or self.policy, approve=approve)
+        runtime = self.runtime(policy=policy or self.policy, approve=approve or (lambda request: True), mode="safe" if approve else "auto")
         def execute_then_die(name, arguments):
             ToolRuntime.execute(runtime, name, arguments)
             raise KeyboardInterrupt
@@ -140,13 +141,13 @@ class SessionTests(unittest.TestCase):
             self.store.resolve(session_id, "1:0", "applied", lambda item: False)
         self.assertEqual(self.store.calls(session_id, True)[0]["state"], "running")
 
-    def test_explicit_retry_keeps_session_approval(self):
+    def test_explicit_retry_requires_new_approval_in_safe(self):
         session_id = self.uncertain_write(policy=Policy(), approve=lambda request: True)
         self.store.resolve(session_id, "1:0", "retry")
         requested = []
-        runtime = self.runtime(policy=Policy(), approve=lambda request: requested.append(request) or True)
+        runtime = self.runtime(policy=Policy(), mode="safe", approve=lambda request: requested.append(request) or True)
         self.assertEqual(CodingAgent(Client({"content": "Done"}), runtime, store=self.store).resume(session_id), "Done")
-        self.assertEqual(len(requested), 0)
+        self.assertEqual(len(requested), 1)
         self.assertEqual(runtime.executions, ["write_file"])
 
     def test_skip_resolution_returns_error_to_model(self):
@@ -260,7 +261,7 @@ class Client:
     def complete(self,messages,tools):
         return {"tool_calls":[{"id":"write","function":{"name":"write_file","arguments":json.dumps({"path":"order.py","content":"effect"})}}]}
 with SessionStore(sys.argv[2]) as store:
-    CodingAgent(Client(),Runtime(sys.argv[1],policy=Policy.from_dict({"defaults":{"write_file":"allow"}})),store=store).run("Task")
+    CodingAgent(Client(),Runtime(sys.argv[1],policy=Policy.from_dict({"defaults":{"write_file":"allow"}}),mode="auto",approve=lambda request: True),store=store).run("Task")
 '''
         env = os.environ.copy()
         env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
@@ -352,7 +353,7 @@ class SessionDemoTests(unittest.TestCase):
                 return c
             first_argv = ["hw-ai-agent", "run", "--provider", "ollama", "--model", "test-model",
                 "--workspace", str(workspace), "--state-db", str(db), "--policy", str(policy_file),
-                "--approvals", "deny", "--stop-after-tools", "1", "Fix order"]
+                "--mode", "auto", "--stop-after-tools", "1", "Fix order"]
             with patch("sys.argv", first_argv), patch("hw_ai_agent.cli.OpenAICompatibleClient", side_effect=fake_client), \
                  redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                 self.assertEqual(main(), 130)
@@ -364,6 +365,7 @@ class SessionDemoTests(unittest.TestCase):
                 c.settings, c.max_tokens, c.usage = settings, kwargs["max_tokens"], []
                 return c
             with patch("sys.argv", ["hw-ai-agent", "resume", session_id, "--state-db", str(db)]), \
+                 patch("hw_ai_agent.cli.confirm_action", return_value=True), \
                  patch("hw_ai_agent.cli.OpenAICompatibleClient", side_effect=final_client), \
                  redirect_stdout(io.StringIO()):
                 self.assertEqual(main(), 0)

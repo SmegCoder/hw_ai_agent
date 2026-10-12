@@ -3,7 +3,8 @@
     "list_files": "allow",
     "read_file": "allow",
     "write_file": "ask",
-    "Bash": "ask"
+    "delete_file": "ask",
+    "Bash": "deny"
   },
   "rules": [
     {
@@ -17,6 +18,34 @@
       "command": "python -m unittest discover -v",
       "action": "allow",
       "reason": "Standard sandboxed test run is pre-approved"
+    },
+    {
+      "tool": "Bash",
+      "command": "pwd",
+      "action": "allow"
+    },
+    {
+      "tool": "Bash",
+      "command": "ls",
+      "action": "allow"
+    },
+    {
+      "tool": "Bash",
+      "command": "cat order.py",
+      "action": "allow"
+    },
+    {
+      "tool": "Bash",
+      "command": "sleep 0",
+      "action": "deny"
     }
-  ]
+  ],
+  "directories": {
+    "allow": [
+      "."
+    ],
+    "deny": [
+      "private"
+    ]
+  }
 }

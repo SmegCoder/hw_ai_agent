@@ -3,6 +3,7 @@
     "list_files": "allow",
     "read_file": "allow",
     "write_file": "deny",
+    "delete_file": "deny",
     "Bash": "deny"
   },
   "rules": [
@@ -17,6 +18,20 @@
       "command": "python -m unittest discover -v",
       "action": "allow",
       "reason": "The demo explicitly permits this sandboxed test command"
+    },
+    {
+      "tool": "Bash",
+      "command": "sleep 0",
+      "action": "deny",
+      "reason": "Only the exact test command is allowed in this profile"
     }
-  ]
+  ],
+  "directories": {
+    "allow": [
+      "."
+    ],
+    "deny": [
+      "private"
+    ]
+  }
 }

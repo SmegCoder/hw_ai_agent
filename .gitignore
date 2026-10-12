@@ -14,4 +14,4 @@ build/
 workspace/demo-*/
 workspace/workflow-*/
 .agent/
-
+.DS_Store

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from contextlib import redirect_stdout, redirect_stderr
 from unittest.mock import Mock, patch
 
 from hw_ai_agent.agent import CodingAgent
@@ -58,15 +60,15 @@ class ModeSessionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.runtime(mode="unknown")
 
-    def test_safe_asks_once_per_tool_for_multiple_files_and_commands(self):
+    def test_safe_asks_for_every_file_and_command(self):
         approve = Mock(return_value=True)
         runtime = self.runtime(approve=approve)
         client = Client({"tool_calls": [write("a"), write("b"),
                         call("ls", "Bash", {"command": "ls"}),
                         call("pwd", "bash", {"command": "pwd"})]}, {"content": "done"})
         CodingAgent(client, runtime, store=self.store).run("Task")
-        self.assertEqual([c.args[0].tool for c in approve.call_args_list], ["write_file", "Bash"])
-        self.assertTrue(all(c.args[0].scope == "session" for c in approve.call_args_list))
+        self.assertEqual([c.args[0].tool for c in approve.call_args_list], ["write_file", "write_file", "Bash", "Bash"])
+        self.assertTrue(all(c.args[0].scope == "call" for c in approve.call_args_list))
         self.assertEqual(runtime.bash.call_count, 2)
         self.assertTrue((self.workspace / "b.py").exists())
 
@@ -89,14 +91,15 @@ class ModeSessionTests(unittest.TestCase):
         self.assertEqual(runtime.session_permissions, set())
         self.assertFalse((self.workspace / "a.py").exists())
 
-    def test_auto_runs_without_confirmation(self):
-        approve = Mock(side_effect=AssertionError("No prompt expected"))
+    def test_auto_runs_write_and_bash_without_confirmation(self):
+        approve = Mock(return_value=True)
         runtime = self.runtime(mode="auto", approve=approve)
-        CodingAgent(Client({"tool_calls": [write("a"), call("cmd", "Bash", {"command": "pwd"})]},
+        CodingAgent(Client({"tool_calls": [write("a"), write("b"), call("cmd", "Bash", {"command": "pwd"}),
+                                          call("other", "Bash", {"command": "ls"})]},
                            {"content": "done"}), runtime, store=self.store).run("Task")
         approve.assert_not_called()
         self.assertTrue((self.workspace / "a.py").exists())
-        runtime.bash.assert_called_once()
+        self.assertEqual(runtime.bash.call_count, 2)
 
     def test_auto_and_grants_do_not_override_policy_deny(self):
         for mode in ("safe", "auto"):
@@ -121,7 +124,7 @@ class ModeSessionTests(unittest.TestCase):
         with self.assertRaisesRegex(ToolError, "APPROVAL_REQUIRED"):
             runtime.execute("read_file", {"path": "private.py"})
 
-    def test_resume_restores_permission_without_prompt(self):
+    def test_safe_resume_requires_fresh_permission(self):
         def stop(event):
             if event["event"] == "tool_result":
                 raise KeyboardInterrupt
@@ -131,14 +134,29 @@ class ModeSessionTests(unittest.TestCase):
             first.run("Task")
         approve = Mock(return_value=False)
         CodingAgent(Client({"content": "done"}), self.runtime(approve=approve), store=self.store).resume(first.session_id)
-        approve.assert_not_called()
-        self.assertEqual((self.workspace / "b.py").read_text(), "fixed")
+        approve.assert_called_once()
+        self.assertFalse((self.workspace / "b.py").exists())
 
     def test_resume_refuses_execution_mode_change(self):
         first = CodingAgent(Client({"content": "done"}), self.runtime(mode="safe"), store=self.store)
         first.run("Task")
         with self.assertRaises(SessionError):
             CodingAgent(Client(), self.runtime(mode="auto"), store=self.store).resume(first.session_id)
+
+    def test_safe_resume_requires_fresh_bash_permission(self):
+        def stop(event):
+            if event["event"] == "tool_result":
+                raise KeyboardInterrupt
+        first = CodingAgent(Client({"tool_calls": [call("ls", "Bash", {"command": "ls"}),
+                                                  call("pwd", "Bash", {"command": "pwd"})]}),
+                            self.runtime(approve=lambda request: True), store=self.store, on_event=stop)
+        with self.assertRaises(KeyboardInterrupt):
+            first.run("Task")
+        approve = Mock(return_value=False)
+        runtime = self.runtime(approve=approve)
+        CodingAgent(Client({"content": "done"}), runtime, store=self.store).resume(first.session_id)
+        approve.assert_called_once()
+        runtime.bash.assert_not_called()
 
     def test_legacy_single_call_permission_is_not_promoted_to_session_grant(self):
         runtime = self.runtime(approve=lambda request: False)
@@ -150,7 +168,7 @@ class ModeSessionTests(unittest.TestCase):
         self.assertFalse((self.workspace / "a.py").exists())
 
     def uncertain(self, tool="write_file"):
-        runtime = self.runtime(mode="auto")
+        runtime = self.runtime(mode="auto", approve=lambda request: True)
         original = runtime.execute
         def execute_then_interrupt(name, arguments):
             original(name, arguments)
@@ -192,25 +210,40 @@ class ModeSessionTests(unittest.TestCase):
         with self.assertRaisesRegex(SessionError, "retry contract"):
             self.store.resolve(session_id, "1:0", "retry")
 
+    def test_cli_abort_works_without_workspace_and_returns_error(self):
+        from hw_ai_agent.cli import main
+        session_id = self.uncertain()
+        self.workspace.rename(self.root / "moved-workspace")
+        with patch("sys.argv", ["hw-ai-agent", "resolve", session_id, "--state-db", str(self.store.path),
+                                "--call", "1:0", "--resolution", "abort"]), redirect_stdout(io.StringIO()):
+            self.assertEqual(main(), 1)
+        self.assertEqual(self.store.get(session_id).status, "aborted")
+        with patch("sys.argv", ["hw-ai-agent", "resume", session_id, "--state-db", str(self.store.path)]), \
+             redirect_stderr(io.StringIO()) as output:
+            self.assertEqual(main(), 1)
+        self.assertIn("terminated", output.getvalue())
+
 
 @unittest.skipUnless(os.getenv("REQUIRE_SANDBOX_TESTS") == "1", "Requires native macOS sandbox")
 class WorkflowIntegrationTests(unittest.TestCase):
-    def test_safe_multifile_demo_asks_twice(self):
+    def test_safe_multifile_demo_asks_for_each_action(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             approve = Mock(return_value=True)
             report = run_workflow_demo(root / "workspace", root / ".agent/state.sqlite3", approve=approve)
             self.assertTrue(report["success"])
-            self.assertEqual(report["permission_requests"], {"write_file": 1, "Bash": 1})
-            self.assertEqual(approve.call_count, 2)
+            self.assertEqual(report["permission_requests"], {"write_file": 2, "Bash": 2})
+            self.assertEqual(approve.call_count, 4)
             self.assertEqual(report["write_attempts"], {"tax.py": 1, "receipt.py": 1})
 
     def test_auto_multifile_demo_does_not_prompt(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            report = run_workflow_demo(root / "workspace", root / ".agent/state.sqlite3", mode="auto")
+            approve = Mock(return_value=True)
+            report = run_workflow_demo(root / "workspace", root / ".agent/state.sqlite3", mode="auto", approve=approve)
             self.assertTrue(report["success"])
             self.assertEqual(report["permission_requests"], {})
+            approve.assert_not_called()
 
     def test_real_process_crash_and_all_three_resolutions(self):
         for resolution in ("retry", "skip", "abort"):
@@ -219,9 +252,10 @@ class WorkflowIntegrationTests(unittest.TestCase):
                 workspace, db = root / "workspace", root / ".agent/state.sqlite3"
                 env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
                 def cli(*args):
-                    return subprocess.run([sys.executable, "-m", "hw_ai_agent.cli", *args],
+                    script = "import hw_ai_agent.cli as cli; cli.confirm_action=lambda request: True; raise SystemExit(cli.main())"
+                    return subprocess.run([sys.executable, "-c", script, *args],
                                           cwd=root, env=env, capture_output=True, text=True, timeout=20)
-                crashed = cli("workflow-demo", "--mode", "auto", "--workspace", str(workspace),
+                crashed = cli("workflow-demo", "--offline", "--mode", "auto", "--workspace", str(workspace),
                               "--state-db", str(db), "--crash-after-write")
                 self.assertEqual(crashed.returncode, 86, crashed.stderr)
                 self.assertEqual((workspace / "tax.py").read_text(), FIXED_TAX)

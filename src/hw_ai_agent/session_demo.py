@@ -54,7 +54,7 @@ def run_session_demo(on_event=None):
                 raise KeyboardInterrupt
         db = root / ".agent/sessions.sqlite3"
         with SessionStore(db) as store:
-            first_runtime = CountingRuntime(workspace, policy=policy)
+            first_runtime = CountingRuntime(workspace, policy=policy, approve=lambda request: True)
             first = CodingAgent(FirstClient(), first_runtime, store=store, on_event=interrupt)
             try:
                 first.run("Fix discount and run tests")
@@ -64,7 +64,7 @@ def run_session_demo(on_event=None):
             interrupted = store.get(session_id).status == "interrupted"
         # New store, client and runtime: no in-memory history is used for continuation.
         with SessionStore(db) as store:
-            resumed_runtime = CountingRuntime(workspace, policy=policy)
+            resumed_runtime = CountingRuntime(workspace, policy=policy, approve=lambda request: True)
             resumed = CodingAgent(ResumedClient(), resumed_runtime, store=store, on_event=on_event)
             result = resumed.resume(session_id)
             checks = {"Session interrupted after saved write": interrupted,

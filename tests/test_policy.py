@@ -112,7 +112,7 @@ class RuntimePolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(ToolError, "APPROVAL_REQUIRED"):
             runtime.execute("write_file", {"path": "order.py", "content": "changed"})
 
-    def test_approval_is_not_reused_for_later_write(self):
+    def test_standalone_runtime_approval_is_per_call(self):
         approve = Mock(side_effect=[True, False])
         runtime = ToolRuntime(self.root, approve=approve)
         runtime.execute("write_file", {"path": "order.py", "content": "first"})
@@ -192,10 +192,11 @@ class RuntimePolicyTests(unittest.TestCase):
 class TerminalApprovalTests(unittest.TestCase):
     def test_noninteractive_input_never_prompts(self):
         from hw_ai_agent.cli import confirm_action
-        from hw_ai_agent.policy import ApprovalRequest
+        from hw_ai_agent.policy import ApprovalDeferred, ApprovalRequest
         request = ApprovalRequest("write_file", "order.py", "ask", "diff", "fingerprint")
         with patch("hw_ai_agent.cli.sys.stdin.isatty", return_value=False), patch("builtins.input") as prompt:
-            self.assertFalse(confirm_action(request))
+            with self.assertRaises(ApprovalDeferred):
+                confirm_action(request)
         prompt.assert_not_called()
 
     def test_policy_inside_workspace_is_rejected(self):

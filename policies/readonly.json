@@ -3,7 +3,16 @@
     "list_files": "allow",
     "read_file": "allow",
     "write_file": "deny",
+    "delete_file": "deny",
     "Bash": "deny"
   },
-  "rules": []
+  "rules": [],
+  "directories": {
+    "allow": [
+      "."
+    ],
+    "deny": [
+      "private"
+    ]
+  }
 }

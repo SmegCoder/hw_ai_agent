@@ -1,0 +1,127 @@
+{
+  "workspace": "workspace/demo",
+  "session_id": "e9ac7380a4054564814077479e2445c5",
+  "mode": "safe",
+  "baseline": "exit_code=1\ntest_receipt (test_checkout.CheckoutTests.test_receipt) ... FAIL\ntest_tax (test_checkout.CheckoutTests.test_tax) ... FAIL\n\n======================================================================\nFAIL: test_receipt (test_checkout.CheckoutTests.test_receipt)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"workspace/demo/test_checkout.py\", line 10, in test_receipt\n    self.assertEqual(receipt_total([10, 20, 30]), 60)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: 3 != 60\n\n======================================================================\nFAIL: test_tax (test_checkout.CheckoutTests.test_tax)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"workspace/demo/test_checkout.py\", line 7, in test_tax\n    self.assertAlmostEqual(add_tax(50), 60)\n    ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^\nAssertionError: 70 != 60 within 7 places (10 difference)\n\n----------------------------------------------------------------------\nRan 2 tests in 0.000s\n\nFAILED (failures=2)",
+  "verification": "exit_code=0\ntest_receipt (test_checkout.CheckoutTests.test_receipt) ... ok\ntest_tax (test_checkout.CheckoutTests.test_tax) ... ok\n\n----------------------------------------------------------------------\nRan 2 tests in 0.000s\n\nOK",
+  "tests_unchanged": true,
+  "success": true,
+  "permission_requests": {
+    "write_file": 1,
+    "Bash": 1
+  },
+  "write_attempts": {
+    "tax.py": 1,
+    "receipt.py": 1
+  },
+  "events": [
+    {
+      "event": "session_created",
+      "session_id": "e9ac7380a4054564814077479e2445c5"
+    },
+    {
+      "event": "model_request",
+      "round": 1
+    },
+    {
+      "event": "tool_call",
+      "name": "write_file",
+      "arguments": "{\"path\": \"tax.py\", \"content\": \"def add_tax(amount):\\n    return amount * 1.2\\n\"}"
+    },
+    {
+      "event": "policy_decision",
+      "tool": "write_file",
+      "action": "ask",
+      "outcome": "approved",
+      "reason": "Default permission for write_file",
+      "source": "policy",
+      "fingerprint": "b7478cfe90f6577d394f6091ef0e29ff2a40fcddfa3a57db94244b92d820b88b",
+      "scope": "session"
+    },
+    {
+      "event": "tool_result",
+      "role": "tool",
+      "tool_call_id": "tax",
+      "name": "write_file",
+      "content": "wrote 45 characters to tax.py"
+    },
+    {
+      "event": "tool_call",
+      "name": "write_file",
+      "arguments": "{\"path\": \"receipt.py\", \"content\": \"def receipt_total(prices):\\n    return sum(prices)\\n\"}"
+    },
+    {
+      "event": "policy_decision",
+      "tool": "write_file",
+      "action": "ask",
+      "outcome": "approved",
+      "reason": "Default permission for write_file",
+      "source": "session_grant",
+      "fingerprint": "25df3eb173cd4630e32cffa5ada9ac73981f256dbd18d2e3e568fa8a471264f3",
+      "scope": "session"
+    },
+    {
+      "event": "tool_result",
+      "role": "tool",
+      "tool_call_id": "receipt",
+      "name": "write_file",
+      "content": "wrote 50 characters to receipt.py"
+    },
+    {
+      "event": "tool_call",
+      "name": "Bash",
+      "arguments": "{\"command\": \"ls\"}"
+    },
+    {
+      "event": "policy_decision",
+      "tool": "Bash",
+      "action": "ask",
+      "outcome": "approved",
+      "reason": "Default permission for Bash",
+      "source": "policy",
+      "fingerprint": "402d1b9d9f5824ae02eb30f6c976f5a88bc163fe98a09bd03156bebe064d5123",
+      "scope": "session"
+    },
+    {
+      "event": "tool_result",
+      "role": "tool",
+      "tool_call_id": "list",
+      "name": "Bash",
+      "content": "exit_code=0\nreceipt.py\ntax.py\ntest_checkout.py"
+    },
+    {
+      "event": "session_resumed",
+      "session_id": "e9ac7380a4054564814077479e2445c5"
+    },
+    {
+      "event": "tool_call",
+      "name": "Bash",
+      "arguments": "{\"command\": \"python -m unittest discover -v\"}"
+    },
+    {
+      "event": "policy_decision",
+      "tool": "Bash",
+      "action": "ask",
+      "outcome": "approved",
+      "reason": "Default permission for Bash",
+      "source": "session_grant",
+      "fingerprint": "842999728c8d9f951ca770f8754b0d02085b3e32c63ef1a21617e4096a22054c",
+      "scope": "session"
+    },
+    {
+      "event": "tool_result",
+      "role": "tool",
+      "tool_call_id": "tests",
+      "name": "Bash",
+      "content": "exit_code=0\ntest_receipt (test_checkout.CheckoutTests.test_receipt) ... ok\ntest_tax (test_checkout.CheckoutTests.test_tax) ... ok\n\n----------------------------------------------------------------------\nRan 2 tests in 0.000s\n\nOK"
+    },
+    {
+      "event": "model_request",
+      "round": 2
+    },
+    {
+      "event": "final",
+      "content": "Сценарий завершён. Результат проверяется независимым запуском тестов."
+    }
+  ]
+}

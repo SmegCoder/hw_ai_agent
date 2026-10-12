@@ -159,7 +159,7 @@ class SessionStore:
             if not messages or any(not isinstance(m, dict) or m.get("role") not in
                 {"system", "user", "assistant", "tool"} for m in messages):
                 raise SessionError("Invalid saved messages")
-            if row["status"] not in {"ready", "running", "interrupted", "failed", "blocked", "completed", "aborted"}:
+            if row["status"] not in {"ready", "running", "interrupted", "waiting_approval", "failed", "blocked", "completed", "aborted"}:
                 raise SessionError("Invalid session status")
             if row["status"] == "completed" and not isinstance(row["final_answer"], str):
                 raise SessionError("Completed session has no final answer")
@@ -180,6 +180,13 @@ class SessionStore:
         with self.transaction():
             self.db.execute("UPDATE sessions SET status=?,error=?,updated_at=? WHERE id=?",
                             (status, error, stamp(), session_id))
+
+    def upgrade_approval_contract(self, session_id: str):
+        with self.transaction():
+            state = self.get(session_id)
+            metadata = {**state.metadata, "approval_contract": 2}
+            self.db.execute("UPDATE sessions SET metadata=? WHERE id=?", (encoded(metadata), session_id))
+            self._event(session_id, {"event": "approval_contract_upgrade", "version": 2})
 
     def _event(self, session_id: str, event: dict):
         row = self.db.execute("SELECT events FROM sessions WHERE id=?", (session_id,)).fetchone()
@@ -212,7 +219,7 @@ class SessionStore:
 
     def calls(self, session_id: str, unfinished_only=False) -> list[dict]:
         self.validate_id(session_id)
-        clause = " AND state IN ('pending','running','uncertain')" if unfinished_only else ""
+        clause = " AND state IN ('pending','awaiting_approval','running','uncertain')" if unfinished_only else ""
         rows = self.db.execute("SELECT * FROM calls WHERE session_id=?" + clause + " ORDER BY batch,position", (session_id,)).fetchall()
         try:
             items = [{"key": f"{r['batch']}:{r['position']}", "batch": r["batch"], "position": r["position"],
@@ -224,7 +231,7 @@ class SessionStore:
                     not isinstance(call.get("function"), dict) or
                     not isinstance(call["function"].get("name"), str) or
                     not isinstance(call["function"].get("arguments"), str) or
-                    item["state"] not in {"pending", "running", "uncertain", "completed", "failed"}):
+                    item["state"] not in {"pending", "awaiting_approval", "running", "uncertain", "completed", "failed"}):
                     raise SessionError("Invalid saved tool call")
             return items
         except (ValueError, TypeError):
@@ -232,12 +239,26 @@ class SessionStore:
 
     def start_call(self, session_id: str, item: dict):
         with self.transaction():
-            cursor = self.db.execute("UPDATE calls SET state='running' WHERE session_id=? AND batch=? AND position=? AND state='pending'",
+            cursor = self.db.execute("UPDATE calls SET state='running' WHERE session_id=? AND batch=? AND position=? AND state IN ('pending','awaiting_approval')",
                 (session_id, item["batch"], item["position"]))
             if cursor.rowcount != 1:
                 raise SessionError("Tool call is not pending")
             function = item["call"]["function"]
-            self._event(session_id, {"event": "tool_call", "name": function["name"], "arguments": function["arguments"]})
+            attempt = 1 + sum(e.get("event") == "tool_call" and e.get("call") == item["key"]
+                              for e in self.get(session_id).events)
+            self._event(session_id, {"event": "tool_call", "call": item["key"], "attempt": attempt,
+                                    "tool_call_id": item["call"]["id"],
+                                    "name": function["name"], "arguments": function["arguments"]})
+
+    def wait_for_approval(self, session_id: str, item: dict):
+        with self.transaction():
+            self.db.execute("UPDATE calls SET state='awaiting_approval' WHERE session_id=? AND batch=? AND position=? AND state='running'",
+                            (session_id, item["batch"], item["position"]))
+
+    def end_approval(self, session_id: str, item: dict):
+        with self.transaction():
+            self.db.execute("UPDATE calls SET state='running' WHERE session_id=? AND batch=? AND position=? AND state='awaiting_approval'",
+                            (session_id, item["batch"], item["position"]))
 
     def finish_call(self, session_id: str, item: dict, result: dict):
         with self.transaction():
@@ -282,7 +303,7 @@ class SessionStore:
             raise SessionError("Resolve only the first uncertain call")
         item = calls[0]
         if resolution == "retry":
-            if item["call"]["function"]["name"] not in {"write_file", "read_file", "list_files", "Bash", "bash"}:
+            if item["call"]["function"]["name"] not in {"write_file", "delete_file", "read_file", "list_files", "Bash", "bash"}:
                 raise SessionError("This instrument has no supported safe retry contract")
             with self.transaction():
                 self.db.execute("UPDATE calls SET state='pending' WHERE session_id=? AND batch=? AND position=?",

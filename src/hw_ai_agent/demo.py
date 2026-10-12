@@ -42,9 +42,10 @@ def initialize_demo(workspace: Path) -> None:
 def run_demo(client: OpenAICompatibleClient, workspace: Path, max_rounds: int = 12,
              on_event=None, *, policy: Policy | None = None, approve=None,
              store: SessionStore | None = None, session_metadata: dict | None = None,
-             mode: str = "safe") -> dict:
+             mode: str = "safe", trash_dir: Path | None = None) -> dict:
     initialize_demo(workspace)
-    runtime = ToolRuntime(workspace, policy=policy, approve=approve, on_policy_event=on_event, mode=mode)
+    runtime = ToolRuntime(workspace, policy=policy, approve=approve, on_policy_event=on_event,
+                          mode=mode, trash_dir=trash_dir)
     before = runtime.bash("python -m unittest discover -v")
     if not before.startswith("exit_code=1\n"):
         raise AgentError("Demo baseline did not produce the expected failing tests")
