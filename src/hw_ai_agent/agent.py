@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import uuid
 from collections.abc import Callable
 from collections.abc import Mapping
@@ -9,6 +10,7 @@ from typing import Any
 
 from .client import ModelClient
 from .tools import ToolError, ToolRuntime
+from .session import SessionError, SessionStore, UncertainActionError
 
 
 DEFAULT_SYSTEM_PROMPT = """You are a careful coding agent.
@@ -40,6 +42,8 @@ class CodingAgent:
         max_rounds: int = 12,
         max_context_chars: int = 120_000,
         on_event: Callable[[dict[str, Any]], None] | None = None,
+        store: SessionStore | None = None,
+        session_metadata: dict | None = None,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be positive")
@@ -50,39 +54,153 @@ class CodingAgent:
         self.max_context_chars = max_context_chars
         self.on_event = on_event
         self.events: list[dict[str, Any]] = []
+        self.messages: list[dict[str, Any]] = []
+        self.store = store
+        self.session_metadata = dict(session_metadata or {})
+        self.session_id: str | None = None
+        self._original_policy_callback = getattr(runtime, "_original_agent_policy_callback", runtime.on_policy_event)
+        runtime._original_agent_policy_callback = self._original_policy_callback
+        runtime.on_policy_event = self._policy_event
 
     def run(self, request: str) -> str:
         if not request.strip():
             raise ValueError("request must not be empty")
         self.events = []
-        messages: list[dict[str, Any]] = [
+        self.runtime.session_permissions = set()
+        self.messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": request},
         ]
+        if self.store:
+            self.session_id = self.store.create(self._binding(), self.messages, self.max_rounds, self.max_context_chars)
+            return self._stored_run(self.session_id, "session_created")
+        return self._loop(0)
 
-        for round_number in range(1, self.max_rounds + 1):
-            if len(json.dumps(messages, ensure_ascii=False)) > self.max_context_chars:
+    def _binding(self) -> dict:
+        allowed_metadata = {"kind", "policy_path", "policy_source", "approvals", "max_tokens", "demo"}
+        if set(self.session_metadata) - allowed_metadata:
+            raise SessionError("Unsupported session metadata fields")
+        metadata = {**self.session_metadata, "workspace": str(self.runtime.root),
+                    "execution_mode": self.runtime.mode,
+                    "policy": self.runtime.policy.as_dict(),
+                    "runtime_limits": {name: getattr(self.runtime, name) for name in
+                        ("command_timeout", "max_output_chars", "max_file_chars")}}
+        settings = getattr(self.client, "settings", None)
+        if settings is not None:
+            # Explicit whitelist: API credentials and client internals never enter metadata.
+            metadata.update({name: getattr(settings, name) for name in ("provider", "model", "base_url")})
+        metadata.setdefault("max_tokens", getattr(self.client, "max_tokens", 2048))
+        return metadata
+
+    def _check_binding(self, metadata: dict):
+        current = self._binding()
+        for key in ("workspace", "policy", "runtime_limits", "provider", "model", "base_url", "max_tokens"):
+            if metadata.get(key) != current.get(key):
+                raise SessionError(f"Session {key} differs from current configuration; continuation was refused")
+        if metadata.get("execution_mode", "safe") != current["execution_mode"]:
+            raise SessionError("Session execution mode differs from current configuration")
+
+    def resume(self, session_id: str) -> str:
+        if not self.store:
+            raise SessionError("Resume requires a session store")
+        return self._stored_run(session_id, "session_resumed")
+
+    def _stored_run(self, session_id: str, event: str) -> str:
+        assert self.store is not None
+        with self.store.lock(session_id):
+            state = self.store.get(session_id)
+            if state.status == "aborted":
+                raise SessionError("This session was terminated by the operator and cannot be resumed")
+            self._check_binding(state.metadata)
+            self.session_id = session_id
+            self.messages, self.events = copy.deepcopy(state.messages), copy.deepcopy(state.events)
+            self.runtime.session_permissions = {
+                e["tool"] for e in self.events
+                if e.get("event") == "policy_decision" and e.get("outcome") == "approved"
+                and e.get("scope") == "session"
+                and e.get("tool") in {"write_file", "Bash"}
+            }
+            self.max_rounds, self.max_context_chars = state.max_rounds, state.max_context_chars
+            if state.status == "completed":
+                if self.on_event:
+                    self.on_event({"event": "session_cached", "session_id": session_id})
+                return state.final_answer or ""
+            try:
+                self.store.recover(session_id)
+                self.events = copy.deepcopy(self.store.get(session_id).events)
+                self.store.set_status(session_id, "running")
+                self._emit({"event": event, "session_id": session_id})
+                # A final assistant message may have been committed just before process death.
+                last = self.messages[-1]
+                if last.get("role") == "assistant" and not last.get("tool_calls") and last.get("content"):
+                    answer = last["content"]
+                    self.store.complete(session_id, answer)
+                    self._emit({"event": "final", "content": answer}, persist=False)
+                    return answer
+                return self._loop(state.rounds)
+            except BaseException as exc:
+                status = ("blocked" if isinstance(exc, UncertainActionError) else
+                          "interrupted" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else "failed")
+                try:
+                    self.store.set_status(session_id, status, type(exc).__name__)
+                except SessionError:
+                    pass
+                raise
+
+    def _loop(self, rounds: int) -> str:
+        if self.store and self.session_id:
+            for item in self.store.calls(self.session_id, True):
+                self._registered_call(item)
+        while rounds < self.max_rounds:
+            if len(json.dumps(self.messages, ensure_ascii=False)) > self.max_context_chars:
                 raise AgentError("Conversation exceeds the context size limit")
-            self._emit({"event": "model_request", "round": round_number})
-            response = self.client.complete(messages, self.runtime.tool_schemas)
+            rounds = self.store.start_model(self.session_id) if self.store and self.session_id else rounds + 1
+            self._emit({"event": "model_request", "round": rounds}, persist=False)
+            response = self.client.complete(self.messages, self.runtime.tool_schemas)
+            if self.store and getattr(self.client, "usage", []):
+                last_usage = self.client.usage[-1]
+                usage = {key: last_usage[key] for key in ("prompt_tokens", "completion_tokens", "total_tokens", "cost")
+                         if type(last_usage.get(key)) in (int, float) and math.isfinite(last_usage[key])}
+                self._emit({"event": "model_usage", "usage": usage})
             assistant = self._assistant_message(response)
-            messages.append(assistant)
             tool_calls = assistant.get("tool_calls") or []
+            if not tool_calls and (not isinstance(assistant.get("content"), str) or not assistant["content"].strip()):
+                raise AgentError("Model returned neither tool calls nor a final answer")
+            if self.store and self.session_id:
+                self.store.assistant(self.session_id, assistant, rounds)
+            self.messages.append(assistant)
             if not tool_calls:
                 content = assistant.get("content")
                 if not isinstance(content, str) or not content.strip():
                     raise AgentError("Model returned neither tool calls nor a final answer")
-                self._emit({"event": "final", "content": content})
+                if self.store and self.session_id:
+                    self.store.complete(self.session_id, content)
+                self._emit({"event": "final", "content": content}, persist=False)
                 return content
 
+            if self.store and self.session_id:
+                for item in self.store.calls(self.session_id, True):
+                    self._registered_call(item)
+                continue
             for call in tool_calls:
                 self._emit({"event": "tool_call", "name": call["function"]["name"],
                             "arguments": call["function"]["arguments"]})
                 tool_result = self._execute_tool_call(call)
-                messages.append(tool_result)
+                self.messages.append(tool_result)
                 self._emit({"event": "tool_result", **tool_result})
 
         raise AgentError(f"agent exceeded the limit of {self.max_rounds} model rounds")
+
+    def _registered_call(self, item: dict):
+        assert self.store is not None and self.session_id is not None
+        call = item["call"]
+        self.store.start_call(self.session_id, item)
+        self._emit({"event": "tool_call", "name": call["function"]["name"],
+                    "arguments": call["function"]["arguments"]}, persist=False)
+        result = self._execute_tool_call(call)
+        self.store.finish_call(self.session_id, item, result)
+        self.messages.append(result)
+        self._emit({"event": "tool_result", **result}, persist=False)
 
     @staticmethod
     def _assistant_message(response: Mapping[str, Any]) -> dict[str, Any]:
@@ -123,10 +241,18 @@ class CodingAgent:
                 message[field] = copy.deepcopy(response[field])
         return message
 
-    def _emit(self, event: dict[str, Any]) -> None:
+    def _emit(self, event: dict[str, Any], *, persist=True) -> None:
         self.events.append(copy.deepcopy(event))
+        if persist and self.store and self.session_id:
+            self.store.event(self.session_id, event)
         if self.on_event:
             self.on_event(event)
+
+    def _policy_event(self, event: dict[str, Any]):
+        self._emit(event)
+        callback = self._original_policy_callback
+        if callback is not None and callback is not self.on_event:
+            callback(event)
 
     def _execute_tool_call(self, call: Any) -> dict[str, Any]:
         call_id = "unknown"

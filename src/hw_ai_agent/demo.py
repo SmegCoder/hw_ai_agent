@@ -7,6 +7,8 @@ from .agent import AgentError, CodingAgent
 from .client import ModelClientError, OpenAICompatibleClient
 from .tools import ToolRuntime
 from .policy import Policy
+from .session import SessionStore
+from .reporting import public_report
 
 BROKEN_ORDER = '''def calculate_total(prices, discount_percent):
     return sum(prices) - discount_percent
@@ -38,15 +40,19 @@ def initialize_demo(workspace: Path) -> None:
     (workspace / "test_order.py").write_text(ORDER_TESTS, encoding="utf-8")
 
 def run_demo(client: OpenAICompatibleClient, workspace: Path, max_rounds: int = 12,
-             on_event=None, *, policy: Policy | None = None, approve=None) -> dict:
+             on_event=None, *, policy: Policy | None = None, approve=None,
+             store: SessionStore | None = None, session_metadata: dict | None = None,
+             mode: str = "safe") -> dict:
     initialize_demo(workspace)
-    runtime = ToolRuntime(workspace, policy=policy, approve=approve, on_policy_event=on_event)
+    runtime = ToolRuntime(workspace, policy=policy, approve=approve, on_policy_event=on_event, mode=mode)
     before = runtime.bash("python -m unittest discover -v")
     if not before.startswith("exit_code=1\n"):
         raise AgentError("Demo baseline did not produce the expected failing tests")
     test = workspace / "test_order.py"
     test_hash = hashlib.sha256(test.read_bytes()).hexdigest()
-    agent = CodingAgent(client, runtime, max_rounds=max_rounds, on_event=on_event)
+    metadata = {**(session_metadata or {}), "kind": "demo", "demo": {"baseline": before, "test_hash": test_hash}}
+    agent = CodingAgent(client, runtime, max_rounds=max_rounds, on_event=on_event,
+                        store=store, session_metadata=metadata)
     error = None
     answer = ""
     try:
@@ -59,11 +65,16 @@ def run_demo(client: OpenAICompatibleClient, workspace: Path, max_rounds: int = 
         )
     except (AgentError, ModelClientError) as exc:
         error = str(exc)
+    return verify_demo(client, workspace, runtime, before, test_hash, answer,
+                       agent.events, error, agent.session_id)
+
+def verify_demo(client, workspace, runtime, before, test_hash, answer, events, error=None, session_id=None):
     after = runtime.bash("python -m unittest discover -v")
+    test = workspace / "test_order.py"
     unchanged = test_hash == hashlib.sha256(test.read_bytes()).hexdigest()
     model_ran_tests = any(e.get("event") == "tool_result" and e.get("name") in {"Bash", "bash"}
                           and "Ran 6 tests" in e["content"] and e["content"].startswith("exit_code=0\n")
-                          for e in agent.events)
+                          for e in events)
     diff = "".join(difflib.unified_diff(BROKEN_ORDER.splitlines(True),
                     (workspace / "order.py").read_text().splitlines(True),
                     fromfile="before/order.py", tofile="after/order.py"))
@@ -72,7 +83,11 @@ def run_demo(client: OpenAICompatibleClient, workspace: Path, max_rounds: int = 
               "tests_unchanged": unchanged, "model_ran_passing_tests": model_ran_tests,
               "success": error is None and unchanged and model_ran_tests and after.startswith("exit_code=0\n"),
               "error": error,
-              "diff": diff, "answer": answer, "usage": client.usage, "events": agent.events,
+              "diff": diff, "answer": answer,
+              "usage": [e["usage"] for e in events if e.get("event") == "model_usage"] or client.usage,
+              "events": events,
+              "session_id": session_id,
               "policy_events": runtime.policy_events}
-    (workspace / "demo-report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    (workspace / "demo-report.json").write_text(
+        json.dumps(public_report(report, workspace), ensure_ascii=False, indent=2), encoding="utf-8")
     return report

@@ -20,7 +20,7 @@ class ToolError(RuntimeError):
     pass
 
 def protected(relative: Path) -> bool:
-    return any(part in {".git", ".venv", ".idea", "__pycache__"} or part.startswith(".env")
+    return any(part in {".git", ".venv", ".idea", ".agent", "__pycache__"} or part.startswith(".env")
                for part in relative.parts)
 
 def is_test(relative: Path) -> bool:
@@ -30,6 +30,7 @@ class ToolRuntime:
     def __init__(self, root: str | Path, *, command_timeout: float = 10,
                  max_output_chars: int = 20_000, max_file_chars: int = 100_000,
                  policy: Policy | None = None,
+                 mode: str = "safe",
                  approve: Callable[[ApprovalRequest], bool] | None = None,
                  on_policy_event: Callable[[dict[str, Any]], None] | None = None) -> None:
         self.root = Path(root).expanduser().resolve()
@@ -40,7 +41,11 @@ class ToolRuntime:
         self.command_timeout = command_timeout
         self.max_output_chars = max_output_chars
         self.max_file_chars = max_file_chars
-        self.policy = policy or Policy()
+        self.policy = policy or Policy.from_dict({"defaults": {"Bash": "ask"}})
+        if mode not in {"safe", "auto"}:
+            raise ValueError("Execution mode must be safe or auto")
+        self.mode = mode
+        self.session_permissions: set[str] | None = None
         self.approve = approve
         self.on_policy_event = on_policy_event
         self.policy_events: list[dict[str, Any]] = []
@@ -63,7 +68,7 @@ class ToolRuntime:
         }} for name, description, props, required in definitions]
 
     def execute(self, name: str, arguments: Mapping[str, Any]) -> str:
-        """Single entry point for all model calls; approval is per invocation."""
+        """Single entry point for model calls, policy and session permissions."""
         name = "Bash" if name == "bash" else name
         # Own an immutable-value snapshot: an approval callback cannot alter the call.
         if isinstance(arguments, Mapping):
@@ -84,6 +89,7 @@ class ToolRuntime:
             self._policy_event(name, "deny", "blocked", decision.reason, "policy")
             raise ToolError(f"POLICY_DENIED: {decision.reason}")
         if decision.action == Action.ASK:
+            reusable = name in {"write_file", "Bash"}
             fingerprint = hashlib.sha256(json.dumps(
                 {"tool": name, "arguments": arguments, "target": path,
                  "file_signature": target.file_signature if target else None},
@@ -99,15 +105,24 @@ class ToolRuntime:
                 except (ToolError, OSError, UnicodeError):
                     preview = "Existing content could not be previewed. Proposed content:\n" + arguments["content"]
                 preview = preview[:4000] + ("\n... preview truncated ..." if len(preview) > 4000 else "")
-            request = ApprovalRequest(name, path or command or ".", decision.reason, preview, fingerprint)
+            request = ApprovalRequest(name, path or command or ".", decision.reason, preview, fingerprint,
+                                      "session" if reusable and self.session_permissions is not None else "call")
             approved = False
-            try:
-                approved = self.approve is not None and self.approve(request) is True
-            except Exception:
-                # Broken approval callbacks never authorize execution.
-                approved = False
+            source = "policy"
+            if reusable and self.mode == "auto":
+                approved, source = True, "auto_mode"
+            elif reusable and self.session_permissions is not None and name in self.session_permissions:
+                approved, source = True, "session_grant"
+            else:
+                try:
+                    approved = self.approve is not None and self.approve(request) is True
+                except Exception:
+                    # Broken approval callbacks never authorize execution.
+                    approved = False
+            if approved and reusable and self.session_permissions is not None:
+                self.session_permissions.add(name)
             self._policy_event(name, "ask", "approved" if approved else "refused",
-                               decision.reason, "policy", fingerprint)
+                               decision.reason, source, fingerprint, request.scope)
             if not approved:
                 raise ToolError("APPROVAL_REQUIRED: operator approval was not granted")
         else:
@@ -161,11 +176,13 @@ class ToolRuntime:
         return file.relative_to(self.root).as_posix(), None
 
     def _policy_event(self, tool: str, action: str, outcome: str, reason: str,
-                      source: str, fingerprint: str | None = None) -> None:
+                      source: str, fingerprint: str | None = None, scope: str | None = None) -> None:
         event = {"event": "policy_decision", "tool": tool, "action": action,
                  "outcome": outcome, "reason": reason, "source": source}
         if fingerprint:
             event["fingerprint"] = fingerprint
+        if scope:
+            event["scope"] = scope
         self.policy_events.append(event.copy())
         if self.on_policy_event:
             self.on_policy_event(event.copy())
@@ -275,7 +292,7 @@ class ToolRuntime:
         root_pattern = re_escape(str(self.root))
         test_pattern = root_pattern + r"/.*(test_[^/]*\.py|[^/]*_test\.py)$"
         test_dir_pattern = root_pattern + r"/(.*/)?tests(/.*)?$"
-        secret_pattern = root_pattern + r"/(.*/)?(\.env[^/]*|\.git|\.venv|\.idea)(/.*)?$"
+        secret_pattern = root_pattern + r"/(.*/)?(\.env[^/]*|\.git|\.venv|\.idea|\.agent)(/.*)?$"
         profile += [f'(deny file-write* (regex {quoted(test_pattern)}))',
                     f'(deny file-write* (subpath {quoted(self.root / "tests")}))',
                     f'(deny file-write* (regex {quoted(test_dir_pattern)}))',

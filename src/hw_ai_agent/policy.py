@@ -58,6 +58,7 @@ class ApprovalRequest:
     reason: str
     preview: str
     fingerprint: str
+    scope: str = "call"
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,12 @@ class Policy:
     rules: tuple[Rule, ...] = ()
     # Tuple instead of a mutable dict: model calls cannot modify active rules.
     defaults: tuple[tuple[str, Action], ...] = tuple(DEFAULTS.items())
+
+    def as_dict(self) -> dict:
+        return {"defaults": {tool: action.value for tool, action in self.defaults}, "rules": [
+            {key: value for key, value in {"tool": r.tool, "action": r.action.value,
+             "path": r.path, "command": r.command, "reason": r.reason}.items() if value is not None}
+            for r in self.rules]}
 
     def decide(self, tool: str, *, path: str | None = None,
                command: str | None = None) -> Decision:
