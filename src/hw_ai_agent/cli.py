@@ -25,6 +25,8 @@ from .planning import PlanApprovalDeferred
 from .terminal import visible, confirm_plan, choose_session, confirm_conflict
 from .plan_demo import PlanDemoClient, run_plan_demo
 from .budget_demo import run_budget_demo
+from .tasks import checklist
+from .tasks_demo import TasksDemoClient, run_tasks_demo, verify_tasks_demo
 
 def show_event(event: dict) -> None:
     if event["event"] == "model_request":
@@ -38,11 +40,14 @@ def show_event(event: dict) -> None:
         if event['name'] == 'submit_plan':
             print("Модель подготовила план.", flush=True)
         else:
-            print(f"Вызов {event['name']}: {visible(event['arguments'])}", flush=True)
+            prefix = f"Задача {event['task_id']}: " if event.get('task_id') else ''
+            print(prefix + f"Вызов {event['name']}: {visible(event['arguments'])}", flush=True)
     elif event["event"] == "policy_decision":
         print(f"Policy: {event['tool']} → {event['action']} / {event['outcome']}", flush=True)
         if event.get("source") == "session_grant":
             print("Используется разрешение, уже выданное для этой сессии.", flush=True)
+    elif event["event"] == "tasks":
+        print("\nЗадачи:\n" + visible(checklist(event["tasks"])), flush=True)
     elif event["event"] == "budget":
         budget = event["budget"]
         labels = {"model_requests": "модель", "tool_calls": "инструменты", "side_effects": "опасные действия", "result_bytes": "результаты (байт)"}
@@ -66,17 +71,22 @@ def confirm_action(request: ApprovalRequest) -> bool:
     except EOFError:
         raise ApprovalDeferred("Ответ не получен; продолжите эту сессию через resume") from None
 
-def event_listener(stop_after_tools=None):
-    if stop_after_tools is None:
+def event_listener(stop_after_tools=None, stop_after_tasks=None):
+    if stop_after_tools is None and stop_after_tasks is None:
         return show_event
-    completed = 0
+    completed, tasks_completed = 0, 0
     def listener(event):
-        nonlocal completed
+        nonlocal completed, tasks_completed
         show_event(event)
         if event["event"] == "tool_result":
             completed += 1
-            if completed >= stop_after_tools:
+            if stop_after_tools is not None and completed >= stop_after_tools:
                 print("Пауза после сохранённого результата инструмента.", flush=True)
+                raise KeyboardInterrupt
+        if event["event"] == "task_completed":
+            tasks_completed += 1
+            if stop_after_tasks is not None and tasks_completed >= stop_after_tasks:
+                print("Пауза после сохранённого результата задачи.", flush=True)
                 raise KeyboardInterrupt
     return listener
 
@@ -158,6 +168,17 @@ def report_workflow(report):
     print("WORKFLOW DEMO PASS" if report["success"] else "WORKFLOW DEMO FAIL")
     return 0 if report["success"] else 1
 
+def report_tasks(report):
+    print("\nЗадачи:\n" + visible(report["checklist"]))
+    print("Независимая проверка:\n" + report["verification"])
+    print(f"Тесты неизменны: {report['tests_unchanged']}; вызовы связаны с задачами: {report['task_calls_scoped']}")
+    if report["error"]:
+        print("Ошибка: " + report["error"])
+    print(f"Отчёт: {Path(report['workspace']) / 'tasks-report.json'}")
+    print("TASKS DEMO PASS" if report["success"] else "TASKS DEMO FAIL")
+    return 0 if report["success"] else 1
+
+
 def saved_runtime(state, db_path: Path, approvals=None, on_event=show_event):
     metadata = state.metadata
     workspace = Path(metadata["workspace"])
@@ -212,19 +233,19 @@ def session_command(args):
                     target = arguments.get("path", arguments.get("command", ".")) if isinstance(arguments, dict) else "invalid arguments"
                 except ValueError:
                     target = "invalid arguments"
-                calls.append({"key": item["key"], "state": item["state"], "tool": function["name"], "target": target})
+                calls.append({"key": item["key"], "state": item["state"], "tool": function["name"], "target": target, "task_id": item.get("task_id"), "phase": item.get("phase")})
             print(json.dumps({"id": state.id, "status": state.status, "workspace": state.metadata["workspace"],
                 "provider": state.metadata.get("provider"), "model": state.metadata.get("model"),
                 "rounds": state.rounds, "max_rounds": state.max_rounds, "error": state.error,
                 "mode": state.metadata.get("execution_mode", "safe"),
                 "budget": store.budget(args.session_id),
-                "plan": store.plan(args.session_id), "unfinished_calls": calls}, ensure_ascii=False, indent=2))
+                "tasks": store.tasks(args.session_id), "plan": store.plan(args.session_id), "unfinished_calls": calls}, ensure_ascii=False, indent=2))
             return 0
         if args.action in {"approve-plan", "reject-plan"}:
             store.decide_plan(args.session_id, args.action == "approve-plan")
             print("Решение по плану сохранено." + (" Продолжение: hw-ai-agent resume" if args.action == "approve-plan" else " Сессия завершена."))
             return 0
-        listener = event_listener(getattr(args, "stop_after_tools", None))
+        listener = event_listener(getattr(args, "stop_after_tools", None), getattr(args, "stop_after_tasks", None))
         if args.action == "resolve":
             verifier = None
             if args.resolution == "applied":
@@ -245,6 +266,14 @@ def session_command(args):
         interactive = {"approve_plan": confirm_plan,
                        "resolve_uncertain": lambda item: confirm_conflict(runtime, item, lambda i: verify_applied(runtime, i)),
                        "verify_recovery": lambda item: verify_applied(runtime, item)}
+        if metadata.get("kind") == "tasks-demo" and metadata.get("provider") not in PROVIDERS:
+            if not metadata["demo"].get("offline"):
+                raise SessionError("Real task demo cannot resume with a scripted client")
+            client = TasksDemoClient()
+            client.max_tokens = metadata.get("max_tokens", 3072)
+            agent = CodingAgent(client, runtime, store=store, on_event=listener, **interactive)
+            answer = agent.resume(args.session_id)
+            return report_tasks(verify_tasks_demo(client, runtime, store, args.session_id, answer, metadata))
         if metadata.get("kind") == "plan-demo" and metadata.get("provider") not in PROVIDERS:
             if not metadata["demo"].get("offline", metadata.get("provider") == "scripted"):
                 raise SessionError("Real-model plan session cannot resume with a scripted client")
@@ -267,6 +296,8 @@ def session_command(args):
                                         max_tokens=metadata["max_tokens"])
         agent = CodingAgent(client, runtime, store=store, on_event=listener, **interactive)
         answer = agent.resume(args.session_id)
+        if metadata.get("kind") == "tasks-demo":
+            return report_tasks(verify_tasks_demo(client, runtime, store, args.session_id, answer, metadata))
         if metadata.get("kind") == "workflow":
             return report_workflow(verify_workflow(agent, runtime, metadata))
         if metadata.get("kind") in {"demo", "plan-demo"}:
@@ -319,6 +350,22 @@ def main() -> int:
     plan_demo.add_argument("--state-db", type=Path, default=Path(".agent/sessions.sqlite3"))
     plan_demo.add_argument("--workspace", type=Path)
     plan_demo.add_argument("--crash-after-write", action="store_true")
+    tasks_demo = subparsers.add_parser("tasks-demo", help="Real-model tasks with dependencies and verification; --offline for deterministic recovery")
+    tasks_demo.add_argument("--offline", action="store_true")
+    tasks_demo.add_argument("--provider", choices=list(PROVIDERS))
+    tasks_demo.add_argument("--model")
+    tasks_demo.add_argument("--env-file", type=Path, default=Path(".env"))
+    add_budget_arguments(tasks_demo)
+    tasks_demo.add_argument("--max-rounds", type=int, default=30)
+    tasks_demo.add_argument("--max-tokens", type=int, default=3072)
+    tasks_demo.add_argument("--mode", choices=["safe", "auto"], default="safe")
+    tasks_demo.add_argument("--approvals", choices=["ask", "deny"], default="ask")
+    tasks_demo.add_argument("--policy", type=Path)
+    tasks_demo.add_argument("--workspace", type=Path)
+    tasks_demo.add_argument("--state-db", type=Path, default=Path(".agent/sessions.sqlite3"))
+    tasks_demo.add_argument("--stop-after-tools", type=int)
+    tasks_demo.add_argument("--stop-after-tasks", type=int)
+    tasks_demo.add_argument("--crash-after-write", action="store_true")
     for action in ("sessions", "session", "resume", "resolve", "approve-plan", "reject-plan"):
         command = subparsers.add_parser(action)
         command.add_argument("--state-db", type=Path, default=Path(".agent/sessions.sqlite3"))
@@ -328,6 +375,7 @@ def main() -> int:
             command.add_argument("--env-file", type=Path, default=Path(".env"))
             command.add_argument("--approvals", choices=["ask", "deny"], default=None)
             command.add_argument("--stop-after-tools", type=int, default=None)
+            command.add_argument("--stop-after-tasks", type=int, default=None)
         if action == "resolve":
             command.add_argument("--call", required=True, help="Uncertain call key, for example 1:0")
             command.add_argument("--resolution", choices=["applied", "retry", "skip", "abort"], required=True)
@@ -338,6 +386,8 @@ def main() -> int:
         command.add_argument("--env-file", type=Path, default=Path(".env"))
         if action in {"demo", "run", "plan"}:
             add_budget_arguments(command)
+            command.add_argument("--tasks", action="store_true", help="Plan with dependency tasks and runtime verification")
+            command.add_argument("--stop-after-tasks", type=int)
             command.add_argument("--plan", action="store_true", default=action == "plan", help="Read-only planning before explicit approval")
             command.add_argument("--mode", choices=["safe", "auto"], default="safe")
             command.add_argument("--state-db", type=Path, default=Path(".agent/sessions.sqlite3"))
@@ -352,13 +402,17 @@ def main() -> int:
         if action in {"run", "plan"}:
             command.add_argument("request", nargs="+")
     args = parser.parse_args()
+    if getattr(args, "tasks", False):
+        args.plan = True
     try:
         budget_limits = None
-        if args.action in {"run", "plan", "demo", "plan-demo", "workflow-demo"}:
+        if args.action in {"run", "plan", "demo", "plan-demo", "workflow-demo", "tasks-demo"}:
             budget_limits = BudgetLimits(model_requests=args.max_rounds, tool_calls=args.max_tool_calls,
                                          side_effects=args.max_side_effects, result_bytes=args.max_result_bytes)
         if getattr(args, "stop_after_tools", None) is not None and args.stop_after_tools < 1:
             raise ConfigurationError("--stop-after-tools must be positive")
+        if getattr(args, "stop_after_tasks", None) is not None and args.stop_after_tasks < 1:
+            raise ConfigurationError("--stop-after-tasks must be positive")
         if args.action in {"sessions", "session", "resume", "resolve", "approve-plan", "reject-plan"}:
             return session_command(args)
         if args.action == "budget-demo":
@@ -366,6 +420,26 @@ def main() -> int:
             print(json.dumps(report["checks"], ensure_ascii=False, indent=2))
             print("BUDGET DEMO PASS" if report["success"] else "BUDGET DEMO FAIL")
             return 0 if report["success"] else 1
+        if args.action == "tasks-demo":
+            if args.max_tokens < 1:
+                raise ConfigurationError("Limits must be positive")
+            client = None
+            if not args.offline:
+                load_env(args.env_file)
+                settings = Settings.from_env(args.provider, args.model)
+                if not doctor(settings, check_sandbox=False):
+                    return 1
+                client = OpenAICompatibleClient(settings, timeout=180 if settings.provider == "ollama" else 90, max_tokens=args.max_tokens)
+            workspace = (args.workspace or Path("workspace") / ("tasks-demo-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"))).resolve()
+            metadata = {"policy_path": str(args.policy.resolve()) if args.policy else None,
+                        "policy_source": "file" if args.policy else "default", "max_tokens": args.max_tokens}
+            print(f"Demo workspace: {workspace}", flush=True)
+            return report_tasks(run_tasks_demo(workspace, args.state_db, client=client, offline=args.offline,
+                mode=args.mode, approve=confirm_action if args.approvals == "ask" else None,
+                approve_plan=confirm_plan, on_event=event_listener(args.stop_after_tools, args.stop_after_tasks),
+                max_rounds=args.max_rounds, max_tokens=args.max_tokens, budget_limits=budget_limits,
+                policy=load_policy(args.policy, workspace), session_metadata=metadata, approvals=args.approvals,
+                crash_after_write=args.crash_after_write))
         if args.action == "plan-demo":
             if args.max_rounds < 1 or args.max_tokens < 1:
                 raise ConfigurationError("Limits must be positive")
@@ -425,7 +499,7 @@ def main() -> int:
             return 0 if doctor(settings) else 1
         if args.max_rounds < 1 or args.max_tokens < 1:
             raise ConfigurationError("Limits must be positive")
-        listener = event_listener(args.stop_after_tools)
+        listener = event_listener(args.stop_after_tools, args.stop_after_tasks)
         client = OpenAICompatibleClient(settings, timeout=180 if settings.provider == "ollama" else 90,
                                         max_tokens=args.max_tokens)
         if args.action == "demo":
@@ -445,7 +519,7 @@ def main() -> int:
                 report = run_demo(client, workspace, args.max_rounds, listener,
                     policy=policy, approve=confirm_action if args.approvals == "ask" else None,
                     store=store, session_metadata=metadata, mode=args.mode,
-                    trash_dir=args.state_db.resolve().parent / "trash", plan_mode=args.plan, approve_plan=confirm_plan, budget_limits=budget_limits)
+                    trash_dir=args.state_db.resolve().parent / "trash", plan_mode=args.plan, task_mode=args.tasks, approve_plan=confirm_plan, budget_limits=budget_limits)
             return report_demo(report)
         workspace = args.workspace or Path(os.getenv("AGENT_WORKSPACE", "workspace"))
         runtime = ToolRuntime(workspace, policy=load_policy(args.policy, workspace), mode=args.mode,
@@ -457,7 +531,7 @@ def main() -> int:
                     "max_tokens": args.max_tokens}
         with SessionStore(args.state_db) as store:
             agent = CodingAgent(client, runtime, max_rounds=args.max_rounds, on_event=listener,
-                                store=store, session_metadata=metadata, plan_mode=args.plan, approve_plan=confirm_plan, budget_limits=budget_limits)
+                                store=store, session_metadata=metadata, plan_mode=args.plan, task_mode=args.tasks, approve_plan=confirm_plan, budget_limits=budget_limits)
             print(agent.run(" ".join(args.request)))
         return 0
     except ApprovalDeferred as exc:

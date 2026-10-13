@@ -13,6 +13,7 @@ from .tools import ToolError, ToolRuntime
 from .policy import ApprovalDeferred, Policy
 from .session import SessionError, SessionStore, UncertainActionError, PlanRejectedError
 from .budget import BudgetLimits, BudgetExceeded, MemoryBudget, output_ceiling
+from .tasks import TASK_INSTRUCTIONS, TASK_PLAN_SCHEMA, TASK_SCHEMAS, validate_task_plan, verify_task, TaskError
 from .planning import PLAN_SCHEMA, PLAN_INSTRUCTIONS, validate_plan, PlanError, PlanApprovalDeferred
 
 
@@ -54,12 +55,15 @@ class CodingAgent:
         store: SessionStore | None = None,
         session_metadata: dict | None = None,
         plan_mode: bool = False,
+        task_mode: bool = False,
         approve_plan: Callable[[dict], bool] | None = None,
         resolve_uncertain: Callable[[dict], str | None] | None = None,
         verify_recovery: Callable[[dict], bool] | None = None,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be positive")
+        if type(task_mode) is not bool:
+            raise ValueError("task_mode must be a boolean")
         if type(plan_mode) is not bool:
             raise ValueError("plan_mode must be a boolean")
         self.client = client
@@ -76,7 +80,9 @@ class CodingAgent:
         self.messages: list[dict[str, Any]] = []
         self.store = store
         self.session_metadata = dict(session_metadata or {})
-        self.plan_mode = plan_mode
+        self.plan_mode = plan_mode or task_mode
+        self.task_mode = task_mode
+        self._pending_task_outcome = None
         self.approve_plan = approve_plan
         self.resolve_uncertain = resolve_uncertain
         self.verify_recovery = verify_recovery
@@ -97,7 +103,7 @@ class CodingAgent:
         self._call_records = {}
         self.runtime.session_permissions = set()
         self.messages = [
-            {"role": "system", "content": self.system_prompt + (PLAN_INSTRUCTIONS if self.plan_mode else "")},
+            {"role": "system", "content": self.system_prompt + (PLAN_INSTRUCTIONS if self.plan_mode else "") + (TASK_INSTRUCTIONS if self.task_mode else "")},
             {"role": "user", "content": request},
         ]
         if self.store:
@@ -113,6 +119,7 @@ class CodingAgent:
                     "execution_mode": self.runtime.mode,
                     "approval_contract": 2,
                     "plan_mode": self.plan_mode,
+                    "task_mode": self.task_mode,
                     "trash_dir": str(self.runtime.trash_dir),
                     "policy": self.runtime.policy.as_dict(),
                     "runtime_limits": {name: getattr(self.runtime, name) for name in
@@ -153,6 +160,8 @@ class CodingAgent:
             self.plan_mode = state.metadata.get("plan_mode", False)
             if type(self.plan_mode) is not bool:
                 raise SessionError("Invalid saved planning mode")
+            self.task_mode = state.metadata.get("task_mode", False)
+            self.store.tasks(session_id)
             saved_plan = self.store.plan(session_id)
             self.runtime.phase = "planning" if saved_plan and saved_plan["state"] != "approved" else "execution"
             self.session_id = session_id
@@ -194,7 +203,8 @@ class CodingAgent:
                 # A final assistant message may have been committed just before process death.
                 last = self.messages[-1]
                 if (self.runtime.phase != "planning" and last.get("role") == "assistant"
-                        and not last.get("tool_calls") and last.get("content")):
+                        and not last.get("tool_calls") and last.get("content")
+                        and (not self.task_mode or all(t["state"] == "completed" for t in self.store.tasks(session_id)))):
                     answer = last["content"]
                     self.store.complete(session_id, answer)
                     self._emit({"event": "final", "content": answer}, persist=False)
@@ -233,7 +243,10 @@ class CodingAgent:
             self._emit_budget()
             schemas = self.runtime.tool_schemas
             if self.runtime.phase == "planning":
-                schemas = [*schemas, copy.deepcopy(PLAN_SCHEMA)]
+                schemas = [*schemas, copy.deepcopy(TASK_PLAN_SCHEMA if self.task_mode else PLAN_SCHEMA)]
+            elif self.task_mode:
+                task = self.store.current_task(self.session_id)
+                schemas = ([schema for schema in schemas if schema["function"]["name"] in task["tools"]] + copy.deepcopy(TASK_SCHEMAS)) if task else []
             response = self.client.complete(self.messages, schemas)
             if self.store and getattr(self.client, "usage", []):
                 last_usage = self.client.usage[-1]
@@ -258,6 +271,11 @@ class CodingAgent:
                     raise AgentError("Model returned neither tool calls nor a final answer")
                 if self.runtime.phase == "planning":
                     message = {"role": "user", "content": "Submit the plan with submit_plan; a text answer is not an approved plan."}
+                    self.store.message(self.session_id, message)
+                    self.messages.append(message)
+                    continue
+                if self.task_mode and any(t["state"] != "completed" for t in self.store.tasks(self.session_id)):
+                    message = {"role": "user", "content": "TASKS_NOT_COMPLETE: finish CURRENT_TASK with verified complete_task; your final text is not evidence."}
                     self.store.message(self.session_id, message)
                     self.messages.append(message)
                     continue
@@ -292,6 +310,8 @@ class CodingAgent:
         if not saved:
             return
         if saved["state"] == "awaiting_approval":
+            if self.task_mode:
+                self._emit({"event": "tasks", "tasks": self.store.tasks(self.session_id)}, persist=False)
             self._emit({"event": "plan_waiting", "plan": saved["data"]})
             if self.approve_plan is None:
                 raise PlanApprovalDeferred("План сохранён и ожидает явного утверждения")
@@ -312,6 +332,21 @@ class CodingAgent:
         self.runtime.phase = "execution" if saved["state"] == "approved" else "planning"
         if self.runtime.phase == "execution":
             self.store.set_status(self.session_id, "running")
+            if self.task_mode:
+                self._advance_task()
+
+    def _advance_task(self):
+        task = self.store.activate_task(self.session_id)
+        tasks = self.store.tasks(self.session_id)
+        self.messages = copy.deepcopy(self.store.get(self.session_id).messages)
+        self._emit({"event": "tasks", "tasks": tasks}, persist=False)
+        if task is None:
+            if any(t["state"] != "completed" for t in tasks):
+                raise AgentError("TASKS_FAILED: task failure blocks unfinished dependencies")
+            if not self.messages[-1].get("content", "").startswith("ALL_TASKS_COMPLETED"):
+                message = {"role": "user", "content": "ALL_TASKS_COMPLETED: return your final summary without more tool calls."}
+                self.store.message(self.session_id, message)
+                self.messages.append(message)
 
     @staticmethod
     def _call_signature(call: dict) -> tuple:
@@ -334,18 +369,28 @@ class CodingAgent:
         call = item["call"]
         quota = self.store.start_call(self.session_id, item, output_ceiling(call["function"]["name"], self.runtime))
         self._active_call = item
+        self._pending_task_outcome = None
         self._emit({"event": "tool_call", "name": call["function"]["name"],
+                    "task_id": item.get("task_id"), "phase": item.get("phase"),
                     "arguments": call["function"]["arguments"]}, persist=False)
         try:
             with self.runtime.output_budget(quota):
                 result = self._execute_tool_call(call)
         finally:
             self._active_call = None
-        result = self.store.finish_call(self.session_id, item, result)
+        outcome = self._pending_task_outcome
+        self._pending_task_outcome = None
+        if outcome:
+            result = self.store.finish_call(self.session_id, item, result, task_outcome=outcome)
+        else:
+            result = self.store.finish_call(self.session_id, item, result)
         self._remember_call(call, result)
         self.messages.append(result)
-        self._emit({"event": "tool_result", **result}, persist=False)
+        self._emit({"event": "tool_result", "task_id": item.get("task_id"), "phase": item.get("phase"), **result}, persist=False)
         self._emit_budget()
+        if outcome:
+            self._emit({"event": "tasks", "tasks": self.store.tasks(self.session_id)}, persist=False)
+            self._emit({"event": "task_" + outcome["state"], "task_id": outcome["task_id"]}, persist=False)
 
     @property
     def budget(self) -> dict:
@@ -442,9 +487,16 @@ class CodingAgent:
                     raise ToolError("submit_plan is available only during planning")
                 if self.store.plan(self.session_id)["state"] != "planning":
                     raise ToolError("PLAN_ALREADY_SAVED: wait for the operator decision")
-                validate_plan(dict(arguments))
+                (validate_task_plan if self.task_mode else validate_plan)(dict(arguments))
                 content = "PLAN_SAVED: runtime will request explicit operator approval before execution"
+            elif name in {"complete_task", "fail_task"}:
+                content = self._execute_task_control(name, dict(arguments))
             else:
+                if self.task_mode and self.runtime.phase == "execution":
+                    task = self.store.current_task(self.session_id)
+                    normalized = "Bash" if name == "bash" else name
+                    if not task or normalized not in task["tools"]:
+                        raise TaskError("TASK_TOOL_DENIED: tool is not allowed for CURRENT_TASK")
                 content = self.runtime.execute(name, arguments)
         except (ToolError, PlanError, json.JSONDecodeError, OSError) as exc:
             content = f"ERROR: {exc}"
@@ -459,3 +511,28 @@ class CodingAgent:
             self._remember_call(call, result)
         return result
 
+
+    def _execute_task_control(self, name: str, arguments: dict) -> str:
+        if not self.task_mode or self.runtime.phase != "execution" or not self.store or not self.session_id:
+            raise TaskError("Task controls require approved task mode")
+        keys = {"task_id"} if name == "complete_task" else {"task_id", "reason"}
+        if set(arguments) != keys or any(not isinstance(v, str) or not v.strip() or len(v) > 4000 for v in arguments.values()):
+            raise TaskError("Invalid task control arguments")
+        task = self.store.current_task(self.session_id)
+        if not task or arguments["task_id"] != task["id"]:
+            raise TaskError("TASK_NOT_CURRENT: runtime chooses the next eligible task")
+        item = getattr(self, "_active_call", None)
+        pending = self.store.calls(self.session_id, True)
+        if not item or pending[-1]["key"] != item["key"]:
+            raise TaskError("TASK_BOUNDARY: complete_task/fail_task must be the last call in its batch")
+        if name == "complete_task":
+            # This read checks recorded execution, not a model-written claim.
+            try:
+                with self.runtime.output_budget(None):
+                    proof = verify_task(task, self.store.calls(self.session_id), self.runtime)
+            except (OSError, UnicodeError):
+                raise TaskError("TASK_NOT_VERIFIED: cannot safely inspect the result") from None
+            self._pending_task_outcome = {"task_id": task["id"], "state": "completed", "proof": proof}
+            return "TASK_COMPLETED: " + json.dumps(proof, ensure_ascii=False)
+        self._pending_task_outcome = {"task_id": task["id"], "state": "failed", "error": arguments["reason"]}
+        return "TASK_FAILED: " + arguments["reason"]

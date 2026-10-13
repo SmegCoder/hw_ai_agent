@@ -122,8 +122,8 @@ hw-ai-agent resolve SESSION_ID --call 1:0 --resolution abort
 
 ## Проверки
 
-Полный набор: 245 тест без ошибок и пропусков. При обычном запуске без
-`REQUIRE_SANDBOX_TESTS=1` пропускается 24 системных теста.
+Полный набор: 281 тест без ошибок и пропусков. При обычном запуске без
+`REQUIRE_SANDBOX_TESTS=1` пропускаются 28 системных тестов.
 
 ```bash
 REQUIRE_SANDBOX_TESTS=1 python -m unittest discover -s tests -v

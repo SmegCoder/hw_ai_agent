@@ -16,3 +16,4 @@ workspace/workflow-*/
 workspace/plan-demo-*/
 .agent/
 .DS_Store
+workspace/tasks-demo-*/

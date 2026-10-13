@@ -43,7 +43,7 @@ def initialize_demo(workspace: Path) -> None:
 def run_demo(client: OpenAICompatibleClient, workspace: Path, max_rounds: int = 12,
              on_event=None, *, policy: Policy | None = None, approve=None,
              store: SessionStore | None = None, session_metadata: dict | None = None,
-             mode: str = "safe", trash_dir: Path | None = None, plan_mode=False, approve_plan=None, budget_limits=None) -> dict:
+             mode: str = "safe", trash_dir: Path | None = None, plan_mode=False, task_mode=False, approve_plan=None, budget_limits=None) -> dict:
     initialize_demo(workspace)
     runtime = ToolRuntime(workspace, policy=policy, approve=approve, on_policy_event=on_event,
                           mode=mode, trash_dir=trash_dir)
@@ -55,7 +55,7 @@ def run_demo(client: OpenAICompatibleClient, workspace: Path, max_rounds: int = 
     test_hash = hashlib.sha256(test.read_bytes()).hexdigest()
     metadata = {**(session_metadata or {}), "kind": "demo", "demo": {"baseline": before, "test_hash": test_hash}}
     agent = CodingAgent(client, runtime, max_rounds=max_rounds, on_event=on_event,
-                        store=store, session_metadata=metadata, plan_mode=plan_mode, approve_plan=approve_plan, budget_limits=budget_limits)
+                        store=store, session_metadata=metadata, plan_mode=plan_mode, task_mode=task_mode, approve_plan=approve_plan, budget_limits=budget_limits)
     error = None
     answer = ""
     try:

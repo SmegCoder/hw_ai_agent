@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from .planning import validate_plan, PlanError
+from .tasks import validate_task_plan, validate_proof, TaskError
 from .budget import BudgetLimits, BudgetExceeded, DIMENSIONS, snapshot, debit, batch_cost, truncate_result
 
 
@@ -76,7 +77,7 @@ class SessionStore:
             self.db = sqlite3.connect(self.path, timeout=5, isolation_level=None)
             self.db.row_factory = sqlite3.Row
             version = self.db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1, 2, 3):
+            if version not in (0, 1, 2, 3, 4):
                 raise SessionError("Unsupported session database version")
             self.db.execute("PRAGMA foreign_keys=ON")
             self.db.execute("PRAGMA synchronous=FULL")
@@ -107,9 +108,24 @@ class SessionStore:
                     PRIMARY KEY(session_id,batch,position),
                     FOREIGN KEY(session_id,batch,position) REFERENCES calls(session_id,batch,position)
                 );
+                CREATE TABLE IF NOT EXISTS tasks (
+                    session_id TEXT NOT NULL REFERENCES sessions(id), task_id TEXT NOT NULL,
+                    position INTEGER NOT NULL, definition TEXT NOT NULL,
+                    state TEXT NOT NULL, proof TEXT, error TEXT,
+                    PRIMARY KEY(session_id,task_id), UNIQUE(session_id,position)
+                );
+                CREATE TABLE IF NOT EXISTS call_tasks (
+                    session_id TEXT NOT NULL, batch INTEGER NOT NULL, position INTEGER NOT NULL,
+                    task_id TEXT, phase TEXT NOT NULL,
+                    PRIMARY KEY(session_id,batch,position),
+                    FOREIGN KEY(session_id,batch,position) REFERENCES calls(session_id,batch,position),
+                    FOREIGN KEY(session_id,task_id) REFERENCES tasks(session_id,task_id)
+                );
             ''')
             if version < 3:
                 self._migrate_budgets()
+            with self.transaction():
+                self.db.execute("PRAGMA user_version=4")
         except (sqlite3.Error, SessionError):
             if hasattr(self, "db"):
                 self.db.close()
@@ -300,7 +316,8 @@ class SessionStore:
         if self.get(session_id).metadata.get("plan_mode") is not True:
             raise SessionError("Saved plan does not match session planning mode")
         try:
-            data = validate_plan(json.loads(row["data"])) if row["data"] is not None else None
+            validator = validate_task_plan if self.get(session_id).metadata.get("task_mode", False) else validate_plan
+            data = validator(json.loads(row["data"])) if row["data"] is not None else None
             if row["state"] not in {"planning", "awaiting_approval", "approved", "rejected"}:
                 raise SessionError("Invalid plan state")
             if (row["state"] == "planning") != (data is None):
@@ -308,6 +325,101 @@ class SessionStore:
             return {"state": row["state"], "data": data}
         except (ValueError, TypeError):
             raise SessionError("Invalid saved plan") from None
+
+    def tasks(self, session_id: str) -> list[dict]:
+        state = self.get(session_id)
+        mode = state.metadata.get("task_mode", False)
+        if type(mode) is not bool or mode and not state.metadata.get("plan_mode"):
+            raise SessionError("Invalid saved task mode")
+        rows = self.db.execute("SELECT * FROM tasks WHERE session_id=? ORDER BY position", (session_id,)).fetchall()
+        if not mode:
+            if rows:
+                raise SessionError("Tasks do not match saved session mode")
+            return []
+        plan = self.plan(session_id)
+        definitions = plan["data"]["steps"] if plan and plan["data"] else []
+        try:
+            if len(rows) != len(definitions):
+                raise ValueError("Missing task definitions")
+            tasks = []
+            for position, (row, definition) in enumerate(zip(rows, definitions)):
+                if json.loads(row["definition"]) != definition or row["task_id"] != definition["id"] or row["position"] != position:
+                    raise ValueError("Task definition differs from approved plan")
+                task = {**definition, "state": row["state"], "proof": json.loads(row["proof"]) if row["proof"] else None, "error": row["error"]}
+                if task["state"] not in {"pending", "running", "completed", "failed", "blocked"}:
+                    raise ValueError("Invalid task state")
+                if (task["state"] == "completed") != (task["proof"] is not None):
+                    raise ValueError("Task completion requires proof")
+                if plan["state"] != "approved" and task["state"] != "pending":
+                    raise ValueError("Task started before plan approval")
+                tasks.append(task)
+            states = {t["id"]: t["state"] for t in tasks}
+            if sum(t["state"] == "running" for t in tasks) > 1:
+                raise ValueError("Multiple active tasks")
+            calls = self.calls(session_id)
+            for task in tasks:
+                if task["state"] in {"running", "completed"} and any(states[d] != "completed" for d in task["depends_on"]):
+                    raise ValueError("Task dependencies are not complete")
+                if task["state"] == "completed":
+                    validate_proof(task, calls)
+            return tasks
+        except (ValueError, TypeError, KeyError, TaskError):
+            raise SessionError("Invalid saved task graph or result proof") from None
+
+    def current_task(self, session_id: str) -> dict | None:
+        return next((t for t in self.tasks(session_id) if t["state"] == "running"), None)
+
+    def activate_task(self, session_id: str) -> dict | None:
+        with self.transaction():
+            tasks = self.tasks(session_id)
+            plan = self.plan(session_id)
+            if not plan or plan["state"] != "approved":
+                raise SessionError("Task execution requires an approved plan")
+            current = next((t for t in tasks if t["state"] == "running"), None)
+            if current:
+                return current
+            states = {t["id"]: t["state"] for t in tasks}
+            changed = True
+            while changed:
+                changed = False
+                for task in tasks:
+                    if states[task["id"]] == "pending" and any(states[d] in {"failed", "blocked"} for d in task["depends_on"]):
+                        states[task["id"]] = "blocked"
+                        self.db.execute("UPDATE tasks SET state='blocked',error='Dependency failed' WHERE session_id=? AND task_id=?", (session_id, task["id"]))
+                        changed = True
+            ready = next((t for t in tasks if states[t["id"]] == "pending" and all(states[d] == "completed" for d in t["depends_on"])), None)
+            if ready is None:
+                return None
+            self.db.execute("UPDATE tasks SET state='running' WHERE session_id=? AND task_id=?", (session_id, ready["id"]))
+            self._event(session_id, {"event": "task_started", "task_id": ready["id"]})
+            ready = {**ready, "state": "running"}
+            state = self.get(session_id)
+            message = {"role": "user", "content": "CURRENT_TASK\n" + encoded(ready)}
+            self.db.execute("UPDATE sessions SET messages=? WHERE id=?", (encoded([*state.messages, message]), session_id))
+            return {**ready, "state": "running"}
+
+    def task_scope(self, session_id: str) -> tuple[str, str | None]:
+        state = self.get(session_id)
+        plan = self.plan(session_id)
+        if not plan or plan["state"] != "approved":
+            return "planning", None
+        task = self.current_task(session_id)
+        if task is None:
+            raise SessionError("TASKS_COMPLETE: return a final answer without tool calls")
+        return "execution", task["id"]
+
+    def _task_outcome(self, session_id: str, item: dict, outcome: dict):
+        task = self.current_task(session_id)
+        if not task or item.get("task_id") != task["id"] or outcome.get("task_id") != task["id"]:
+            raise SessionError("Task result does not match current task")
+        if outcome["state"] == "completed":
+            validate_proof({**task, "proof": outcome["proof"]}, self.calls(session_id))
+        elif outcome["state"] != "failed" or not outcome.get("error"):
+            raise SessionError("Invalid task outcome")
+        self.db.execute("UPDATE tasks SET state=?,proof=?,error=? WHERE session_id=? AND task_id=?",
+                        (outcome["state"], encoded(outcome["proof"]) if outcome.get("proof") else None,
+                         outcome.get("error"), session_id, task["id"]))
+        self._event(session_id, {"event": "task_" + outcome["state"], **outcome})
 
     def message(self, session_id: str, message: dict):
         with self.transaction():
@@ -371,6 +483,12 @@ class SessionStore:
         with self.transaction():
             state = self.get(session_id)
             calls = message.get("tool_calls") or []
+            task_mode = state.metadata.get("task_mode", False)
+            scope = self.task_scope(session_id) if task_mode and calls else None
+            if task_mode:
+                for previous in self.calls(session_id):
+                    if any(c["id"] == previous["call"]["id"] for c in calls) and previous.get("task_id") != (scope[1] if scope else None):
+                        raise SessionError("PROTOCOL_ERROR: tool_call_id cannot be reused across task scopes")
             cached = {i["call"]["id"] for i in self.calls(session_id) if i["result"] is not None}
             try:
                 available = self.budget(session_id)["remaining"]["result_bytes"]
@@ -390,17 +508,19 @@ class SessionStore:
                         (session_id, batch, position, encoded(call), "pending"))
                     self.db.execute("INSERT INTO call_budgets VALUES (?,?,?,?,NULL,0)",
                                     (session_id, batch, position, 1))
+                    if scope:
+                        self.db.execute("INSERT INTO call_tasks VALUES (?,?,?,?,?)", (session_id, batch, position, scope[1], scope[0]))
         if failure:
             raise failure
 
     def calls(self, session_id: str, unfinished_only=False) -> list[dict]:
         self.validate_id(session_id)
         clause = " AND state IN ('pending','awaiting_approval','running','uncertain')" if unfinished_only else ""
-        rows = self.db.execute("SELECT * FROM calls WHERE session_id=?" + clause + " ORDER BY batch,position", (session_id,)).fetchall()
+        rows = self.db.execute("SELECT calls.*,call_tasks.task_id,call_tasks.phase FROM calls LEFT JOIN call_tasks USING(session_id,batch,position) WHERE session_id=?" + clause + " ORDER BY batch,position", (session_id,)).fetchall()
         try:
             items = [{"key": f"{r['batch']}:{r['position']}", "batch": r["batch"], "position": r["position"],
                      "call": json.loads(r["call"]), "state": r["state"],
-                     "result": json.loads(r["result"]) if r["result"] else None} for r in rows]
+                     "result": json.loads(r["result"]) if r["result"] else None, "task_id": r["task_id"], "phase": r["phase"]} for r in rows]
             for item in items:
                 call = item["call"]
                 if (not isinstance(call, dict) or not isinstance(call.get("id"), str) or
@@ -409,6 +529,12 @@ class SessionStore:
                     not isinstance(call["function"].get("arguments"), str) or
                     item["state"] not in {"pending", "awaiting_approval", "running", "uncertain", "completed", "failed"}):
                     raise SessionError("Invalid saved tool call")
+            if self.get(session_id).metadata.get("task_mode"):
+                known = {row[0] for row in self.db.execute("SELECT task_id FROM tasks WHERE session_id=?", (session_id,))}
+                if any((i["phase"] == "planning" and i["task_id"] is not None) or
+                       (i["phase"] == "execution" and i["task_id"] not in known) or
+                       i["phase"] not in {"planning", "execution"} for i in items):
+                    raise SessionError("Invalid saved task scope for tool call")
             return items
         except (ValueError, TypeError):
             raise SessionError("Invalid saved tool calls") from None
@@ -417,6 +543,10 @@ class SessionStore:
         if type(output_ceiling) is not int or output_ceiling < 1:
             raise SessionError("Invalid output ceiling")
         with self.transaction():
+            if self.get(session_id).metadata.get("task_mode"):
+                phase, task_id = self.task_scope(session_id)
+                if item.get("phase") != phase or item.get("task_id") != task_id:
+                    raise SessionError("Saved tool call differs from current task scope")
             allocation = self._allocation(session_id, item)
             if not allocation["paid"]:
                 raise SessionError("Tool batch budget has not been reserved")
@@ -440,6 +570,7 @@ class SessionStore:
                               for e in self.get(session_id).events)
             self._event(session_id, {"event": "tool_call", "call": item["key"], "attempt": attempt,
                                     "tool_call_id": item["call"]["id"],
+                                    "task_id": item.get("task_id"), "phase": item.get("phase"),
                                     "name": function["name"], "arguments": function["arguments"]})
         return quota
 
@@ -453,7 +584,7 @@ class SessionStore:
             self.db.execute("UPDATE calls SET state='running' WHERE session_id=? AND batch=? AND position=? AND state='awaiting_approval'",
                             (session_id, item["batch"], item["position"]))
 
-    def finish_call(self, session_id: str, item: dict, result: dict):
+    def finish_call(self, session_id: str, item: dict, result: dict, *, task_outcome: dict | None = None):
         with self.transaction():
             state = self.get(session_id)
             allocation = self._allocation(session_id, item)
@@ -477,12 +608,13 @@ class SessionStore:
                             (session_id, item["batch"], item["position"]))
             self.db.execute("UPDATE sessions SET messages=?,updated_at=? WHERE id=?",
                             (encoded([*state.messages, result]), stamp(), session_id))
-            self._event(session_id, {"event": "tool_result", **result})
+            self._event(session_id, {"event": "tool_result", "task_id": item.get("task_id"), "phase": item.get("phase"), **result})
             self._event(session_id, {"event": "budget_settlement", "call": item["key"], "quota": quota,
                                      "result_bytes": len(result["content"].encode("utf-8")),
                                      "forfeited": bool(allocation["forfeited"])})
             if item["call"]["function"]["name"] == "submit_plan" and not failed:
-                plan = validate_plan(json.loads(item["call"]["function"]["arguments"]))
+                validator = validate_task_plan if state.metadata.get("task_mode") else validate_plan
+                plan = validator(json.loads(item["call"]["function"]["arguments"]))
                 saved = self.plan(session_id)
                 if saved and saved["data"] == plan:
                     return result
@@ -492,10 +624,19 @@ class SessionStore:
                                 (encoded(plan), stamp(), session_id))
                 self.db.execute("UPDATE sessions SET status='waiting_plan_approval' WHERE id=?", (session_id,))
                 self._event(session_id, {"event": "plan_saved", "plan": plan})
+                if state.metadata.get("task_mode"):
+                    for position, definition in enumerate(plan["steps"]):
+                        self.db.execute("INSERT INTO tasks VALUES (?,?,?,?, 'pending',NULL,NULL)", (session_id, definition["id"], position, encoded(definition)))
+            if task_outcome:
+                self._task_outcome(session_id, item, task_outcome)
         return result
 
     def complete(self, session_id: str, answer: str):
         with self.transaction():
+            if self.get(session_id).metadata.get("task_mode"):
+                tasks = self.tasks(session_id)
+                if not tasks or any(t["state"] != "completed" for t in tasks):
+                    raise SessionError("TASKS_NOT_COMPLETE: final answer cannot complete this session")
             self.db.execute("UPDATE sessions SET status='completed',final_answer=?,error=NULL,updated_at=? WHERE id=?", (answer, stamp(), session_id))
             self._event(session_id, {"event": "final", "content": answer})
 
@@ -527,7 +668,7 @@ class SessionStore:
             raise SessionError("Resolve only the first uncertain call")
         item = calls[0]
         if resolution == "retry":
-            if item["call"]["function"]["name"] not in {"write_file", "delete_file", "read_file", "list_files", "Bash", "bash", "submit_plan"}:
+            if item["call"]["function"]["name"] not in {"write_file", "delete_file", "read_file", "list_files", "Bash", "bash", "submit_plan", "complete_task", "fail_task"}:
                 raise SessionError("This instrument has no supported safe retry contract")
             with self.transaction():
                 self.db.execute("UPDATE calls SET state='pending' WHERE session_id=? AND batch=? AND position=?",

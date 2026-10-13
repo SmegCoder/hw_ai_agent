@@ -17,6 +17,12 @@ def confirm_plan(plan: dict) -> bool:
     print('Цель: ' + visible(plan['goal']))
     for number, step in enumerate(plan['steps'], 1):
         print(f"{number}. {visible(step['description'])}\n   Инструменты: {', '.join(step['tools'])}")
+        if 'id' in step:
+            print('   Задача: ' + step['id'] + '; зависит от: ' + (', '.join(step['depends_on']) or '—'))
+            verification = step['verification']
+            descriptions = {'file_written': 'Файл соответствует выполненной записи', 'file_read': 'Прочитано актуальное содержимое файла', 'file_absent': 'Файл отсутствует после удаления', 'tests_passed': 'Контрольные тесты проходят'}
+            target = verification.get('path', verification.get('command', ''))
+            print('   Проверка: ' + descriptions[verification['kind']] + ': ' + visible(target))
     for key, title in (('risks', 'Риски'), ('assumptions', 'Допущения'), ('done_criteria', 'Критерии готовности')):
         print(title + ':')
         for item in plan[key]:
@@ -89,7 +95,7 @@ def confirm_conflict(runtime, item: dict, verify=None) -> str | None:
                 print('Сравнение с предложенной записью:\n' + visible(diff[:4000] or '(содержимое совпадает)'))
     except (ToolError, OSError, ValueError, TypeError):
         print('Текущее состояние нельзя безопасно показать; проверьте workspace вручную.')
-    supported = function['name'] in {'write_file', 'delete_file', 'read_file', 'list_files', 'Bash', 'bash', 'submit_plan'}
+    supported = function['name'] in {'write_file', 'delete_file', 'read_file', 'list_files', 'Bash', 'bash', 'submit_plan', 'complete_task', 'fail_task'}
     print('1 — повторить поддержанный инструмент' if supported else 'Повтор этого инструмента не поддерживается.')
     print('2 — считать вызов неуспешным и продолжить\n3 — завершить с ошибкой')
     if function['name'] == 'write_file':
