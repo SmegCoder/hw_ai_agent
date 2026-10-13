@@ -11,10 +11,12 @@ import stat
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 from .policy import Action, ApprovalDeferred, ApprovalRequest, Decision, Policy, PolicyError
+from .budget import truncate_result
 from .filesystem import TargetChangedError, capture_target, write_target, remove_target, open_read_file, open_directory
 
 class ToolError(RuntimeError):
@@ -60,6 +62,21 @@ class ToolRuntime:
         self.approve = approve
         self.on_policy_event = on_policy_event
         self.policy_events: list[dict[str, Any]] = []
+        self.result_limit_bytes: int | None = None
+
+    @contextmanager
+    def output_budget(self, quota: int | None):
+        if quota is not None and (type(quota) is not int or quota < 1):
+            raise ValueError("Output quota must be positive")
+        previous = self.result_limit_bytes
+        self.result_limit_bytes = quota
+        try:
+            yield
+        finally:
+            self.result_limit_bytes = previous
+
+    def _bounded_output(self, content: str) -> str:
+        return content if self.result_limit_bytes is None else truncate_result(content, self.result_limit_bytes)
 
     @property
     def tool_schemas(self) -> list[dict[str, Any]]:
@@ -123,7 +140,8 @@ class ToolRuntime:
             if name == "write_file":
                 file = self._safe_path(arguments["path"])
                 try:
-                    original = self.read_file(arguments["path"]) if file.is_file() else ""
+                    with self.output_budget(None):
+                        original = self.read_file(arguments["path"]) if file.is_file() else ""
                     preview = "".join(difflib.unified_diff(original.splitlines(True),
                                 arguments["content"].splitlines(True), fromfile="current", tofile="proposed"))
                 except (ToolError, OSError, UnicodeError):
@@ -260,6 +278,8 @@ class ToolRuntime:
                         except FileNotFoundError:
                             continue
                         entries.append(item.as_posix() + ("/" if stat.S_ISDIR(info.st_mode) else ""))
+                        if self.result_limit_bytes is not None and len("\n".join(entries).encode("utf-8")) > self.result_limit_bytes:
+                            return self._bounded_output("\n".join(entries))
                         if len(entries) == 500:
                             return self._truncate("\n".join(entries) + "\n... list truncated ...")
                     if not recursive:
@@ -277,12 +297,15 @@ class ToolRuntime:
                 if os.fstat(descriptor).st_size > self.max_file_chars * 4:
                     raise ToolError("File exceeds size limit")
                 with os.fdopen(descriptor, encoding="utf-8", closefd=False) as stream:
-                    result = stream.read(self.max_file_chars + 1)
+                    limit = self.max_file_chars + 1
+                    if self.result_limit_bytes is not None:
+                        limit = min(limit, self.result_limit_bytes + 1)
+                    result = stream.read(limit)
         except TargetChangedError:
             raise ToolError("TARGET_CHANGED: cannot read the checked workspace file safely") from None
         if len(result) > self.max_file_chars:
             raise ToolError("File exceeds size limit; no partial content returned")
-        return result
+        return self._bounded_output(result)
 
     def write_file(self, path: str, content: str) -> str:
         self._check_phase("write_file")
@@ -371,6 +394,7 @@ class ToolRuntime:
             raise ToolError(f"Could not start sandbox: {type(exc).__name__}") from None
         chunks: dict[str, list[bytes]] = {"stdout": [], "stderr": []}
         count = 0
+        output_limit = min(self.max_output_chars, self.result_limit_bytes) if self.result_limit_bytes is not None else self.max_output_chars
         deadline = time.monotonic() + self.command_timeout
         selector = selectors.DefaultSelector()
         assert process.stdout is not None and process.stderr is not None
@@ -388,9 +412,9 @@ class ToolRuntime:
                     if not data:
                         selector.unregister(key.fileobj)
                         continue
-                    chunks[key.data].append(data[:max(0, self.max_output_chars - count)])
+                    chunks[key.data].append(data[:max(0, output_limit - count)])
                     count += len(data)
-                    if count >= self.max_output_chars:
+                    if count >= output_limit:
                         reason = "output truncated: command stopped at output limit"
                         break
                 if reason:
@@ -414,7 +438,7 @@ class ToolRuntime:
             raise ToolError("System sandbox is unavailable in this environment; Bash was not run")
         if reason == "Command timed out":
             raise ToolError(f"Command timed out after {self.command_timeout:g} seconds")
-        return f"exit_code={process.returncode}\nstdout:\n{stdout}\nstderr:\n{stderr}\n{reason}".rstrip()
+        return self._bounded_output(f"exit_code={process.returncode}\nstdout:\n{stdout}\nstderr:\n{stderr}\n{reason}".rstrip())
 
     @staticmethod
     def _terminate_process_group(process: subprocess.Popen) -> None:
@@ -438,7 +462,8 @@ class ToolRuntime:
             raise ToolError("Command process did not stop after termination") from None
 
     def _truncate(self, value: str) -> str:
-        return value if len(value) <= self.max_output_chars else value[:self.max_output_chars] + "\n... output truncated ..."
+        result = value if len(value) <= self.max_output_chars else value[:self.max_output_chars] + "\n... output truncated ..."
+        return self._bounded_output(result)
 
 def re_escape(value: str) -> str:
     import re

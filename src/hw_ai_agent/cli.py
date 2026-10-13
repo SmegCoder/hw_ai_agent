@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.request import urlopen
 from .agent import AgentError, CodingAgent
+from .budget import BudgetLimits, BudgetExceeded
 from .client import ModelClientError, OpenAICompatibleClient
 from .config import ConfigurationError, PROVIDERS, Settings, load_env
 from .demo import run_demo, verify_demo
@@ -23,6 +24,7 @@ from .workflow_demo import WorkflowClient, run_workflow_demo, verify_workflow
 from .planning import PlanApprovalDeferred
 from .terminal import visible, confirm_plan, choose_session, confirm_conflict
 from .plan_demo import PlanDemoClient, run_plan_demo
+from .budget_demo import run_budget_demo
 
 def show_event(event: dict) -> None:
     if event["event"] == "model_request":
@@ -41,6 +43,10 @@ def show_event(event: dict) -> None:
         print(f"Policy: {event['tool']} → {event['action']} / {event['outcome']}", flush=True)
         if event.get("source") == "session_grant":
             print("Используется разрешение, уже выданное для этой сессии.", flush=True)
+    elif event["event"] == "budget":
+        budget = event["budget"]
+        labels = {"model_requests": "модель", "tool_calls": "инструменты", "side_effects": "опасные действия", "result_bytes": "результаты (байт)"}
+        print("Бюджет: " + "; ".join(f"{labels[k]} {budget['spent'][k]}/{budget['limits'][k]}" for k in labels), flush=True)
     elif event["event"] in {"session_created", "session_resumed", "session_cached"}:
         print(f"Сессия: {event['session_id']} ({event['event']})", flush=True)
 
@@ -211,6 +217,7 @@ def session_command(args):
                 "provider": state.metadata.get("provider"), "model": state.metadata.get("model"),
                 "rounds": state.rounds, "max_rounds": state.max_rounds, "error": state.error,
                 "mode": state.metadata.get("execution_mode", "safe"),
+                "budget": store.budget(args.session_id),
                 "plan": store.plan(args.session_id), "unfinished_calls": calls}, ensure_ascii=False, indent=2))
             return 0
         if args.action in {"approve-plan", "reject-plan"}:
@@ -229,6 +236,8 @@ def session_command(args):
                 return 1
             print("Решение сохранено. Продолжение: hw-ai-agent resume " + args.session_id)
             return 0
+        if state.status == "budget_exhausted":
+            raise SessionError(state.error or "BUDGET_EXHAUSTED: saved budget was exhausted")
         if state.status == "aborted":
             raise SessionError("This session was terminated by the operator and cannot be resumed")
         runtime = saved_runtime(state, store.path, getattr(args, "approvals", None), listener)
@@ -268,9 +277,16 @@ def session_command(args):
         print(answer)
         return 0
 
+def add_budget_arguments(command):
+    command.add_argument("--max-tool-calls", type=int, default=128, help="Total tool-call budget for all run phases")
+    command.add_argument("--max-side-effects", type=int, default=32, help="Total write/delete/Bash attempts; zero permits reading only")
+    command.add_argument("--max-result-bytes", type=int, default=1_000_000, help="Total UTF-8 bytes of tool results")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Coding agent: OpenRouter / OpenAI / Ollama")
     subparsers = parser.add_subparsers(dest="action", required=True)
+    subparsers.add_parser("budget-demo", help="Check all four budgets, resume and crash accounting offline")
     subparsers.add_parser("policy-demo", help="Check allow/ask/deny offline, without an API key")
     subparsers.add_parser("session-demo", help="Interrupt and resume a scripted session without an API key")
     workflow = subparsers.add_parser("workflow-demo", help="Real-model multi-file optimization demo; --offline for scripted recovery")
@@ -278,6 +294,7 @@ def main() -> int:
     workflow.add_argument("--provider", choices=list(PROVIDERS))
     workflow.add_argument("--model")
     workflow.add_argument("--env-file", type=Path, default=Path(".env"))
+    add_budget_arguments(workflow)
     workflow.add_argument("--max-rounds", type=int, default=20)
     workflow.add_argument("--max-tokens", type=int, default=2048)
     workflow.add_argument("--mode", choices=["safe", "auto"], default="safe")
@@ -292,6 +309,7 @@ def main() -> int:
     plan_demo.add_argument("--provider", choices=list(PROVIDERS))
     plan_demo.add_argument("--model")
     plan_demo.add_argument("--env-file", type=Path, default=Path(".env"))
+    add_budget_arguments(plan_demo)
     plan_demo.add_argument("--max-rounds", type=int, default=20)
     plan_demo.add_argument("--max-tokens", type=int, default=2048)
     plan_demo.add_argument("--approvals", choices=["ask", "deny"], default="ask")
@@ -319,6 +337,7 @@ def main() -> int:
         command.add_argument("--model")
         command.add_argument("--env-file", type=Path, default=Path(".env"))
         if action in {"demo", "run", "plan"}:
+            add_budget_arguments(command)
             command.add_argument("--plan", action="store_true", default=action == "plan", help="Read-only planning before explicit approval")
             command.add_argument("--mode", choices=["safe", "auto"], default="safe")
             command.add_argument("--state-db", type=Path, default=Path(".agent/sessions.sqlite3"))
@@ -334,10 +353,19 @@ def main() -> int:
             command.add_argument("request", nargs="+")
     args = parser.parse_args()
     try:
+        budget_limits = None
+        if args.action in {"run", "plan", "demo", "plan-demo", "workflow-demo"}:
+            budget_limits = BudgetLimits(model_requests=args.max_rounds, tool_calls=args.max_tool_calls,
+                                         side_effects=args.max_side_effects, result_bytes=args.max_result_bytes)
         if getattr(args, "stop_after_tools", None) is not None and args.stop_after_tools < 1:
             raise ConfigurationError("--stop-after-tools must be positive")
         if args.action in {"sessions", "session", "resume", "resolve", "approve-plan", "reject-plan"}:
             return session_command(args)
+        if args.action == "budget-demo":
+            report = run_budget_demo(show_event)
+            print(json.dumps(report["checks"], ensure_ascii=False, indent=2))
+            print("BUDGET DEMO PASS" if report["success"] else "BUDGET DEMO FAIL")
+            return 0 if report["success"] else 1
         if args.action == "plan-demo":
             if args.max_rounds < 1 or args.max_tokens < 1:
                 raise ConfigurationError("Limits must be positive")
@@ -359,7 +387,7 @@ def main() -> int:
                                             approve_plan=confirm_plan, on_event=event_listener(args.stop_after_tools),
                                             crash_after_write=args.crash_after_write, client=client, offline=args.offline,
                                             max_rounds=args.max_rounds, approvals=args.approvals, policy=policy,
-                                            session_metadata=metadata))
+                                            session_metadata=metadata, budget_limits=budget_limits))
         if args.action == "session-demo":
             report = run_session_demo(show_event)
             print(json.dumps(report["checks"], ensure_ascii=False, indent=2))
@@ -386,7 +414,7 @@ def main() -> int:
             report = run_workflow_demo(workspace, args.state_db, mode=args.mode,
                 approve=confirm_action if args.approvals == "ask" else None, approvals=args.approvals,
                 on_event=event_listener(args.stop_after_tools), crash_after_write=args.crash_after_write,
-                client=client, max_rounds=args.max_rounds)
+                client=client, max_rounds=args.max_rounds, budget_limits=budget_limits)
             return report_workflow(report)
         if args.action == "setup":
             setup(args.provider or "openrouter", args.model, args.env_file)
@@ -417,23 +445,19 @@ def main() -> int:
                 report = run_demo(client, workspace, args.max_rounds, listener,
                     policy=policy, approve=confirm_action if args.approvals == "ask" else None,
                     store=store, session_metadata=metadata, mode=args.mode,
-                    trash_dir=args.state_db.resolve().parent / "trash", plan_mode=args.plan, approve_plan=confirm_plan)
+                    trash_dir=args.state_db.resolve().parent / "trash", plan_mode=args.plan, approve_plan=confirm_plan, budget_limits=budget_limits)
             return report_demo(report)
         workspace = args.workspace or Path(os.getenv("AGENT_WORKSPACE", "workspace"))
         runtime = ToolRuntime(workspace, policy=load_policy(args.policy, workspace), mode=args.mode,
                               trash_dir=args.state_db.resolve().parent / "trash",
                               approve=confirm_action if args.approvals == "ask" else None,
                               on_policy_event=listener)
-        if not args.plan:
-            preflight = runtime.bash("pwd")
-            if not preflight.startswith("exit_code=0\n"):
-                raise ToolError("Bash preflight failed")
         metadata = {"kind": "run", "policy_path": str(args.policy.resolve()) if args.policy else None,
                     "policy_source": "file" if args.policy else "default", "approvals": args.approvals,
                     "max_tokens": args.max_tokens}
         with SessionStore(args.state_db) as store:
             agent = CodingAgent(client, runtime, max_rounds=args.max_rounds, on_event=listener,
-                                store=store, session_metadata=metadata, plan_mode=args.plan, approve_plan=confirm_plan)
+                                store=store, session_metadata=metadata, plan_mode=args.plan, approve_plan=confirm_plan, budget_limits=budget_limits)
             print(agent.run(" ".join(args.request)))
         return 0
     except ApprovalDeferred as exc:
@@ -442,7 +466,7 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\nРабота остановлена. Продолжите через hw-ai-agent resume и выберите сессию в терминале.", file=sys.stderr)
         return 130
-    except (ConfigurationError, ModelClientError, AgentError, ToolError, PolicyError, SessionError, OSError, ValueError) as exc:
+    except (ConfigurationError, ModelClientError, AgentError, BudgetExceeded, ToolError, PolicyError, SessionError, OSError, ValueError) as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
         return 1
 

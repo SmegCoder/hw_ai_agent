@@ -10,6 +10,7 @@ from .client import ModelClientError
 from .reporting import public_report
 from .policy import Policy
 from .session import SessionStore
+from .budget import BudgetExceeded
 from .tools import ToolRuntime
 
 
@@ -87,7 +88,7 @@ class CrashAfterWriteRuntime(ToolRuntime):
 
 def run_workflow_demo(workspace: Path, db_path: Path, *, mode="safe", approve=None,
                       approvals="ask", on_event=None, crash_after_write=False,
-                      client=None, max_rounds=20):
+                      client=None, max_rounds=20, budget_limits=None):
     if db_path.resolve().is_relative_to(workspace.resolve()):
         raise ValueError("Session database must be outside workspace")
     workspace.mkdir(parents=True, exist_ok=False)
@@ -112,12 +113,12 @@ def run_workflow_demo(workspace: Path, db_path: Path, *, mode="safe", approve=No
                          "cleanup_required": real_model}}
     with SessionStore(db_path) as store:
         agent = CodingAgent(client if real_model else WorkflowClient(), runtime, store=store,
-                            on_event=on_event, session_metadata=metadata, max_rounds=max_rounds,
+                            on_event=on_event, session_metadata=metadata, max_rounds=max_rounds, budget_limits=budget_limits,
                             system_prompt=WORKFLOW_SYSTEM_PROMPT if real_model else DEFAULT_SYSTEM_PROMPT)
         error = None
         try:
             agent.run(WORKFLOW_REQUEST)
-        except (AgentError, ModelClientError) as exc:
+        except (AgentError, BudgetExceeded, ModelClientError) as exc:
             error = str(exc)
         return verify_workflow(agent, runtime, metadata, error=error)
 
@@ -132,7 +133,7 @@ def verify_workflow(agent, runtime, metadata, error=None):
     removed = [name for name in metadata["demo"].get("optional_files", []) if not (runtime.root / name).exists()]
     cleanup = len(removed) >= 2 if metadata["demo"].get("cleanup_required") else True
     functional = output.startswith("exit_code=0\n") and unchanged
-    report = {"workspace": str(runtime.root), "session_id": agent.session_id,
+    report = {"workspace": str(runtime.root), "session_id": agent.session_id, "budget": agent.budget,
               "mode": runtime.mode, "baseline": metadata["demo"]["baseline"],
               "verification": output, "tests_unchanged": unchanged,
               "success": error is None and functional and cleanup, "functional_success": functional,

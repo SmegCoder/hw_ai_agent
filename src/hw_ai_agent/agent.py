@@ -12,6 +12,7 @@ from .client import ModelClient
 from .tools import ToolError, ToolRuntime
 from .policy import ApprovalDeferred, Policy
 from .session import SessionError, SessionStore, UncertainActionError, PlanRejectedError
+from .budget import BudgetLimits, BudgetExceeded, MemoryBudget, output_ceiling
 from .planning import PLAN_SCHEMA, PLAN_INSTRUCTIONS, validate_plan, PlanError, PlanApprovalDeferred
 
 
@@ -35,6 +36,10 @@ class AgentError(RuntimeError):
     """Raised when the agent loop cannot finish safely."""
 
 
+class AgentBudgetExceeded(BudgetExceeded, AgentError, SessionError):
+    pass
+
+
 class CodingAgent:
     def __init__(
         self,
@@ -44,6 +49,7 @@ class CodingAgent:
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         max_rounds: int = 12,
         max_context_chars: int = 120_000,
+        budget_limits: BudgetLimits | None = None,
         on_event: Callable[[dict[str, Any]], None] | None = None,
         store: SessionStore | None = None,
         session_metadata: dict | None = None,
@@ -61,6 +67,10 @@ class CodingAgent:
         self.system_prompt = system_prompt
         self.max_rounds = max_rounds
         self.max_context_chars = max_context_chars
+        self.budget_limits = budget_limits or BudgetLimits(model_requests=max_rounds)
+        if self.budget_limits.model_requests != max_rounds:
+            raise ValueError("Model budget must equal max_rounds")
+        self._memory_budget = MemoryBudget(self.budget_limits)
         self.on_event = on_event
         self.events: list[dict[str, Any]] = []
         self.messages: list[dict[str, Any]] = []
@@ -83,6 +93,7 @@ class CodingAgent:
             raise SessionError("Plan Mode requires a session store")
         self.runtime.phase = "planning" if self.plan_mode else "execution"
         self.events = []
+        self._memory_budget = MemoryBudget(self.budget_limits)
         self._call_records = {}
         self.runtime.session_permissions = set()
         self.messages = [
@@ -90,7 +101,7 @@ class CodingAgent:
             {"role": "user", "content": request},
         ]
         if self.store:
-            self.session_id = self.store.create(self._binding(), self.messages, self.max_rounds, self.max_context_chars)
+            self.session_id = self.store.create(self._binding(), self.messages, self.max_rounds, self.max_context_chars, self.budget_limits)
             return self._stored_run(self.session_id, "session_created")
         return self._loop(0)
 
@@ -135,6 +146,9 @@ class CodingAgent:
             state = self.store.get(session_id)
             if state.status == "aborted":
                 raise SessionError("This session was terminated by the operator and cannot be resumed")
+            self.store.budget(session_id)  # Validate saved counters before model or tool access.
+            if state.status == "budget_exhausted":
+                raise SessionError(state.error or "BUDGET_EXHAUSTED: saved budget was exhausted")
             self._check_binding(state.metadata)
             self.plan_mode = state.metadata.get("plan_mode", False)
             if type(self.plan_mode) is not bool:
@@ -148,6 +162,7 @@ class CodingAgent:
                 self._remember_call(item["call"], item["result"])
             self.runtime.session_permissions = set()
             self.max_rounds, self.max_context_chars = state.max_rounds, state.max_context_chars
+            self.budget_limits = BudgetLimits.restore(self.store.budget(session_id)["limits"])
             if state.status == "completed":
                 if self.on_event:
                     self.on_event({"event": "session_cached", "session_id": session_id})
@@ -175,6 +190,7 @@ class CodingAgent:
                 self.events = copy.deepcopy(self.store.get(session_id).events)
                 self.store.set_status(session_id, "running")
                 self._emit({"event": event, "session_id": session_id})
+                self._emit_budget()
                 # A final assistant message may have been committed just before process death.
                 last = self.messages[-1]
                 if (self.runtime.phase != "planning" and last.get("role") == "assistant"
@@ -185,27 +201,36 @@ class CodingAgent:
                     return answer
                 return self._loop(state.rounds)
             except BaseException as exc:
-                status = ("blocked" if isinstance(exc, UncertainActionError) else
+                status = ("budget_exhausted" if isinstance(exc, BudgetExceeded) else
+                          "blocked" if isinstance(exc, UncertainActionError) else
                           "waiting_plan_approval" if isinstance(exc, PlanApprovalDeferred) else
                           "aborted" if isinstance(exc, PlanRejectedError) or self.store.get(session_id).status == "aborted" else
                           "waiting_approval" if isinstance(exc, ApprovalDeferred) else
                           "interrupted" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else "failed")
                 try:
-                    self.store.set_status(session_id, status, type(exc).__name__)
+                    self.store.set_status(session_id, status, str(exc) if isinstance(exc, BudgetExceeded) else type(exc).__name__)
+                    if isinstance(exc, BudgetExceeded):
+                        self._emit_budget()
                 except SessionError:
                     pass
                 raise
 
     def _loop(self, rounds: int) -> str:
         if self.store and self.session_id:
+            self.store.reserve_pending(self.session_id)
             for item in self.store.calls(self.session_id, True):
                 self._registered_call(item)
             self._review_plan()
         while rounds < self.max_rounds:
             if len(json.dumps(self.messages, ensure_ascii=False)) > self.max_context_chars:
                 raise AgentError("Conversation exceeds the context size limit")
-            rounds = self.store.start_model(self.session_id) if self.store and self.session_id else rounds + 1
+            if self.store and self.session_id:
+                rounds = self.store.start_model(self.session_id)
+            else:
+                self._memory_budget.charge(model_requests=1)
+                rounds += 1
             self._emit({"event": "model_request", "round": rounds}, persist=False)
+            self._emit_budget()
             schemas = self.runtime.tool_schemas
             if self.runtime.phase == "planning":
                 schemas = [*schemas, copy.deepcopy(PLAN_SCHEMA)]
@@ -223,6 +248,9 @@ class CodingAgent:
                 raise AgentError("Model returned neither tool calls nor a final answer")
             if self.store and self.session_id:
                 self.store.assistant(self.session_id, assistant, rounds)
+            else:
+                cached = {key for key, (_, result) in self._call_records.items() if result is not None}
+                self._memory_budget.batch(tool_calls, cached)
             self.messages.append(assistant)
             if not tool_calls:
                 content = assistant.get("content")
@@ -243,14 +271,19 @@ class CodingAgent:
                     self._registered_call(item)
                 self._review_plan()
                 continue
-            for call in tool_calls:
+            for index, call in enumerate(tool_calls):
+                quota = self._memory_budget.reserve_output(output_ceiling(call["function"]["name"], self.runtime), len(tool_calls) - index - 1)
                 self._emit({"event": "tool_call", "name": call["function"]["name"],
                             "arguments": call["function"]["arguments"]})
-                tool_result = self._execute_tool_call(call)
+                with self.runtime.output_budget(quota):
+                    tool_result = self._execute_tool_call(call)
+                tool_result = {**tool_result, "content": self._memory_budget.finish_output(tool_result["content"], quota)}
+                self._remember_call(call, tool_result)
                 self.messages.append(tool_result)
                 self._emit({"event": "tool_result", **tool_result})
+                self._emit_budget()
 
-        raise AgentError(f"agent exceeded the limit of {self.max_rounds} model rounds")
+        raise AgentBudgetExceeded("model_requests", 1, 0)
 
     def _review_plan(self):
         if not self.store or not self.session_id:
@@ -299,17 +332,27 @@ class CodingAgent:
     def _registered_call(self, item: dict):
         assert self.store is not None and self.session_id is not None
         call = item["call"]
-        self.store.start_call(self.session_id, item)
+        quota = self.store.start_call(self.session_id, item, output_ceiling(call["function"]["name"], self.runtime))
         self._active_call = item
         self._emit({"event": "tool_call", "name": call["function"]["name"],
                     "arguments": call["function"]["arguments"]}, persist=False)
         try:
-            result = self._execute_tool_call(call)
+            with self.runtime.output_budget(quota):
+                result = self._execute_tool_call(call)
         finally:
             self._active_call = None
-        self.store.finish_call(self.session_id, item, result)
+        result = self.store.finish_call(self.session_id, item, result)
+        self._remember_call(call, result)
         self.messages.append(result)
         self._emit({"event": "tool_result", **result}, persist=False)
+        self._emit_budget()
+
+    @property
+    def budget(self) -> dict:
+        return self.store.budget(self.session_id) if self.store and self.session_id else copy.deepcopy(self._memory_budget.state)
+
+    def _emit_budget(self):
+        self._emit({"event": "budget", "budget": self.budget}, persist=False)
 
     @staticmethod
     def _assistant_message(response: Mapping[str, Any]) -> dict[str, Any]:

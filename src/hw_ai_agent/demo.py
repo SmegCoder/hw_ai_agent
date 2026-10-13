@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from .agent import AgentError, CodingAgent
 from .client import ModelClientError, OpenAICompatibleClient
+from .budget import BudgetExceeded
 from .tools import ToolRuntime
 from .policy import Policy
 from .session import SessionStore
@@ -42,7 +43,7 @@ def initialize_demo(workspace: Path) -> None:
 def run_demo(client: OpenAICompatibleClient, workspace: Path, max_rounds: int = 12,
              on_event=None, *, policy: Policy | None = None, approve=None,
              store: SessionStore | None = None, session_metadata: dict | None = None,
-             mode: str = "safe", trash_dir: Path | None = None, plan_mode=False, approve_plan=None) -> dict:
+             mode: str = "safe", trash_dir: Path | None = None, plan_mode=False, approve_plan=None, budget_limits=None) -> dict:
     initialize_demo(workspace)
     runtime = ToolRuntime(workspace, policy=policy, approve=approve, on_policy_event=on_event,
                           mode=mode, trash_dir=trash_dir)
@@ -54,7 +55,7 @@ def run_demo(client: OpenAICompatibleClient, workspace: Path, max_rounds: int = 
     test_hash = hashlib.sha256(test.read_bytes()).hexdigest()
     metadata = {**(session_metadata or {}), "kind": "demo", "demo": {"baseline": before, "test_hash": test_hash}}
     agent = CodingAgent(client, runtime, max_rounds=max_rounds, on_event=on_event,
-                        store=store, session_metadata=metadata, plan_mode=plan_mode, approve_plan=approve_plan)
+                        store=store, session_metadata=metadata, plan_mode=plan_mode, approve_plan=approve_plan, budget_limits=budget_limits)
     error = None
     answer = ""
     try:
@@ -65,7 +66,7 @@ def run_demo(client: OpenAICompatibleClient, workspace: Path, max_rounds: int = 
             "Once they pass, stop calling tools and give a short final summary. "
             "Do not change tests or create auxiliary files. Respond in Russian."
         )
-    except (AgentError, ModelClientError) as exc:
+    except (AgentError, BudgetExceeded, ModelClientError) as exc:
         error = str(exc)
     return verify_demo(client, workspace, runtime, before, test_hash, answer,
                        agent.events, error, agent.session_id)
@@ -89,6 +90,7 @@ def verify_demo(client, workspace, runtime, before, test_hash, answer, events, e
               "usage": [e["usage"] for e in events if e.get("event") == "model_usage"] or client.usage,
               "events": events,
               "session_id": session_id,
+              "budget": next((e["budget"] for e in reversed(events) if e.get("event") == "budget"), None),
               "policy_events": runtime.policy_events}
     (workspace / "demo-report.json").write_text(
         json.dumps(public_report(report, workspace), ensure_ascii=False, indent=2), encoding="utf-8")

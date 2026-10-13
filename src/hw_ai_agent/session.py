@@ -12,9 +12,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from .planning import validate_plan, PlanError
+from .budget import BudgetLimits, BudgetExceeded, DIMENSIONS, snapshot, debit, batch_cost, truncate_result
 
 
 class SessionError(RuntimeError):
+    pass
+
+
+class SessionBudgetExceeded(BudgetExceeded, SessionError):
     pass
 
 
@@ -71,7 +76,7 @@ class SessionStore:
             self.db = sqlite3.connect(self.path, timeout=5, isolation_level=None)
             self.db.row_factory = sqlite3.Row
             version = self.db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1, 2):
+            if version not in (0, 1, 2, 3):
                 raise SessionError("Unsupported session database version")
             self.db.execute("PRAGMA foreign_keys=ON")
             self.db.execute("PRAGMA synchronous=FULL")
@@ -92,8 +97,19 @@ class SessionStore:
                     session_id TEXT PRIMARY KEY REFERENCES sessions(id),
                     state TEXT NOT NULL, data TEXT, updated_at TEXT NOT NULL
                 );
-                PRAGMA user_version=2;
+                CREATE TABLE IF NOT EXISTS budgets (
+                    session_id TEXT PRIMARY KEY REFERENCES sessions(id),
+                    limits TEXT NOT NULL, spent TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS call_budgets (
+                    session_id TEXT NOT NULL, batch INTEGER NOT NULL, position INTEGER NOT NULL,
+                    paid INTEGER NOT NULL, output_quota INTEGER, forfeited INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(session_id,batch,position),
+                    FOREIGN KEY(session_id,batch,position) REFERENCES calls(session_id,batch,position)
+                );
             ''')
+            if version < 3:
+                self._migrate_budgets()
         except (sqlite3.Error, SessionError):
             if hasattr(self, "db"):
                 self.db.close()
@@ -140,18 +156,100 @@ class SessionStore:
         finally:
             os.close(fd)
 
-    def create(self, metadata: dict, messages: list, max_rounds: int, max_context_chars: int) -> str:
+    def _migrate_budgets(self):
+        with self.transaction():
+            for row in self.db.execute("SELECT id FROM sessions").fetchall():
+                state = self.get(row["id"])
+                if self.db.execute("SELECT 1 FROM budgets WHERE session_id=?", (state.id,)).fetchone():
+                    continue  # Existing counters are never reset, even by a legacy version marker.
+                calls = self.calls(state.id)
+                attempts = [e for e in state.events if e.get("event") == "tool_call"]
+                spent = {"model_requests": state.rounds, "tool_calls": len(attempts),
+                         "side_effects": sum(e.get("name") in {"write_file", "delete_file", "Bash", "bash"} for e in attempts),
+                         "result_bytes": sum(len(m.get("content", "").encode("utf-8")) for m in state.messages if m.get("role") == "tool")}
+                defaults = BudgetLimits(model_requests=state.max_rounds).as_dict()
+                limits = {k: max(defaults[k], spent[k]) for k in DIMENSIONS}
+                self.db.execute("INSERT INTO budgets VALUES (?,?,?)", (state.id, encoded(limits), encoded(spent)))
+                for item in calls:
+                    paid = int(any(e.get("call") == item["key"] for e in attempts))
+                    self.db.execute("INSERT INTO call_budgets VALUES (?,?,?,?,NULL,0)",
+                                    (state.id, item["batch"], item["position"], paid))
+                metadata = {**state.metadata, "budget_contract": 1}
+                self.db.execute("UPDATE sessions SET metadata=? WHERE id=?", (encoded(metadata), state.id))
+                self._event(state.id, {"event": "budget_migrated", "budget": snapshot(limits, spent)})
+            self.db.execute("PRAGMA user_version=3")
+
+    def budget(self, session_id: str) -> dict:
+        state = self.get(session_id)
+        row = self.db.execute("SELECT * FROM budgets WHERE session_id=?", (session_id,)).fetchone()
+        try:
+            if row is None:
+                raise ValueError("Missing budget")
+            budget = snapshot(json.loads(row["limits"]), json.loads(row["spent"]))
+            if budget["spent"]["model_requests"] != state.rounds or budget["limits"]["model_requests"] != state.max_rounds:
+                raise ValueError("Model counter differs")
+            paid = self.db.execute("SELECT COALESCE(SUM(paid),0) FROM call_budgets WHERE session_id=?", (session_id,)).fetchone()[0]
+            held = self.db.execute("SELECT COALESCE(SUM(output_quota),0) FROM call_budgets WHERE session_id=?", (session_id,)).fetchone()[0]
+            delivered = sum(len(m.get("content", "").encode("utf-8")) for m in state.messages if m.get("role") == "tool")
+            if paid > budget["spent"]["tool_calls"] or held + delivered > budget["spent"]["result_bytes"]:
+                raise ValueError("Counters do not cover saved calls/results")
+            return budget
+        except (ValueError, TypeError, KeyError):
+            raise SessionError("Invalid saved budget; continuation refused") from None
+
+    def _charge(self, session_id: str, **cost):
+        try:
+            budget = debit(self.budget(session_id), **cost)
+        except BudgetExceeded as exc:
+            raise SessionBudgetExceeded(exc.dimension, exc.requested, exc.remaining) from None
+        self.db.execute("UPDATE budgets SET spent=? WHERE session_id=?", (encoded(budget["spent"]), session_id))
+        self._event(session_id, {"event": "budget_debit", "cost": cost, "spent": budget["spent"]})
+        return budget
+
+    def _allocation(self, session_id, item):
+        row = self.db.execute("SELECT * FROM call_budgets WHERE session_id=? AND batch=? AND position=?",
+                              (session_id, item["batch"], item["position"])).fetchone()
+        if (row is None or row["paid"] not in (0, 1) or row["forfeited"] not in (0, 1)
+                or row["output_quota"] is not None and (type(row["output_quota"]) is not int or row["output_quota"] < 1)):
+            raise SessionError("Invalid saved call budget")
+        if row["output_quota"] is not None and row["output_quota"] > self.budget(session_id)["spent"]["result_bytes"]:
+            raise SessionError("Saved output reservation exceeds charged budget")
+        return row
+
+    def reserve_pending(self, session_id: str):
+        # Covers legacy pending batches and explicit retries before any call starts.
+        with self.transaction():
+            pending = self.calls(session_id, True)
+            unpaid = [i for i in pending if not self._allocation(session_id, i)["paid"]]
+            unreserved = sum(self._allocation(session_id, i)["output_quota"] is None for i in pending)
+            available = self.budget(session_id)["remaining"]["result_bytes"]
+            if unreserved > available:
+                raise SessionBudgetExceeded("result_bytes", unreserved, available)
+            if unpaid:
+                cached = {i["call"]["id"] for i in self.calls(session_id) if i["result"] is not None}
+                self._charge(session_id, **batch_cost([i["call"] for i in unpaid], cached))
+                for item in unpaid:
+                    self.db.execute("UPDATE call_budgets SET paid=1 WHERE session_id=? AND batch=? AND position=?",
+                                    (session_id, item["batch"], item["position"]))
+
+    def create(self, metadata: dict, messages: list, max_rounds: int, max_context_chars: int,
+               budgets: BudgetLimits | None = None) -> str:
         workspace = Path(metadata["workspace"]).resolve()
         if self.path.is_relative_to(workspace):
             raise SessionError("Session database must be outside the model workspace")
         if type(max_rounds) is not int or max_rounds < 1 or type(max_context_chars) is not int or max_context_chars < 1:
             raise SessionError("Invalid session limits")
+        budgets = budgets or BudgetLimits(model_requests=max_rounds)
+        if budgets.model_requests != max_rounds:
+            raise SessionError("Model budget differs from max_rounds")
+        metadata = {**metadata, "budget_contract": 1}
         session_id = uuid.uuid4().hex
         now = stamp()
         with self.transaction():
             self.db.execute("INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (session_id, encoded(metadata), encoded(messages), "[]", "ready", 0,
                  max_rounds, max_context_chars, None, None, now, now))
+            self.db.execute("INSERT INTO budgets VALUES (?,?,?)", (session_id, encoded(budgets.as_dict()), encoded(dict.fromkeys(DIMENSIONS, 0))))
             if metadata.get("plan_mode"):
                 self.db.execute("INSERT INTO plans VALUES (?, 'planning', NULL, ?)", (session_id, now))
         return session_id
@@ -170,7 +268,7 @@ class SessionStore:
             if not messages or any(not isinstance(m, dict) or m.get("role") not in
                 {"system", "user", "assistant", "tool"} for m in messages):
                 raise SessionError("Invalid saved messages")
-            if row["status"] not in {"ready", "running", "interrupted", "waiting_approval", "waiting_plan_approval", "failed", "blocked", "completed", "aborted"}:
+            if row["status"] not in {"ready", "running", "interrupted", "waiting_approval", "waiting_plan_approval", "failed", "blocked", "completed", "aborted", "budget_exhausted"}:
                 raise SessionError("Invalid session status")
             if row["status"] == "completed" and not isinstance(row["final_answer"], str):
                 raise SessionError("Completed session has no final answer")
@@ -262,21 +360,38 @@ class SessionStore:
     def start_model(self, session_id: str) -> int:
         with self.transaction():
             state = self.get(session_id)
-            if state.rounds >= state.max_rounds:
-                raise SessionError("Saved model round limit has been reached")
+            self._charge(session_id, model_requests=1)
             number = state.rounds + 1
             self.db.execute("UPDATE sessions SET rounds=?,updated_at=? WHERE id=?", (number, stamp(), session_id))
             self._event(session_id, {"event": "model_request", "round": number})
         return number
 
     def assistant(self, session_id: str, message: dict, batch: int):
+        failure = None
         with self.transaction():
             state = self.get(session_id)
-            self.db.execute("UPDATE sessions SET messages=?,updated_at=? WHERE id=?",
-                (encoded([*state.messages, message]), stamp(), session_id))
-            for position, call in enumerate(message.get("tool_calls") or []):
-                self.db.execute("INSERT INTO calls VALUES (?,?,?,?,?,NULL)",
-                    (session_id, batch, position, encoded(call), "pending"))
+            calls = message.get("tool_calls") or []
+            cached = {i["call"]["id"] for i in self.calls(session_id) if i["result"] is not None}
+            try:
+                available = self.budget(session_id)["remaining"]["result_bytes"]
+                if len(calls) > available:
+                    raise SessionBudgetExceeded("result_bytes", len(calls), available)
+                self._charge(session_id, **batch_cost(calls, cached))
+            except SessionBudgetExceeded as exc:
+                failure = exc
+                self._event(session_id, {"event": "batch_rejected", "assistant": message, "reason": str(exc)})
+                self.db.execute("UPDATE sessions SET status='budget_exhausted',error=?,updated_at=? WHERE id=?",
+                                (str(exc), stamp(), session_id))
+            else:
+                self.db.execute("UPDATE sessions SET messages=?,updated_at=? WHERE id=?",
+                    (encoded([*state.messages, message]), stamp(), session_id))
+                for position, call in enumerate(calls):
+                    self.db.execute("INSERT INTO calls VALUES (?,?,?,?,?,NULL)",
+                        (session_id, batch, position, encoded(call), "pending"))
+                    self.db.execute("INSERT INTO call_budgets VALUES (?,?,?,?,NULL,0)",
+                                    (session_id, batch, position, 1))
+        if failure:
+            raise failure
 
     def calls(self, session_id: str, unfinished_only=False) -> list[dict]:
         self.validate_id(session_id)
@@ -298,8 +413,24 @@ class SessionStore:
         except (ValueError, TypeError):
             raise SessionError("Invalid saved tool calls") from None
 
-    def start_call(self, session_id: str, item: dict):
+    def start_call(self, session_id: str, item: dict, output_ceiling: int = 1024) -> int:
+        if type(output_ceiling) is not int or output_ceiling < 1:
+            raise SessionError("Invalid output ceiling")
         with self.transaction():
+            allocation = self._allocation(session_id, item)
+            if not allocation["paid"]:
+                raise SessionError("Tool batch budget has not been reserved")
+            quota = allocation["output_quota"]
+            if quota is None:
+                future = sum(i["key"] != item["key"] and self._allocation(session_id, i)["output_quota"] is None
+                             for i in self.calls(session_id, True))
+                available = self.budget(session_id)["remaining"]["result_bytes"]
+                if available <= future:
+                    raise SessionBudgetExceeded("result_bytes", future + 1, available)
+                quota = min(output_ceiling, available - future)
+                self._charge(session_id, result_bytes=quota)
+                self.db.execute("UPDATE call_budgets SET output_quota=? WHERE session_id=? AND batch=? AND position=?",
+                                (quota, session_id, item["batch"], item["position"]))
             cursor = self.db.execute("UPDATE calls SET state='running' WHERE session_id=? AND batch=? AND position=? AND state IN ('pending','awaiting_approval')",
                 (session_id, item["batch"], item["position"]))
             if cursor.rowcount != 1:
@@ -310,6 +441,7 @@ class SessionStore:
             self._event(session_id, {"event": "tool_call", "call": item["key"], "attempt": attempt,
                                     "tool_call_id": item["call"]["id"],
                                     "name": function["name"], "arguments": function["arguments"]})
+        return quota
 
     def wait_for_approval(self, session_id: str, item: dict):
         with self.transaction():
@@ -324,25 +456,43 @@ class SessionStore:
     def finish_call(self, session_id: str, item: dict, result: dict):
         with self.transaction():
             state = self.get(session_id)
+            allocation = self._allocation(session_id, item)
+            quota = allocation["output_quota"]
+            failed = result["content"].startswith("ERROR:")
+            if quota is None:
+                # Legacy uncertain calls have no reservation from the old runtime.
+                quota = max(1, len(result["content"].encode("utf-8")))
+                self._charge(session_id, result_bytes=quota)
+            result = {**result, "content": truncate_result(result["content"], quota)}
+            if not allocation["forfeited"] and allocation["output_quota"] is not None:
+                budget = self.budget(session_id)
+                spent = {**budget["spent"], "result_bytes": budget["spent"]["result_bytes"] - quota + len(result["content"].encode("utf-8"))}
+                self.db.execute("UPDATE budgets SET spent=? WHERE session_id=?", (encoded(spent), session_id))
             cursor = self.db.execute("UPDATE calls SET state=?,result=? WHERE session_id=? AND batch=? AND position=? AND state IN ('running','uncertain')",
-                ("failed" if result["content"].startswith("ERROR:") else "completed", encoded(result),
+                ("failed" if failed else "completed", encoded(result),
                  session_id, item["batch"], item["position"]))
             if cursor.rowcount != 1:
                 raise SessionError("Cannot checkpoint this tool result")
+            self.db.execute("UPDATE call_budgets SET output_quota=NULL WHERE session_id=? AND batch=? AND position=?",
+                            (session_id, item["batch"], item["position"]))
             self.db.execute("UPDATE sessions SET messages=?,updated_at=? WHERE id=?",
                             (encoded([*state.messages, result]), stamp(), session_id))
             self._event(session_id, {"event": "tool_result", **result})
-            if item["call"]["function"]["name"] == "submit_plan" and not result["content"].startswith("ERROR:"):
+            self._event(session_id, {"event": "budget_settlement", "call": item["key"], "quota": quota,
+                                     "result_bytes": len(result["content"].encode("utf-8")),
+                                     "forfeited": bool(allocation["forfeited"])})
+            if item["call"]["function"]["name"] == "submit_plan" and not failed:
                 plan = validate_plan(json.loads(item["call"]["function"]["arguments"]))
                 saved = self.plan(session_id)
                 if saved and saved["data"] == plan:
-                    return
+                    return result
                 if not saved or saved["state"] != "planning":
                     raise SessionError("Cannot replace a saved plan")
                 self.db.execute("UPDATE plans SET state='awaiting_approval',data=?,updated_at=? WHERE session_id=?",
                                 (encoded(plan), stamp(), session_id))
                 self.db.execute("UPDATE sessions SET status='waiting_plan_approval' WHERE id=?", (session_id,))
                 self._event(session_id, {"event": "plan_saved", "plan": plan})
+        return result
 
     def complete(self, session_id: str, answer: str):
         with self.transaction():
@@ -351,6 +501,8 @@ class SessionStore:
 
     def recover(self, session_id: str):
         with self.transaction():
+            # Reservations surviving interruption are never released afterwards.
+            self.db.execute("UPDATE call_budgets SET forfeited=1 WHERE session_id=? AND output_quota IS NOT NULL AND (batch,position) IN (SELECT batch,position FROM calls WHERE session_id=? AND state IN ('running','uncertain','awaiting_approval'))", (session_id, session_id))
             for item in self.calls(session_id, True):
                 if item["state"] != "running":
                     continue
@@ -380,6 +532,8 @@ class SessionStore:
             with self.transaction():
                 self.db.execute("UPDATE calls SET state='pending' WHERE session_id=? AND batch=? AND position=?",
                     (session_id, item["batch"], item["position"]))
+                self.db.execute("UPDATE call_budgets SET paid=0,output_quota=NULL,forfeited=0 WHERE session_id=? AND batch=? AND position=?",
+                                (session_id, item["batch"], item["position"]))
                 self._event(session_id, {"event": "recovery_resolution", "call": key, "resolution": resolution})
         elif resolution == "abort":
             with self.transaction():
@@ -395,6 +549,9 @@ class SessionStore:
             content = ("RECOVERY_CONFIRMED: operator verified the write; check tests before finishing" if resolution == "applied"
                        else "ERROR: RECOVERY_SKIPPED: operator declined repeating the uncertain action; inspect the workspace")
             result = {"role": "tool", "tool_call_id": item["call"]["id"], "name": function["name"], "content": content}
+            with self.transaction():
+                self.db.execute("UPDATE call_budgets SET forfeited=1 WHERE session_id=? AND batch=? AND position=?",
+                                (session_id, item["batch"], item["position"]))
             self.finish_call(session_id, item, result)
             self.event(session_id, {"event": "recovery_resolution", "call": key, "resolution": resolution})
         else:
