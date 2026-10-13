@@ -88,7 +88,7 @@ class CrashAfterWriteRuntime(ToolRuntime):
 
 def run_workflow_demo(workspace: Path, db_path: Path, *, mode="safe", approve=None,
                       approvals="ask", on_event=None, crash_after_write=False,
-                      client=None, max_rounds=20, budget_limits=None):
+                      client=None, max_rounds=20, budget_limits=None, journal_mode=False):
     if db_path.resolve().is_relative_to(workspace.resolve()):
         raise ValueError("Session database must be outside workspace")
     workspace.mkdir(parents=True, exist_ok=False)
@@ -113,7 +113,7 @@ def run_workflow_demo(workspace: Path, db_path: Path, *, mode="safe", approve=No
                          "cleanup_required": real_model}}
     with SessionStore(db_path) as store:
         agent = CodingAgent(client if real_model else WorkflowClient(), runtime, store=store,
-                            on_event=on_event, session_metadata=metadata, max_rounds=max_rounds, budget_limits=budget_limits,
+                            on_event=on_event, session_metadata=metadata, max_rounds=max_rounds, budget_limits=budget_limits, journal_mode=journal_mode,
                             system_prompt=WORKFLOW_SYSTEM_PROMPT if real_model else DEFAULT_SYSTEM_PROMPT)
         error = None
         try:

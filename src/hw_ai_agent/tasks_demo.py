@@ -80,7 +80,7 @@ class TasksDemoClient:
 
 def run_tasks_demo(workspace: Path, db_path: Path, *, client=None, offline=False, mode='safe', approve=None,
                    approve_plan=None, on_event=None, max_rounds=30, budget_limits=None, policy=None,
-                   session_metadata=None, approvals='ask', crash_after_write=False, max_tokens=3072):
+                   session_metadata=None, approvals='ask', crash_after_write=False, max_tokens=3072, journal_mode=False):
     if offline:
         if client is not None:
             raise ValueError('Offline demo cannot use a real model client')
@@ -99,7 +99,7 @@ def run_tasks_demo(workspace: Path, db_path: Path, *, client=None, offline=False
                 'demo': {'offline': offline, 'test_hash': hashlib.sha256(TESTS.encode()).hexdigest()}}
     with SessionStore(db_path) as store:
         agent = CodingAgent(client, runtime, task_mode=True, store=store, approve_plan=approve_plan,
-                            on_event=on_event, max_rounds=max_rounds, budget_limits=budget_limits, session_metadata=metadata)
+                            on_event=on_event, max_rounds=max_rounds, budget_limits=budget_limits, journal_mode=journal_mode, session_metadata=metadata)
         error, answer = None, ''
         try:
             answer = agent.run('Изучи файлы и составь план минимум из трёх задач с зависимостями и проверяемыми результатами. '

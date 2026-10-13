@@ -77,7 +77,7 @@ class SessionStore:
             self.db = sqlite3.connect(self.path, timeout=5, isolation_level=None)
             self.db.row_factory = sqlite3.Row
             version = self.db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1, 2, 3, 4):
+            if version not in (0, 1, 2, 3, 4, 5):
                 raise SessionError("Unsupported session database version")
             self.db.execute("PRAGMA foreign_keys=ON")
             self.db.execute("PRAGMA synchronous=FULL")
@@ -121,11 +121,28 @@ class SessionStore:
                     FOREIGN KEY(session_id,batch,position) REFERENCES calls(session_id,batch,position),
                     FOREIGN KEY(session_id,task_id) REFERENCES tasks(session_id,task_id)
                 );
+                CREATE TABLE IF NOT EXISTS journal_blobs (sha256 TEXT PRIMARY KEY, data BLOB NOT NULL);
+                CREATE TABLE IF NOT EXISTS journal_images (
+                    session_id TEXT NOT NULL REFERENCES sessions(id),revision INTEGER NOT NULL,tree TEXT NOT NULL,
+                    PRIMARY KEY(session_id,revision)
+                );
+                CREATE TABLE IF NOT EXISTS journals (
+                    session_id TEXT PRIMARY KEY REFERENCES sessions(id),revision INTEGER NOT NULL,status TEXT NOT NULL,rollback_plan TEXT
+                );
+                CREATE TABLE IF NOT EXISTS journal_entries (
+                    session_id TEXT NOT NULL REFERENCES sessions(id),path TEXT NOT NULL,before_state TEXT NOT NULL,after_state TEXT NOT NULL,
+                    PRIMARY KEY(session_id,path)
+                );
+                CREATE TABLE IF NOT EXISTS journal_actions (
+                    session_id TEXT NOT NULL REFERENCES sessions(id),call_key TEXT NOT NULL,ordinal INTEGER NOT NULL,
+                    pre_revision INTEGER NOT NULL,post_revision INTEGER,state TEXT NOT NULL,prior_entries TEXT NOT NULL,ownership TEXT,
+                    PRIMARY KEY(session_id,call_key,ordinal)
+                );
             ''')
             if version < 3:
                 self._migrate_budgets()
             with self.transaction():
-                self.db.execute("PRAGMA user_version=4")
+                self.db.execute("PRAGMA user_version=5")
         except (sqlite3.Error, SessionError):
             if hasattr(self, "db"):
                 self.db.close()
@@ -284,7 +301,7 @@ class SessionStore:
             if not messages or any(not isinstance(m, dict) or m.get("role") not in
                 {"system", "user", "assistant", "tool"} for m in messages):
                 raise SessionError("Invalid saved messages")
-            if row["status"] not in {"ready", "running", "interrupted", "waiting_approval", "waiting_plan_approval", "failed", "blocked", "completed", "aborted", "budget_exhausted"}:
+            if row["status"] not in {"ready", "running", "interrupted", "waiting_approval", "waiting_plan_approval", "failed", "blocked", "completed", "aborted", "budget_exhausted", "journal_conflict", "rolled_back"}:
                 raise SessionError("Invalid session status")
             if row["status"] == "completed" and not isinstance(row["final_answer"], str):
                 raise SessionError("Completed session has no final answer")
@@ -656,17 +673,26 @@ class SessionStore:
             self.set_status(session_id, "blocked", "UncertainActionError")
             raise UncertainActionError(f"Call {uncertain[0]['key']} has an unknown result; inspect the workspace and use resolve before resuming")
 
-    def resolve(self, session_id: str, key: str, resolution: str, verify_applied=None):
+    def resolve(self, session_id: str, key: str, resolution: str, verify_applied=None, *, journal=None, changes=None):
         with self.lock(session_id):
-            self._resolve(session_id, key, resolution, verify_applied)
+            self._resolve(session_id, key, resolution, verify_applied, journal=journal, changes=changes)
 
-    def _resolve(self, session_id: str, key: str, resolution: str, verify_applied):
+    def _resolve(self, session_id: str, key: str, resolution: str, verify_applied, *, journal=None, changes=None):
         if self.get(session_id).status == "aborted":
             raise SessionError("This session was terminated by the operator")
         calls = self.calls(session_id, True)
         if not calls or calls[0]["key"] != key or calls[0]["state"] not in {"running", "uncertain"}:
             raise SessionError("Resolve only the first uncertain call")
         item = calls[0]
+        journal_mode = self.get(session_id).metadata.get("journal_mode", False)
+        if resolution not in {"retry", "skip", "applied", "abort"}:
+            raise SessionError("Unknown recovery resolution")
+        if resolution == "applied" and (item["call"]["function"]["name"] != "write_file" or verify_applied is None or verify_applied(item) is not True):
+            raise SessionError("The current file does not verify the proposed write")
+        if journal_mode:
+            if journal is None or journal.id != session_id or journal.store is not self:
+                raise SessionError("Journal recovery requires the session runtime and explicit change attribution")
+            journal.resolve_changes(item, changes)
         if resolution == "retry":
             if item["call"]["function"]["name"] not in {"write_file", "delete_file", "read_file", "list_files", "Bash", "bash", "submit_plan", "complete_task", "fail_task"}:
                 raise SessionError("This instrument has no supported safe retry contract")
@@ -677,6 +703,12 @@ class SessionStore:
                                 (session_id, item["batch"], item["position"]))
                 self._event(session_id, {"event": "recovery_resolution", "call": key, "resolution": resolution})
         elif resolution == "abort":
+            if journal_mode:
+                with self.transaction():
+                    self.db.execute("UPDATE call_budgets SET forfeited=1 WHERE session_id=? AND batch=? AND position=?", (session_id,item["batch"],item["position"]))
+                function = item["call"]["function"]
+                result = {"role":"tool","tool_call_id":item["call"]["id"],"name":function["name"],"content":"ERROR: RECOVERY_ABORTED: operator terminated this session"}
+                self.finish_call(session_id,item,result)
             with self.transaction():
                 self.db.execute("UPDATE sessions SET status='aborted',error='RecoveryAborted',updated_at=? WHERE id=?",
                                 (stamp(), session_id))

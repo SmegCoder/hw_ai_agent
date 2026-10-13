@@ -148,7 +148,10 @@ def verify_target(target: WriteTarget) -> None:
 
 
 def write_target(target: WriteTarget, content: str) -> None:
-    data = content.encode("utf-8")
+    write_bytes_target(target, content.encode("utf-8"))
+
+
+def write_bytes_target(target: WriteTarget, data: bytes, *, mode: int | None = None) -> None:
     verify_target(target)
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     directory_fd = os.open(target.root, directory_flags)
@@ -196,6 +199,9 @@ def write_target(target: WriteTarget, content: str) -> None:
         while view:
             count = os.write(file_fd, view)
             view = view[count:]
+        if mode is not None:
+            os.fchmod(file_fd, mode)
+        os.fsync(file_fd)
     finally:
         if file_fd is not None:
             os.close(file_fd)

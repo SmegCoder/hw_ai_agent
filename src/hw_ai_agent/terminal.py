@@ -45,12 +45,12 @@ def confirm_plan(plan: dict) -> bool:
         raise PlanApprovalDeferred('Ответ не получен; план сохранён без утверждения') from None
 
 
-def choose_session(store, identifier: str | None) -> str:
+def choose_session(store, identifier: str | None, *, include_completed=False, journal_only=False) -> str:
     if identifier is not None:
         return identifier
     if not sys.stdin.isatty():
         raise SessionError('Без интерактивного терминала укажите SESSION_ID явно')
-    candidates = [s for s in store.list_sessions() if s['status'] not in {'completed', 'aborted'}][:20]
+    candidates = [s for s in store.list_sessions() if (include_completed or s['status'] not in {'completed', 'aborted','rolled_back'}) and (not journal_only or store.get(s['id']).metadata.get('journal_mode',False))][:20]
     if not candidates:
         raise SessionError('Нет незавершённых сессий для продолжения')
     if len(candidates) == 1:
@@ -118,5 +118,23 @@ def confirm_conflict(runtime, item: dict, verify=None) -> str | None:
                 print('Текущее содержимое не подтверждает запись; выберите другое решение.')
                 continue
             print('Введите номер доступного действия.')
+    except EOFError:
+        return None
+
+
+def confirm_attribution(view: dict) -> str | None:
+    print('\nИзменения, обнаруженные после сбоя:\n' + visible(view['diff']))
+    print('1 — отнести все показанные изменения к этой сессии')
+    print('2 — считать их внешними; не включать в откат сессии')
+    print('0 — оставить вызов заблокированным')
+    if not sys.stdin.isatty():
+        return None
+    try:
+        while True:
+            answer=input('Принадлежность изменений: ').strip()
+            if answer=='1':return 'own'
+            if answer=='2':return 'external'
+            if answer in {'0',''}:return None
+            print('Введите 1, 2 или 0.')
     except EOFError:
         return None

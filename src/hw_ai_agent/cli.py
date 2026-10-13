@@ -22,9 +22,10 @@ from .session import SessionError, SessionStore, UncertainActionError
 from .session_demo import run_session_demo
 from .workflow_demo import WorkflowClient, run_workflow_demo, verify_workflow
 from .planning import PlanApprovalDeferred
-from .terminal import visible, confirm_plan, choose_session, confirm_conflict
+from .terminal import visible, confirm_plan, choose_session, confirm_conflict, confirm_attribution
 from .plan_demo import PlanDemoClient, run_plan_demo
 from .budget_demo import run_budget_demo
+from .journal import ChangeJournal, JournalError
 from .tasks import checklist
 from .tasks_demo import TasksDemoClient, run_tasks_demo, verify_tasks_demo
 
@@ -179,7 +180,7 @@ def report_tasks(report):
     return 0 if report["success"] else 1
 
 
-def saved_runtime(state, db_path: Path, approvals=None, on_event=show_event):
+def saved_runtime(state, db_path: Path, approvals=None, on_event=show_event, *, allow_policy_change=False):
     metadata = state.metadata
     workspace = Path(metadata["workspace"])
     if db_path.resolve().is_relative_to(workspace.resolve()):
@@ -189,7 +190,7 @@ def saved_runtime(state, db_path: Path, approvals=None, on_event=show_event):
         policy = load_policy(Path(policy_path) if policy_path else None, workspace)
     else:
         policy = Policy.restore(metadata["policy"])
-    if policy.as_dict() != Policy.restore(metadata["policy"]).as_dict():
+    if not allow_policy_change and policy.as_dict() != Policy.restore(metadata["policy"]).as_dict():
         raise SessionError("Policy changed since the checkpoint; continuation was refused")
     limits = metadata.get("runtime_limits", {})
     if set(limits) != {"command_timeout", "max_output_chars", "max_file_chars"}:
@@ -223,7 +224,25 @@ def session_command(args):
             return 0
         if args.action == "resume":
             args.session_id = choose_session(store, args.session_id)
+        if args.action in {"changes","rollback"}:
+            args.session_id=choose_session(store,args.session_id,include_completed=True,journal_only=True)
         state = store.get(args.session_id)
+        if args.action in {"changes","rollback"}:
+            if not state.metadata.get("journal_mode",False):
+                raise JournalError("This session was created without a change journal")
+            runtime=saved_runtime(state,store.path,getattr(args,"approvals",None),allow_policy_change=args.action=="rollback")
+            journal=ChangeJournal(store,args.session_id,runtime)
+            if args.action=="rollback":
+                print(json.dumps(journal.rollback(),ensure_ascii=False,indent=2))
+            else:
+                with store.lock(args.session_id):
+                    print(f"Сессия: {args.session_id}; журнал: {journal.head()['status']}")
+                    print(visible(journal.diff()))
+                    current,_=journal.capture();expected=journal.image(journal.head()['revision'])
+                    if current!=expected:
+                        view=journal.recovery_view({'key':'observed'})
+                        print('Текущее дерево отличается от сохранённого:\n'+visible(view['diff']))
+            return 0
         if args.action == "session":
             calls = []
             for item in store.calls(args.session_id, True):
@@ -248,10 +267,19 @@ def session_command(args):
         listener = event_listener(getattr(args, "stop_after_tools", None), getattr(args, "stop_after_tasks", None))
         if args.action == "resolve":
             verifier = None
+            journal = None
+            if state.metadata.get("journal_mode"):
+                runtime=saved_runtime(state,store.path,on_event=listener)
+                journal=ChangeJournal(store,args.session_id,runtime)
+                item=next((i for i in store.calls(args.session_id,True) if i['key']==args.call),None)
+                if item is None:raise SessionError('Uncertain call key was not found')
+                view=journal.recovery_view(item)
+                journal.reviewed_tree=view['_current']
+                print('Обнаруженные изменения:\n'+visible(view['diff']))
             if args.resolution == "applied":
                 runtime = saved_runtime(state, store.path, on_event=listener)
                 verifier = lambda item: verify_applied(runtime, item)
-            store.resolve(args.session_id, args.call, args.resolution, verifier)
+            store.resolve(args.session_id, args.call, args.resolution, verifier, journal=journal, changes=getattr(args,"changes",None))
             if args.resolution == "abort":
                 print("Сессия завершена с ошибкой по решению пользователя. Продолжение запрещено.")
                 return 1
@@ -265,7 +293,7 @@ def session_command(args):
         metadata = state.metadata
         interactive = {"approve_plan": confirm_plan,
                        "resolve_uncertain": lambda item: confirm_conflict(runtime, item, lambda i: verify_applied(runtime, i)),
-                       "verify_recovery": lambda item: verify_applied(runtime, item)}
+                       "verify_recovery": lambda item: verify_applied(runtime, item), "attribute_changes": confirm_attribution}
         if metadata.get("kind") == "tasks-demo" and metadata.get("provider") not in PROVIDERS:
             if not metadata["demo"].get("offline"):
                 raise SessionError("Real task demo cannot resume with a scripted client")
@@ -325,6 +353,7 @@ def main() -> int:
     workflow.add_argument("--provider", choices=list(PROVIDERS))
     workflow.add_argument("--model")
     workflow.add_argument("--env-file", type=Path, default=Path(".env"))
+    workflow.add_argument("--journal",action="store_true")
     add_budget_arguments(workflow)
     workflow.add_argument("--max-rounds", type=int, default=20)
     workflow.add_argument("--max-tokens", type=int, default=2048)
@@ -335,26 +364,29 @@ def main() -> int:
     workflow.add_argument("--stop-after-tools", type=int)
     workflow.add_argument("--crash-after-write", action="store_true",
                           help="Exit with code 86 after the first write, before its result checkpoint")
-    plan_demo = subparsers.add_parser("plan-demo", help="Real-model Plan Mode; --offline for deterministic demo")
-    plan_demo.add_argument("--offline", action="store_true", help="Use scripted planning without a model or API key")
-    plan_demo.add_argument("--provider", choices=list(PROVIDERS))
-    plan_demo.add_argument("--model")
-    plan_demo.add_argument("--env-file", type=Path, default=Path(".env"))
-    add_budget_arguments(plan_demo)
-    plan_demo.add_argument("--max-rounds", type=int, default=20)
-    plan_demo.add_argument("--max-tokens", type=int, default=2048)
-    plan_demo.add_argument("--approvals", choices=["ask", "deny"], default="ask")
-    plan_demo.add_argument("--policy", type=Path)
-    plan_demo.add_argument("--stop-after-tools", type=int)
-    plan_demo.add_argument("--mode", choices=["safe", "auto"], default="safe")
-    plan_demo.add_argument("--state-db", type=Path, default=Path(".agent/sessions.sqlite3"))
-    plan_demo.add_argument("--workspace", type=Path)
-    plan_demo.add_argument("--crash-after-write", action="store_true")
+    for demo_name in ("plan-demo","rollback-demo"):
+        plan_demo = subparsers.add_parser(demo_name, help="Real-model plan demo; rollback-demo enables the change journal")
+        plan_demo.add_argument("--offline", action="store_true", help="Use scripted planning without a model or API key")
+        plan_demo.add_argument("--provider", choices=list(PROVIDERS))
+        plan_demo.add_argument("--model")
+        plan_demo.add_argument("--env-file", type=Path, default=Path(".env"))
+        plan_demo.add_argument("--journal",action="store_true",default=demo_name=="rollback-demo")
+        add_budget_arguments(plan_demo)
+        plan_demo.add_argument("--max-rounds", type=int, default=20)
+        plan_demo.add_argument("--max-tokens", type=int, default=2048)
+        plan_demo.add_argument("--approvals", choices=["ask", "deny"], default="ask")
+        plan_demo.add_argument("--policy", type=Path)
+        plan_demo.add_argument("--stop-after-tools", type=int)
+        plan_demo.add_argument("--mode", choices=["safe", "auto"], default="safe")
+        plan_demo.add_argument("--state-db", type=Path, default=Path(".agent/sessions.sqlite3"))
+        plan_demo.add_argument("--workspace", type=Path)
+        plan_demo.add_argument("--crash-after-write", action="store_true")
     tasks_demo = subparsers.add_parser("tasks-demo", help="Real-model tasks with dependencies and verification; --offline for deterministic recovery")
     tasks_demo.add_argument("--offline", action="store_true")
     tasks_demo.add_argument("--provider", choices=list(PROVIDERS))
     tasks_demo.add_argument("--model")
     tasks_demo.add_argument("--env-file", type=Path, default=Path(".env"))
+    tasks_demo.add_argument("--journal",action="store_true")
     add_budget_arguments(tasks_demo)
     tasks_demo.add_argument("--max-rounds", type=int, default=30)
     tasks_demo.add_argument("--max-tokens", type=int, default=3072)
@@ -366,17 +398,20 @@ def main() -> int:
     tasks_demo.add_argument("--stop-after-tools", type=int)
     tasks_demo.add_argument("--stop-after-tasks", type=int)
     tasks_demo.add_argument("--crash-after-write", action="store_true")
-    for action in ("sessions", "session", "resume", "resolve", "approve-plan", "reject-plan"):
+    for action in ("sessions", "session", "resume", "resolve", "approve-plan", "reject-plan", "changes", "rollback"):
         command = subparsers.add_parser(action)
         command.add_argument("--state-db", type=Path, default=Path(".agent/sessions.sqlite3"))
         if action != "sessions":
-            command.add_argument("session_id", nargs="?" if action == "resume" else None)
+            command.add_argument("session_id", nargs="?" if action in {"resume","changes","rollback"} else None)
         if action == "resume":
             command.add_argument("--env-file", type=Path, default=Path(".env"))
             command.add_argument("--approvals", choices=["ask", "deny"], default=None)
             command.add_argument("--stop-after-tools", type=int, default=None)
             command.add_argument("--stop-after-tasks", type=int, default=None)
+        if action=="rollback":
+            command.add_argument("--approvals",choices=["ask","deny"],default=None)
         if action == "resolve":
+            command.add_argument("--changes",choices=["own","external"],help="Explicit attribution of all observed changes after a crash")
             command.add_argument("--call", required=True, help="Uncertain call key, for example 1:0")
             command.add_argument("--resolution", choices=["applied", "retry", "skip", "abort"], required=True)
     for action in ("setup", "doctor", "demo", "run", "plan"):
@@ -385,6 +420,7 @@ def main() -> int:
         command.add_argument("--model")
         command.add_argument("--env-file", type=Path, default=Path(".env"))
         if action in {"demo", "run", "plan"}:
+            command.add_argument("--journal",action="store_true",help="Track file changes and enable safe rollback")
             add_budget_arguments(command)
             command.add_argument("--tasks", action="store_true", help="Plan with dependency tasks and runtime verification")
             command.add_argument("--stop-after-tasks", type=int)
@@ -406,14 +442,14 @@ def main() -> int:
         args.plan = True
     try:
         budget_limits = None
-        if args.action in {"run", "plan", "demo", "plan-demo", "workflow-demo", "tasks-demo"}:
+        if args.action in {"run", "plan", "demo", "plan-demo", "workflow-demo", "tasks-demo", "rollback-demo"}:
             budget_limits = BudgetLimits(model_requests=args.max_rounds, tool_calls=args.max_tool_calls,
                                          side_effects=args.max_side_effects, result_bytes=args.max_result_bytes)
         if getattr(args, "stop_after_tools", None) is not None and args.stop_after_tools < 1:
             raise ConfigurationError("--stop-after-tools must be positive")
         if getattr(args, "stop_after_tasks", None) is not None and args.stop_after_tasks < 1:
             raise ConfigurationError("--stop-after-tasks must be positive")
-        if args.action in {"sessions", "session", "resume", "resolve", "approve-plan", "reject-plan"}:
+        if args.action in {"sessions", "session", "resume", "resolve", "approve-plan", "reject-plan", "changes", "rollback"}:
             return session_command(args)
         if args.action == "budget-demo":
             report = run_budget_demo(show_event)
@@ -439,8 +475,8 @@ def main() -> int:
                 approve_plan=confirm_plan, on_event=event_listener(args.stop_after_tools, args.stop_after_tasks),
                 max_rounds=args.max_rounds, max_tokens=args.max_tokens, budget_limits=budget_limits,
                 policy=load_policy(args.policy, workspace), session_metadata=metadata, approvals=args.approvals,
-                crash_after_write=args.crash_after_write))
-        if args.action == "plan-demo":
+                crash_after_write=args.crash_after_write, journal_mode=args.journal))
+        if args.action in {"plan-demo","rollback-demo"}:
             if args.max_rounds < 1 or args.max_tokens < 1:
                 raise ConfigurationError("Limits must be positive")
             client = None
@@ -451,7 +487,7 @@ def main() -> int:
                     return 1
                 client = OpenAICompatibleClient(settings, timeout=180 if settings.provider == "ollama" else 90,
                                                 max_tokens=args.max_tokens)
-            workspace = (args.workspace or Path("workspace") / ("plan-demo-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"))).resolve()
+            workspace = (args.workspace or Path("workspace") / (args.action + "-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"))).resolve()
             policy = load_policy(args.policy, workspace)
             metadata = {"policy_path": str(args.policy.resolve()) if args.policy else None,
                         "policy_source": "file" if args.policy else "default", "max_tokens": args.max_tokens}
@@ -461,7 +497,7 @@ def main() -> int:
                                             approve_plan=confirm_plan, on_event=event_listener(args.stop_after_tools),
                                             crash_after_write=args.crash_after_write, client=client, offline=args.offline,
                                             max_rounds=args.max_rounds, approvals=args.approvals, policy=policy,
-                                            session_metadata=metadata, budget_limits=budget_limits))
+                                            session_metadata=metadata, budget_limits=budget_limits, journal_mode=args.journal))
         if args.action == "session-demo":
             report = run_session_demo(show_event)
             print(json.dumps(report["checks"], ensure_ascii=False, indent=2))
@@ -488,7 +524,7 @@ def main() -> int:
             report = run_workflow_demo(workspace, args.state_db, mode=args.mode,
                 approve=confirm_action if args.approvals == "ask" else None, approvals=args.approvals,
                 on_event=event_listener(args.stop_after_tools), crash_after_write=args.crash_after_write,
-                client=client, max_rounds=args.max_rounds, budget_limits=budget_limits)
+                client=client, max_rounds=args.max_rounds, budget_limits=budget_limits, journal_mode=args.journal)
             return report_workflow(report)
         if args.action == "setup":
             setup(args.provider or "openrouter", args.model, args.env_file)
@@ -519,7 +555,7 @@ def main() -> int:
                 report = run_demo(client, workspace, args.max_rounds, listener,
                     policy=policy, approve=confirm_action if args.approvals == "ask" else None,
                     store=store, session_metadata=metadata, mode=args.mode,
-                    trash_dir=args.state_db.resolve().parent / "trash", plan_mode=args.plan, task_mode=args.tasks, approve_plan=confirm_plan, budget_limits=budget_limits)
+                    trash_dir=args.state_db.resolve().parent / "trash", plan_mode=args.plan, task_mode=args.tasks, approve_plan=confirm_plan, budget_limits=budget_limits, journal_mode=args.journal)
             return report_demo(report)
         workspace = args.workspace or Path(os.getenv("AGENT_WORKSPACE", "workspace"))
         runtime = ToolRuntime(workspace, policy=load_policy(args.policy, workspace), mode=args.mode,
@@ -531,7 +567,7 @@ def main() -> int:
                     "max_tokens": args.max_tokens}
         with SessionStore(args.state_db) as store:
             agent = CodingAgent(client, runtime, max_rounds=args.max_rounds, on_event=listener,
-                                store=store, session_metadata=metadata, plan_mode=args.plan, task_mode=args.tasks, approve_plan=confirm_plan, budget_limits=budget_limits)
+                                store=store, session_metadata=metadata, plan_mode=args.plan, task_mode=args.tasks, approve_plan=confirm_plan, budget_limits=budget_limits, journal_mode=args.journal)
             print(agent.run(" ".join(args.request)))
         return 0
     except ApprovalDeferred as exc:
@@ -540,7 +576,7 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\nРабота остановлена. Продолжите через hw-ai-agent resume и выберите сессию в терминале.", file=sys.stderr)
         return 130
-    except (ConfigurationError, ModelClientError, AgentError, BudgetExceeded, ToolError, PolicyError, SessionError, OSError, ValueError) as exc:
+    except (ConfigurationError, ModelClientError, AgentError, JournalError, BudgetExceeded, ToolError, PolicyError, SessionError, OSError, ValueError) as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
         return 1
 

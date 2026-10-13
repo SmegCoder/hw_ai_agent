@@ -13,6 +13,7 @@ from .tools import ToolError, ToolRuntime
 from .policy import ApprovalDeferred, Policy
 from .session import SessionError, SessionStore, UncertainActionError, PlanRejectedError
 from .budget import BudgetLimits, BudgetExceeded, MemoryBudget, output_ceiling
+from .journal import ChangeJournal, JournalError, JournalConflict
 from .tasks import TASK_INSTRUCTIONS, TASK_PLAN_SCHEMA, TASK_SCHEMAS, validate_task_plan, verify_task, TaskError
 from .planning import PLAN_SCHEMA, PLAN_INSTRUCTIONS, validate_plan, PlanError, PlanApprovalDeferred
 
@@ -56,12 +57,16 @@ class CodingAgent:
         session_metadata: dict | None = None,
         plan_mode: bool = False,
         task_mode: bool = False,
+        journal_mode: bool = False,
+        attribute_changes: Callable[[dict], str | None] | None = None,
         approve_plan: Callable[[dict], bool] | None = None,
         resolve_uncertain: Callable[[dict], str | None] | None = None,
         verify_recovery: Callable[[dict], bool] | None = None,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be positive")
+        if type(journal_mode) is not bool:
+            raise ValueError("journal_mode must be a boolean")
         if type(task_mode) is not bool:
             raise ValueError("task_mode must be a boolean")
         if type(plan_mode) is not bool:
@@ -83,6 +88,9 @@ class CodingAgent:
         self.plan_mode = plan_mode or task_mode
         self.task_mode = task_mode
         self._pending_task_outcome = None
+        self.journal_mode, self.journal = journal_mode, None
+        self.attribute_changes = attribute_changes
+        self._journal_failure = None
         self.approve_plan = approve_plan
         self.resolve_uncertain = resolve_uncertain
         self.verify_recovery = verify_recovery
@@ -95,7 +103,7 @@ class CodingAgent:
     def run(self, request: str) -> str:
         if not request.strip():
             raise ValueError("request must not be empty")
-        if self.plan_mode and not self.store:
+        if (self.plan_mode or self.journal_mode) and not self.store:
             raise SessionError("Plan Mode requires a session store")
         self.runtime.phase = "planning" if self.plan_mode else "execution"
         self.events = []
@@ -120,6 +128,7 @@ class CodingAgent:
                     "approval_contract": 2,
                     "plan_mode": self.plan_mode,
                     "task_mode": self.task_mode,
+                    "journal_mode": self.journal_mode,
                     "trash_dir": str(self.runtime.trash_dir),
                     "policy": self.runtime.policy.as_dict(),
                     "runtime_limits": {name: getattr(self.runtime, name) for name in
@@ -151,7 +160,7 @@ class CodingAgent:
         assert self.store is not None
         with self.store.lock(session_id):
             state = self.store.get(session_id)
-            if state.status == "aborted":
+            if state.status in {"aborted", "rolled_back"}:
                 raise SessionError("This session was terminated by the operator and cannot be resumed")
             self.store.budget(session_id)  # Validate saved counters before model or tool access.
             if state.status == "budget_exhausted":
@@ -165,6 +174,15 @@ class CodingAgent:
             saved_plan = self.store.plan(session_id)
             self.runtime.phase = "planning" if saved_plan and saved_plan["state"] != "approved" else "execution"
             self.session_id = session_id
+            self.journal_mode = state.metadata.get("journal_mode", False)
+            if type(self.journal_mode) is not bool:
+                raise SessionError("Invalid saved journal mode")
+            self.journal = ChangeJournal(self.store,session_id,self.runtime) if self.journal_mode else None
+            self.runtime.journal = self.journal
+            if self.journal:
+                head = self.journal.start()
+                if head['status'] != 'active':
+                    raise JournalError("Finish rollback before attempting to resume the agent")
             self.messages, self.events = copy.deepcopy(state.messages), copy.deepcopy(state.events)
             self._call_records = {}
             for item in self.store.calls(session_id):
@@ -186,7 +204,15 @@ class CodingAgent:
                         resolution = self.resolve_uncertain(copy.deepcopy(item)) if self.resolve_uncertain else None
                         if resolution is None:
                             raise
-                        self.store._resolve(session_id, item["key"], resolution, self.verify_recovery)
+                        ownership = None
+                        if self.journal:
+                            view = self.journal.recovery_view(item)
+                            self.journal.reviewed_tree = view['_current']
+                            if view['changed']:
+                                ownership = self.attribute_changes({k:v for k,v in view.items() if not k.startswith('_')}) if self.attribute_changes else None
+                                if ownership not in {'own','external'}:
+                                    raise UncertainActionError("Workspace changes require explicit attribution before recovery")
+                        self.store._resolve(session_id, item["key"], resolution, self.verify_recovery, journal=self.journal, changes=ownership)
                         if resolution == "abort":
                             raise SessionError("This session was terminated by the operator")
                         state = self.store.get(session_id)
@@ -211,14 +237,15 @@ class CodingAgent:
                     return answer
                 return self._loop(state.rounds)
             except BaseException as exc:
-                status = ("budget_exhausted" if isinstance(exc, BudgetExceeded) else
+                status = ("journal_conflict" if isinstance(exc, JournalError) else
+                          "budget_exhausted" if isinstance(exc, BudgetExceeded) else
                           "blocked" if isinstance(exc, UncertainActionError) else
                           "waiting_plan_approval" if isinstance(exc, PlanApprovalDeferred) else
                           "aborted" if isinstance(exc, PlanRejectedError) or self.store.get(session_id).status == "aborted" else
                           "waiting_approval" if isinstance(exc, ApprovalDeferred) else
                           "interrupted" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else "failed")
                 try:
-                    self.store.set_status(session_id, status, str(exc) if isinstance(exc, BudgetExceeded) else type(exc).__name__)
+                    self.store.set_status(session_id, status, str(exc) if isinstance(exc, (BudgetExceeded, JournalError)) else type(exc).__name__)
                     if isinstance(exc, BudgetExceeded):
                         self._emit_budget()
                 except SessionError:
@@ -370,6 +397,8 @@ class CodingAgent:
         quota = self.store.start_call(self.session_id, item, output_ceiling(call["function"]["name"], self.runtime))
         self._active_call = item
         self._pending_task_outcome = None
+        self._journal_failure = None
+        if self.journal:self.journal.active_call = item
         self._emit({"event": "tool_call", "name": call["function"]["name"],
                     "task_id": item.get("task_id"), "phase": item.get("phase"),
                     "arguments": call["function"]["arguments"]}, persist=False)
@@ -378,6 +407,7 @@ class CodingAgent:
                 result = self._execute_tool_call(call)
         finally:
             self._active_call = None
+            if self.journal:self.journal.active_call = None
         outcome = self._pending_task_outcome
         self._pending_task_outcome = None
         if outcome:
@@ -388,6 +418,8 @@ class CodingAgent:
         self.messages.append(result)
         self._emit({"event": "tool_result", "task_id": item.get("task_id"), "phase": item.get("phase"), **result}, persist=False)
         self._emit_budget()
+        if self._journal_failure:
+            raise self._journal_failure
         if outcome:
             self._emit({"event": "tasks", "tasks": self.store.tasks(self.session_id)}, persist=False)
             self._emit({"event": "task_" + outcome["state"], "task_id": outcome["task_id"]}, persist=False)
@@ -498,6 +530,9 @@ class CodingAgent:
                     if not task or normalized not in task["tools"]:
                         raise TaskError("TASK_TOOL_DENIED: tool is not allowed for CURRENT_TASK")
                 content = self.runtime.execute(name, arguments)
+        except JournalConflict as exc:
+            self._journal_failure = exc
+            content = f"ERROR: {exc}"
         except (ToolError, PlanError, json.JSONDecodeError, OSError) as exc:
             content = f"ERROR: {exc}"
 

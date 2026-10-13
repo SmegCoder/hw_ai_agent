@@ -306,7 +306,7 @@ class TaskGraphTests(unittest.TestCase):
         self.assertEqual(self.store.budget(first.session_id),before)
         self.assertEqual(self.store.plan(first.session_id),old_plan)
         self.assertEqual(self.store.tasks(first.session_id),[])
-        self.assertEqual(self.store.db.execute('PRAGMA user_version').fetchone()[0],4)
+        self.assertEqual(self.store.db.execute('PRAGMA user_version').fetchone()[0],5)
 
 
 class TaskValidationTests(unittest.TestCase):

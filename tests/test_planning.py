@@ -242,7 +242,7 @@ class PlanningTests(unittest.TestCase):
         self.store.db.execute('PRAGMA user_version=1')
         self.store.db.close()
         self.store = SessionStore(self.root / '.agent/state.sqlite3')
-        self.assertEqual(self.store.db.execute('PRAGMA user_version').fetchone()[0], 4)
+        self.assertEqual(self.store.db.execute('PRAGMA user_version').fetchone()[0], 5)
         self.assertEqual(self.store.get(agent.session_id).final_answer, 'done')
         self.assertIsNone(self.store.plan(agent.session_id))
 

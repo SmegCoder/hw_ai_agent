@@ -436,7 +436,7 @@ with SessionStore(sys.argv[2]) as store:
         self.assertEqual(self.store.budget(identifier)['spent']['side_effects'], 1)
         self.agent(Client({'content': 'done'})).resume(identifier)
         self.assertEqual(self.store.budget(identifier)['spent']['tool_calls'], 2)
-        self.assertEqual(self.store.db.execute('PRAGMA user_version').fetchone()[0], 4)
+        self.assertEqual(self.store.db.execute('PRAGMA user_version').fetchone()[0], 5)
 
     def test_legacy_version_marker_does_not_reset_existing_counters(self):
         first = self.agent(Client({'tool_calls': [write()]}, {'content': 'done'}))

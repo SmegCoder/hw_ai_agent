@@ -11,7 +11,7 @@ import stat
 import subprocess
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -63,6 +63,7 @@ class ToolRuntime:
         self.on_policy_event = on_policy_event
         self.policy_events: list[dict[str, Any]] = []
         self.result_limit_bytes: int | None = None
+        self.journal = None
 
     @contextmanager
     def output_budget(self, quota: int | None):
@@ -171,19 +172,21 @@ class ToolRuntime:
         else:
             self._policy_event(name, "allow", "permitted", decision.reason, "policy")
         handler = self.bash if name == "Bash" else getattr(self, name)
+        boundary = self.journal.action(name, arguments, path) if self.journal is not None and name in {"write_file", "delete_file", "Bash"} else nullcontext()
         try:
-            if target is not None and name == "delete_file":
-                recovery_id = remove_target(target, self.trash_dir)
-                return (f"removed {path}; recovery_id={recovery_id}" if recovery_id else f"already absent: {path}")
-            if target is not None:
-                write_target(target, arguments["content"])
-                return f"wrote {len(arguments['content'])} characters to {path}"
-            if path is not None:
-                if self._safe_path(arguments.get("path", ".")).relative_to(self.root).as_posix() != path:
-                    raise ToolError("TARGET_CHANGED: path changed after permission checking")
-                # Execute against the checked canonical path, not its mutable alias.
-                arguments = {**arguments, "path": path}
-            return handler(**dict(arguments))
+            with boundary:
+                if target is not None and name == "delete_file":
+                    recovery_id = remove_target(target, self.trash_dir)
+                    return (f"removed {path}; recovery_id={recovery_id}" if recovery_id else f"already absent: {path}")
+                if target is not None:
+                    write_target(target, arguments["content"])
+                    return f"wrote {len(arguments['content'])} characters to {path}"
+                if path is not None:
+                    if self._safe_path(arguments.get("path", ".")).relative_to(self.root).as_posix() != path:
+                        raise ToolError("TARGET_CHANGED: path changed after permission checking")
+                    # Execute against the checked canonical path, not its mutable alias.
+                    arguments = {**arguments, "path": path}
+                return handler(**dict(arguments))
         except TargetChangedError:
             self._policy_event(name, "deny", "blocked", "Write target changed", "runtime_boundary")
             raise ToolError("TARGET_CHANGED: file or parent changed; a new request and approval are required") from None

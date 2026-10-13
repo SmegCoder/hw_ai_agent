@@ -43,7 +43,7 @@ class PlanDemoClient:
 def run_plan_demo(workspace: Path, db_path: Path, *, mode='safe', approve=None,
                   approve_plan=None, on_event=None, crash_after_write=False,
                   client=None, offline=False, max_rounds=20, approvals='ask', policy=None,
-                  session_metadata=None, budget_limits=None):
+                  session_metadata=None, budget_limits=None, journal_mode=False):
     if max_rounds < 1:
         raise ValueError('Limits must be positive')
     if offline:
@@ -61,7 +61,7 @@ def run_plan_demo(workspace: Path, db_path: Path, *, mode='safe', approve=None,
     runtime = cls(workspace, mode=mode, approve=approve, policy=policy, trash_dir=db_path.resolve().parent / 'trash')
     with SessionStore(db_path) as store:
         agent = CodingAgent(client, runtime, plan_mode=True, approve_plan=approve_plan, store=store,
-                            max_rounds=max_rounds, on_event=on_event, budget_limits=budget_limits,
+                            max_rounds=max_rounds, on_event=on_event, budget_limits=budget_limits, journal_mode=journal_mode,
                             session_metadata={**(session_metadata or {}), 'kind': 'plan-demo', 'approvals': approvals,
                                               'demo': {'baseline': baseline, 'test_hash': test_hash, 'offline': offline}})
         error = None
