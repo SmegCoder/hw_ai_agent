@@ -402,13 +402,11 @@ class ToolRuntime:
                     reason = "Command timed out"
         finally:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait()
-            selector.close()
-            process.stdout.close()
-            process.stderr.close()
+                self._terminate_process_group(process)
+            finally:
+                selector.close()
+                process.stdout.close()
+                process.stderr.close()
         stdout = b"".join(chunks["stdout"]).decode("utf-8", errors="replace")
         stderr = b"".join(chunks["stderr"]).decode("utf-8", errors="replace")
         output = stdout + stderr
@@ -417,6 +415,27 @@ class ToolRuntime:
         if reason == "Command timed out":
             raise ToolError(f"Command timed out after {self.command_timeout:g} seconds")
         return f"exit_code={process.returncode}\nstdout:\n{stdout}\nstderr:\n{stderr}\n{reason}".rstrip()
+
+    @staticmethod
+    def _terminate_process_group(process: subprocess.Popen) -> None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            # macOS may report EPERM for a group whose leader already exited.
+            # Only a confirmed exit makes this harmless; a live command must stop.
+            if process.poll() is None:
+                try:
+                    process.kill()
+                    process.wait(timeout=1)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+                raise ToolError("Cannot terminate command process group safely") from None
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            raise ToolError("Command process did not stop after termination") from None
 
     def _truncate(self, value: str) -> str:
         return value if len(value) <= self.max_output_chars else value[:self.max_output_chars] + "\n... output truncated ..."

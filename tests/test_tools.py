@@ -1,5 +1,7 @@
 from __future__ import annotations
 import os
+import signal
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -86,6 +88,51 @@ class ToolRuntimeTests(unittest.TestCase):
             result = runtime.bash("pwd")
             self.assertIn("output truncated", result)
             self.assertLess(len(result), 250)
+
+    def test_permission_error_for_exited_group_preserves_truncated_output(self):
+        runtime = ToolRuntime(self.root, max_output_chars=100)
+        original_popen = subprocess.Popen
+        processes = []
+        def finished_process(*args, **kwargs):
+            process = original_popen(*args, **kwargs)
+            processes.append(process)
+            process.wait(timeout=5)
+            return process
+        with patch.object(runtime, "_sandbox", return_value=[sys.executable, "-c", "print('x' * 1000)"]), \
+             patch("hw_ai_agent.tools.subprocess.Popen", side_effect=finished_process), \
+             patch("hw_ai_agent.tools.os.killpg", side_effect=PermissionError(1, "Operation not permitted")) as kill_group:
+            result = runtime.bash("pwd")
+        kill_group.assert_called_once_with(processes[0].pid, signal.SIGKILL)
+        self.assertIn("exit_code=0", result)
+        self.assertIn("output truncated", result)
+        self.assertLess(len(result), 250)
+        self.assertTrue(processes[0].stdout.closed)
+        self.assertTrue(processes[0].stderr.closed)
+
+    def test_permission_error_for_live_group_is_reported_and_child_is_stopped(self):
+        runtime = ToolRuntime(self.root, command_timeout=0.1)
+        original_popen = subprocess.Popen
+        processes = []
+        def live_process(*args, **kwargs):
+            process = original_popen(*args, **kwargs)
+            processes.append(process)
+            return process
+        with patch.object(runtime, "_sandbox", return_value=[sys.executable, "-c", "import time; time.sleep(30)"]), \
+             patch("hw_ai_agent.tools.subprocess.Popen", side_effect=live_process), \
+             patch("hw_ai_agent.tools.os.killpg", side_effect=PermissionError(1, "Operation not permitted")):
+            with self.assertRaisesRegex(ToolError, "terminate.*safely"):
+                runtime.bash("pwd")
+        self.assertIsNotNone(processes[0].poll())
+        self.assertTrue(processes[0].stdout.closed)
+        self.assertTrue(processes[0].stderr.closed)
+
+    def test_exited_group_lookup_error_does_not_hide_success(self):
+        runtime = ToolRuntime(self.root)
+        with patch.object(runtime, "_sandbox", return_value=[sys.executable, "-c", "print('done')"]), \
+             patch("hw_ai_agent.tools.os.killpg", side_effect=ProcessLookupError):
+            result = runtime.bash("pwd")
+        self.assertTrue(result.startswith("exit_code=0\n"))
+        self.assertIn("done", result)
 
 @unittest.skipUnless(os.getenv("REQUIRE_SANDBOX_TESTS") == "1", "Set REQUIRE_SANDBOX_TESTS=1 for real OS sandbox tests")
 class SandboxIntegrationTests(unittest.TestCase):
