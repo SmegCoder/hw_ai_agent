@@ -12,7 +12,10 @@ from urllib.request import urlopen
 from .agent import AgentError, CodingAgent
 from .budget import BudgetLimits, BudgetExceeded
 from .client import ModelClientError, OpenAICompatibleClient
-from .config import ConfigurationError, PROVIDERS, Settings, load_env
+from .config import (ConfigurationError, PROVIDERS, Settings, load_env, LAUNCH_OPTIONS,
+                     START_COMMANDS, apply_launch_defaults, validate_explicit_options,
+                     initial_launch_values, option_value, set_options, load_launch_env)
+from .usage import COMMAND_HELP, HelpParser, project_guide
 from .demo import run_demo, verify_demo
 from .tools import ToolError, ToolRuntime
 from .filesystem import open_read_file
@@ -105,7 +108,7 @@ def setup(provider: str, model: str | None, path: Path) -> None:
     chosen_model = model or default_model
     if not chosen_model:
         raise ConfigurationError("Specify the model ID with --model")
-    values = {"AGENT_PROVIDER": provider, f"{provider.upper()}_MODEL": chosen_model,
+    values = {**initial_launch_values(), "AGENT_PROVIDER": provider, f"{provider.upper()}_MODEL": chosen_model,
               f"{provider.upper()}_BASE_URL": default_url}
     if key_name:
         if not sys.stdin.isatty():
@@ -337,74 +340,90 @@ def session_command(args):
         return 0
 
 def add_budget_arguments(command):
-    command.add_argument("--max-tool-calls", type=int, default=128, help="Total tool-call budget for all run phases")
-    command.add_argument("--max-side-effects", type=int, default=32, help="Total write/delete/Bash attempts; zero permits reading only")
-    command.add_argument("--max-result-bytes", type=int, default=1_000_000, help="Total UTF-8 bytes of tool results")
+    command.add_argument("--max-tool-calls", type=int, default=None, help="Total tool-call budget for all run phases")
+    command.add_argument("--max-side-effects", type=int, default=None, help="Total write/delete/Bash attempts; zero permits reading only")
+    command.add_argument("--max-result-bytes", type=int, default=None, help="Total UTF-8 bytes of tool results")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Coding agent: OpenRouter / OpenAI / Ollama")
+    parser = HelpParser(description="Coding agent: исправление файлов, планирование и безопасное продолжение сессий",
+                        epilog=project_guide())
     subparsers = parser.add_subparsers(dest="action", required=True)
-    subparsers.add_parser("budget-demo", help="Check all four budgets, resume and crash accounting offline")
-    subparsers.add_parser("policy-demo", help="Check allow/ask/deny offline, without an API key")
-    subparsers.add_parser("session-demo", help="Interrupt and resume a scripted session without an API key")
-    workflow = subparsers.add_parser("workflow-demo", help="Real-model multi-file optimization demo; --offline for scripted recovery")
+    help_command = subparsers.add_parser("help", help=COMMAND_HELP["help"], description=COMMAND_HELP["help"])
+    help_command.add_argument("command", nargs="?", choices=list(COMMAND_HELP))
+    subparsers.add_parser("budget-demo", help=COMMAND_HELP["budget-demo"], description=COMMAND_HELP["budget-demo"])
+    subparsers.add_parser("policy-demo", help=COMMAND_HELP["policy-demo"], description=COMMAND_HELP["policy-demo"])
+    subparsers.add_parser("session-demo", help=COMMAND_HELP["session-demo"], description=COMMAND_HELP["session-demo"])
+    workflow = subparsers.add_parser("workflow-demo", help=COMMAND_HELP["workflow-demo"], description=COMMAND_HELP["workflow-demo"])
     workflow.add_argument("--offline", action="store_true", help="Use the small deterministic recovery scenario without a model")
     workflow.add_argument("--provider", choices=list(PROVIDERS))
     workflow.add_argument("--model")
     workflow.add_argument("--env-file", type=Path, default=Path(".env"))
-    workflow.add_argument("--journal",action="store_true")
+    workflow.add_argument("--journal", action=argparse.BooleanOptionalAction, default=None)
     add_budget_arguments(workflow)
-    workflow.add_argument("--max-rounds", type=int, default=20)
-    workflow.add_argument("--max-tokens", type=int, default=2048)
-    workflow.add_argument("--mode", choices=["safe", "auto"], default="safe")
-    workflow.add_argument("--approvals", choices=["ask", "deny"], default="ask")
-    workflow.add_argument("--state-db", type=Path, default=Path(".agent/sessions.sqlite3"))
+    workflow.add_argument("--max-rounds", type=int, default=None)
+    workflow.add_argument("--max-tokens", type=int, default=None)
+    workflow.add_argument("--mode", choices=["safe", "auto"], default=None)
+    workflow.add_argument("--approvals", choices=["ask", "deny"], default=None)
+    workflow.add_argument("--state-db", type=Path, default=None)
     workflow.add_argument("--workspace", type=Path)
     workflow.add_argument("--stop-after-tools", type=int)
     workflow.add_argument("--crash-after-write", action="store_true",
                           help="Exit with code 86 after the first write, before its result checkpoint")
     for demo_name in ("plan-demo","rollback-demo"):
-        plan_demo = subparsers.add_parser(demo_name, help="Real-model plan demo; rollback-demo enables the change journal")
+        plan_demo = subparsers.add_parser(demo_name, help=COMMAND_HELP[demo_name], description=COMMAND_HELP[demo_name])
         plan_demo.add_argument("--offline", action="store_true", help="Use scripted planning without a model or API key")
         plan_demo.add_argument("--provider", choices=list(PROVIDERS))
         plan_demo.add_argument("--model")
         plan_demo.add_argument("--env-file", type=Path, default=Path(".env"))
-        plan_demo.add_argument("--journal",action="store_true",default=demo_name=="rollback-demo")
+        plan_demo.add_argument("--journal", action="store_true" if demo_name == "rollback-demo" else argparse.BooleanOptionalAction, default=None)
         add_budget_arguments(plan_demo)
-        plan_demo.add_argument("--max-rounds", type=int, default=20)
-        plan_demo.add_argument("--max-tokens", type=int, default=2048)
-        plan_demo.add_argument("--approvals", choices=["ask", "deny"], default="ask")
+        plan_demo.add_argument("--max-rounds", type=int, default=None)
+        plan_demo.add_argument("--max-tokens", type=int, default=None)
+        plan_demo.add_argument("--approvals", choices=["ask", "deny"], default=None)
         plan_demo.add_argument("--policy", type=Path)
         plan_demo.add_argument("--stop-after-tools", type=int)
-        plan_demo.add_argument("--mode", choices=["safe", "auto"], default="safe")
-        plan_demo.add_argument("--state-db", type=Path, default=Path(".agent/sessions.sqlite3"))
+        plan_demo.add_argument("--mode", choices=["safe", "auto"], default=None)
+        plan_demo.add_argument("--state-db", type=Path, default=None)
         plan_demo.add_argument("--workspace", type=Path)
         plan_demo.add_argument("--crash-after-write", action="store_true")
-    tasks_demo = subparsers.add_parser("tasks-demo", help="Real-model tasks with dependencies and verification; --offline for deterministic recovery")
+    tasks_demo = subparsers.add_parser("tasks-demo", help=COMMAND_HELP["tasks-demo"], description=COMMAND_HELP["tasks-demo"])
     tasks_demo.add_argument("--offline", action="store_true")
     tasks_demo.add_argument("--provider", choices=list(PROVIDERS))
     tasks_demo.add_argument("--model")
     tasks_demo.add_argument("--env-file", type=Path, default=Path(".env"))
-    tasks_demo.add_argument("--journal",action="store_true")
+    tasks_demo.add_argument("--journal", action=argparse.BooleanOptionalAction, default=None)
     add_budget_arguments(tasks_demo)
-    tasks_demo.add_argument("--max-rounds", type=int, default=30)
-    tasks_demo.add_argument("--max-tokens", type=int, default=3072)
-    tasks_demo.add_argument("--mode", choices=["safe", "auto"], default="safe")
-    tasks_demo.add_argument("--approvals", choices=["ask", "deny"], default="ask")
+    tasks_demo.add_argument("--max-rounds", type=int, default=None)
+    tasks_demo.add_argument("--max-tokens", type=int, default=None)
+    tasks_demo.add_argument("--mode", choices=["safe", "auto"], default=None)
+    tasks_demo.add_argument("--approvals", choices=["ask", "deny"], default=None)
     tasks_demo.add_argument("--policy", type=Path)
     tasks_demo.add_argument("--workspace", type=Path)
-    tasks_demo.add_argument("--state-db", type=Path, default=Path(".agent/sessions.sqlite3"))
+    tasks_demo.add_argument("--state-db", type=Path, default=None)
     tasks_demo.add_argument("--stop-after-tools", type=int)
     tasks_demo.add_argument("--stop-after-tasks", type=int)
     tasks_demo.add_argument("--crash-after-write", action="store_true")
+    set_command = subparsers.add_parser("set", help=COMMAND_HELP["set"], description=COMMAND_HELP["set"])
+    set_command.add_argument("--provider", choices=list(PROVIDERS))
+    set_command.add_argument("--model")
+    set_command.add_argument("--env-file", type=Path, default=Path(".env"))
+    for name, option in LAUNCH_OPTIONS.items():
+        flags = {"default": None}
+        if option.kind is bool:
+            flags["action"] = argparse.BooleanOptionalAction
+        else:
+            flags["type"] = option.kind
+            if option.choices:
+                flags["choices"] = option.choices
+        set_command.add_argument("--" + name.replace("_", "-"), **flags)
     for action in ("sessions", "session", "resume", "resolve", "approve-plan", "reject-plan", "changes", "rollback"):
-        command = subparsers.add_parser(action)
-        command.add_argument("--state-db", type=Path, default=Path(".agent/sessions.sqlite3"))
+        command = subparsers.add_parser(action, help=COMMAND_HELP[action], description=COMMAND_HELP[action])
+        command.add_argument("--state-db", type=Path, default=None)
         if action != "sessions":
             command.add_argument("session_id", nargs="?" if action in {"resume","changes","rollback"} else None)
+        command.add_argument("--env-file", type=Path, default=Path(".env"))
         if action == "resume":
-            command.add_argument("--env-file", type=Path, default=Path(".env"))
             command.add_argument("--approvals", choices=["ask", "deny"], default=None)
             command.add_argument("--stop-after-tools", type=int, default=None)
             command.add_argument("--stop-after-tasks", type=int, default=None)
@@ -415,32 +434,52 @@ def main() -> int:
             command.add_argument("--call", required=True, help="Uncertain call key, for example 1:0")
             command.add_argument("--resolution", choices=["applied", "retry", "skip", "abort"], required=True)
     for action in ("setup", "doctor", "demo", "run", "plan"):
-        command = subparsers.add_parser(action)
+        command = subparsers.add_parser(action, help=COMMAND_HELP[action], description=COMMAND_HELP[action])
         command.add_argument("--provider", choices=list(PROVIDERS))
         command.add_argument("--model")
         command.add_argument("--env-file", type=Path, default=Path(".env"))
         if action in {"demo", "run", "plan"}:
-            command.add_argument("--journal",action="store_true",help="Track file changes and enable safe rollback")
+            command.add_argument("--journal", action=argparse.BooleanOptionalAction, default=None, help="Track file changes and enable safe rollback")
             add_budget_arguments(command)
-            command.add_argument("--tasks", action="store_true", help="Plan with dependency tasks and runtime verification")
+            command.add_argument("--tasks", action=argparse.BooleanOptionalAction, default=None, help="Plan with dependency tasks and runtime verification")
             command.add_argument("--stop-after-tasks", type=int)
-            command.add_argument("--plan", action="store_true", default=action == "plan", help="Read-only planning before explicit approval")
-            command.add_argument("--mode", choices=["safe", "auto"], default="safe")
-            command.add_argument("--state-db", type=Path, default=Path(".agent/sessions.sqlite3"))
+            command.add_argument("--plan", action="store_true" if action == "plan" else argparse.BooleanOptionalAction, default=None, help="Read-only planning before explicit approval")
+            command.add_argument("--mode", choices=["safe", "auto"], default=None)
+            command.add_argument("--state-db", type=Path, default=None)
             command.add_argument("--stop-after-tools", type=int, default=None,
                                  help="Pause after N checkpointed tool results; resume does not inherit this flag")
             command.add_argument("--workspace", type=Path, default=None)
-            command.add_argument("--max-rounds", type=int, default=12)
-            command.add_argument("--max-tokens", type=int, default=2048)
+            command.add_argument("--max-rounds", type=int, default=None)
+            command.add_argument("--max-tokens", type=int, default=None)
             command.add_argument("--policy", type=Path, help="Trusted JSON policy outside workspace")
-            command.add_argument("--approvals", choices=["ask", "deny"], default="ask",
+            command.add_argument("--approvals", choices=["ask", "deny"], default=None,
                                  help="Prompt for ask decisions, or refuse them without prompting")
         if action in {"run", "plan"}:
             command.add_argument("request", nargs="+")
+    if len(sys.argv) == 1:
+        parser.print_help()
+        return 0
     args = parser.parse_args()
-    if getattr(args, "tasks", False):
-        args.plan = True
+    if args.action == "help":
+        target = subparsers.choices[args.command] if args.command else parser
+        target.print_help()
+        return 0
     try:
+        validate_explicit_options(args)
+        if args.action == "set":
+            updates = set_options(args)
+            print(f"Настройки сохранены в {args.env_file}: " + ", ".join(updates))
+            print("Применяются к новым запускам; начатые сессии сохраняют прежние параметры.")
+            return 0
+        if args.action in START_COMMANDS:
+            if getattr(args, "offline", False):
+                load_launch_env(args.env_file)
+            else:
+                load_env(args.env_file)
+            apply_launch_defaults(args)
+        elif hasattr(args, "state_db") and args.state_db is None:
+            load_env(args.env_file)
+            args.state_db = option_value("state_db", os.getenv("AGENT_STATE_DB", ".agent/sessions.sqlite3"))
         budget_limits = None
         if args.action in {"run", "plan", "demo", "plan-demo", "workflow-demo", "tasks-demo", "rollback-demo"}:
             budget_limits = BudgetLimits(model_requests=args.max_rounds, tool_calls=args.max_tool_calls,
@@ -461,7 +500,6 @@ def main() -> int:
                 raise ConfigurationError("Limits must be positive")
             client = None
             if not args.offline:
-                load_env(args.env_file)
                 settings = Settings.from_env(args.provider, args.model)
                 if not doctor(settings, check_sandbox=False):
                     return 1
@@ -481,7 +519,6 @@ def main() -> int:
                 raise ConfigurationError("Limits must be positive")
             client = None
             if not args.offline:
-                load_env(args.env_file)
                 settings = Settings.from_env(args.provider, args.model)
                 if not doctor(settings, check_sandbox=False):
                     return 1
@@ -513,7 +550,6 @@ def main() -> int:
                 raise ConfigurationError("Limits must be positive")
             client = None
             if not args.offline:
-                load_env(args.env_file)
                 settings = Settings.from_env(args.provider, args.model)
                 if not doctor(settings):
                     return 1
@@ -529,7 +565,8 @@ def main() -> int:
         if args.action == "setup":
             setup(args.provider or "openrouter", args.model, args.env_file)
             return 0
-        load_env(args.env_file)
+        if args.action == "doctor":
+            load_env(args.env_file)
         settings = Settings.from_env(args.provider, args.model)
         if args.action == "doctor":
             return 0 if doctor(settings) else 1
