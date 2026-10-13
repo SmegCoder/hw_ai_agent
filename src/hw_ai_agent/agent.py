@@ -96,6 +96,7 @@ class CodingAgent:
         self.verify_recovery = verify_recovery
         self.session_id: str | None = None
         self._call_records: dict[str, tuple[tuple, dict | None]] = {}
+        self._failed_call_ids: set[str] = set()
         self._original_policy_callback = getattr(runtime, "_original_agent_policy_callback", runtime.on_policy_event)
         runtime._original_agent_policy_callback = self._original_policy_callback
         runtime.on_policy_event = self._policy_event
@@ -109,6 +110,7 @@ class CodingAgent:
         self.events = []
         self._memory_budget = MemoryBudget(self.budget_limits)
         self._call_records = {}
+        self._failed_call_ids = set()
         self.runtime.session_permissions = set()
         self.messages = [
             {"role": "system", "content": self.system_prompt + (PLAN_INSTRUCTIONS if self.plan_mode else "") + (TASK_INSTRUCTIONS if self.task_mode else "")},
@@ -185,8 +187,9 @@ class CodingAgent:
                     raise JournalError("Finish rollback before attempting to resume the agent")
             self.messages, self.events = copy.deepcopy(state.messages), copy.deepcopy(state.events)
             self._call_records = {}
+            self._failed_call_ids = set()
             for item in self.store.calls(session_id):
-                self._remember_call(item["call"], item["result"])
+                self._remember_call(item["call"], item["result"], failed=item["state"] == "failed" if item["result"] is not None else None)
             self.runtime.session_permissions = set()
             self.max_rounds, self.max_context_chars = state.max_rounds, state.max_context_chars
             self.budget_limits = BudgetLimits.restore(self.store.budget(session_id)["limits"])
@@ -218,8 +221,9 @@ class CodingAgent:
                         state = self.store.get(session_id)
                         self.messages = copy.deepcopy(state.messages)
                         self._call_records = {}
+                        self._failed_call_ids = set()
                         for saved in self.store.calls(session_id):
-                            self._remember_call(saved["call"], saved["result"])
+                            self._remember_call(saved["call"], saved["result"], failed=saved["state"] == "failed" if saved["result"] is not None else None)
                 if state.metadata.get("approval_contract") != 2:
                     self.store.upgrade_approval_contract(session_id)
                 self.events = copy.deepcopy(self.store.get(session_id).events)
@@ -384,12 +388,17 @@ class CodingAgent:
             arguments = function["arguments"]
         return function["name"], arguments
 
-    def _remember_call(self, call: dict, result: dict | None = None):
+    def _remember_call(self, call: dict, result: dict | None = None, *, failed: bool | None = None):
         signature = self._call_signature(call)
         previous = self._call_records.get(call["id"])
         if previous is not None and previous[0] != signature:
             raise AgentError("PROTOCOL_ERROR: repeated tool_call_id has different name or arguments")
         self._call_records[call["id"]] = (signature, result or (previous[1] if previous else None))
+        if failed is not None:
+            if failed:
+                self._failed_call_ids.add(call["id"])
+            else:
+                self._failed_call_ids.discard(call["id"])
 
     def _registered_call(self, item: dict):
         assert self.store is not None and self.session_id is not None
@@ -411,9 +420,9 @@ class CodingAgent:
         outcome = self._pending_task_outcome
         self._pending_task_outcome = None
         if outcome:
-            result = self.store.finish_call(self.session_id, item, result, task_outcome=outcome)
+            result = self.store.finish_call(self.session_id, item, result, call["id"] in self._failed_call_ids, task_outcome=outcome)
         else:
-            result = self.store.finish_call(self.session_id, item, result)
+            result = self.store.finish_call(self.session_id, item, result, call["id"] in self._failed_call_ids)
         self._remember_call(call, result)
         self.messages.append(result)
         self._emit({"event": "tool_result", "task_id": item.get("task_id"), "phase": item.get("phase"), **result}, persist=False)
@@ -499,6 +508,7 @@ class CodingAgent:
                     return copy.deepcopy(previous[1])
         call_id = "unknown"
         name = "unknown"
+        failed = False
         try:
             if not isinstance(call, Mapping):
                 raise ToolError("tool call must be an object")
@@ -532,8 +542,10 @@ class CodingAgent:
                 content = self.runtime.execute(name, arguments)
         except JournalConflict as exc:
             self._journal_failure = exc
+            failed = True
             content = f"ERROR: {exc}"
         except (ToolError, PlanError, json.JSONDecodeError, OSError) as exc:
+            failed = True
             content = f"ERROR: {exc}"
 
         result = {
@@ -543,7 +555,7 @@ class CodingAgent:
             "content": content,
         }
         if call_id != "unknown":
-            self._remember_call(call, result)
+            self._remember_call(call, result, failed=failed)
         return result
 
 

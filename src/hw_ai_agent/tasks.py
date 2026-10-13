@@ -106,6 +106,8 @@ def validate_task_plan(value):
         if not isinstance(verification, dict):
             raise PlanError('Task verification must be an object')
         kind = verification.get('kind')
+        if not isinstance(kind, str):
+            raise PlanError('Task verification kind must be a string')
         if kind in {'file_written', 'file_read', 'file_absent'}:
             if set(verification) != {'kind', 'path'}:
                 raise PlanError('File verification requires exactly kind and path')

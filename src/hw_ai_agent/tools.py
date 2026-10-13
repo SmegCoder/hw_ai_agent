@@ -3,6 +3,7 @@ import fnmatch
 import difflib
 import hashlib
 import json
+import math
 import os
 import selectors
 import shlex
@@ -40,8 +41,10 @@ class ToolRuntime:
         self.root = Path(root).expanduser().resolve()
         if not self.root.is_dir():
             raise ValueError(f"Workspace does not exist: {self.root}")
-        if min(command_timeout, max_output_chars, max_file_chars) <= 0:
-            raise ValueError("Runtime limits must be positive")
+        if (type(command_timeout) not in (int, float) or not math.isfinite(command_timeout)
+                or command_timeout <= 0 or any(type(v) is not int or v <= 0
+                for v in (max_output_chars, max_file_chars))):
+            raise ValueError("Runtime limits must be finite and positive; size limits must be integers")
         self.command_timeout = command_timeout
         self.max_output_chars = max_output_chars
         self.max_file_chars = max_file_chars
@@ -117,6 +120,12 @@ class ToolRuntime:
             self._policy_event(name, "deny", "blocked", str(exc), "runtime_boundary")
             raise
         target = None
+        checked_cwd = None
+        if name == "Bash":
+            directory = self._safe_path(arguments.get("cwd", "."))
+            with open_directory(self.root, directory) as descriptor:
+                info = os.fstat(descriptor)
+                checked_cwd = (directory, info.st_dev, info.st_ino)
         if name in {"write_file", "delete_file"}:
             try:
                 target = capture_target(self.root, self.root / path, arguments["path"])
@@ -171,6 +180,25 @@ class ToolRuntime:
                 raise ToolError("APPROVAL_REQUIRED: operator approval was not granted")
         else:
             self._policy_event(name, "allow", "permitted", decision.reason, "policy")
+        # The operator may spend time answering. Revalidate the live policy,
+        # paths and mode boundary immediately before dispatching the action.
+        self._check_phase(name)
+        try:
+            current_path, current_command = self._validate_call(name, arguments)
+            if (current_path, current_command) != (path, command):
+                raise ToolError("checked target changed during approval")
+            if checked_cwd is not None:
+                directory = self._safe_path(arguments.get("cwd", "."))
+                with open_directory(self.root, directory) as descriptor:
+                    info = os.fstat(descriptor)
+                if (directory, info.st_dev, info.st_ino) != checked_cwd:
+                    raise ToolError("Bash working directory changed during approval")
+        except (ToolError, OSError) as exc:
+            self._policy_event(name, "deny", "blocked", "Checked target changed", "runtime_boundary")
+            raise ToolError(f"TARGET_CHANGED: {exc}") from None
+        if self.policy.decide(name, path=path, command=command).action == Action.DENY:
+            self._policy_event(name, "deny", "blocked", "Policy changed during approval", "runtime_boundary")
+            raise ToolError("POLICY_DENIED: policy changed during approval")
         handler = self.bash if name == "Bash" else getattr(self, name)
         boundary = self.journal.action(name, arguments, path) if self.journal is not None and name in {"write_file", "delete_file", "Bash"} else nullcontext()
         try:
@@ -208,6 +236,11 @@ class ToolRuntime:
             expected = bool if properties[key]["type"] == "boolean" else str
             if type(value) is not expected:
                 raise ToolError(f"{key} must be {properties[key]['type']}")
+            if isinstance(value, str):
+                try:
+                    value.encode("utf-8")
+                except UnicodeError:
+                    raise ToolError(f"{key} must contain valid UTF-8 text") from None
         if name == "Bash":
             directory = self._safe_path(arguments.get("cwd", "."))
             if not directory.is_dir():
@@ -341,14 +374,74 @@ class ToolRuntime:
         if program in {"python", "python3"}:
             if args[1:3] != ["-m", "unittest"]:
                 raise ToolError("Only python -m unittest is allowed")
+            self._check_unittest_args(args[3:], cwd or self.root)
             executable = sys.executable
         else:
             executable = {"pwd": "/bin/pwd", "ls": "/bin/ls", "cat": "/bin/cat", "sleep": "/bin/sleep"}[program]
-        for arg in args[1:]:
-            if not arg.startswith("-"):
-                relative = (cwd or self.root).relative_to(self.root) / arg
-                self._safe_path(relative.as_posix())
+        if program not in {"python", "python3"}:
+            for arg in args[1:]:
+                if not arg.startswith("-"):
+                    self._command_path(arg, cwd or self.root)
         return [executable, *args[1:]]
+
+    def _command_path(self, value: str, cwd: Path) -> None:
+        if not value:
+            raise ToolError("Command paths must not be empty")
+        if Path(value).is_absolute():
+            raise ToolError("Absolute command paths are not allowed")
+        self._safe_path((cwd.relative_to(self.root) / value).as_posix())
+
+    def _check_unittest_args(self, arguments: list[str], cwd: Path) -> None:
+        """Parse the whole supported command, including attached option values.
+
+        Reject abbreviations and unknown options rather than relying on argparse
+        in the child process to interpret paths that the runtime never checked.
+        Patterns are data, not paths; shlex.join quotes them before Bash sees them.
+        """
+        switches = {"-v", "--verbose", "-q", "--quiet", "-f", "--failfast",
+                    "-c", "--catch", "-b", "--buffer", "--locals", "-h", "--help"}
+        values = {"-s": "path", "--start-directory": "path",
+                  "-t": "path", "--top-level-directory": "path",
+                  "-p": "pattern", "--pattern": "pattern", "-k": "pattern"}
+        index = 0
+        positional = False
+        while index < len(arguments):
+            arg = arguments[index]
+            index += 1
+            if arg == "--" and not positional:
+                positional = True
+                continue
+            if not positional and arg in switches:
+                continue
+            if not positional and arg.startswith("-"):
+                option, separator, value = arg.partition("=")
+                if not separator and len(arg) > 2 and arg[:2] in values:
+                    option, value, separator = arg[:2], arg[2:], "attached"
+                if option not in values:
+                    raise ToolError("Unsupported unittest option; use full supported option names")
+                if not separator:
+                    if index == len(arguments):
+                        raise ToolError("Missing unittest option value")
+                    value = arguments[index]
+                    index += 1
+                if not value or value.startswith("-"):
+                    raise ToolError("Invalid unittest option value")
+                if values[option] == "path":
+                    self._command_path(value, cwd)
+                    if option in {"-s", "--start-directory"}:
+                        self._command_module(value, cwd)
+                continue
+            if arg == "discover" and not positional:
+                continue
+            self._command_path(arg, cwd)
+            # unittest also accepts dotted module/class/method selectors. Check
+            # their directory form so private.test_order cannot bypass policy.
+            self._command_module(arg, cwd)
+
+    def _command_module(self, value: str, cwd: Path) -> None:
+        module = value[:-3] if value.endswith(".py") else value
+        if "/" not in module and "." in module and not module.startswith("."):
+            self._command_path(module.replace(".", "/"), cwd)
 
     def _sandbox(self, argv: list[str]) -> list[str]:
         if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").exists():

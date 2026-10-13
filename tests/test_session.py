@@ -338,7 +338,10 @@ class SessionDemoTests(unittest.TestCase):
             workspace = root / "workspace"
             initialize_demo(workspace)
             policy_file = root / "policy.json"
-            policy_file.write_text(json.dumps({"defaults": {"write_file": "allow"}}))
+            policy_file.write_text(json.dumps({
+                "directories": {"allow": ["."], "deny": []},
+                "defaults": {"read_file": "allow", "write_file": "allow", "Bash": "allow"},
+            }))
             db = root / ".agent/sessions.sqlite3"
             code = ("def calculate_total(prices, discount_percent):\n"
                     "    if not 0 <= discount_percent <= 100:\n"

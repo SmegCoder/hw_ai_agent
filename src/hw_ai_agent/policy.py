@@ -143,10 +143,10 @@ class Policy:
         return conditions[0] if len(conditions) == 1 else "(require-all " + " ".join(conditions) + ")"
 
     @classmethod
-    def from_dict(cls, data: Any) -> Policy:
+    def from_dict(cls, data: Any, *, fail_closed: bool = False) -> Policy:
         if not isinstance(data, dict) or set(data) - {"defaults", "rules", "directories"}:
             raise PolicyError("Policy must contain only defaults, rules and directories")
-        directories = data.get("directories", {"allow": ["."], "deny": []})
+        directories = data.get("directories", {"allow": [] if fail_closed else ["."], "deny": []})
         if not isinstance(directories, dict) or set(directories) - {"allow", "deny"}:
             raise PolicyError("Directories must contain allow and deny lists")
         paths = {}
@@ -163,7 +163,7 @@ class Policy:
         defaults = data.get("defaults", {})
         if not isinstance(defaults, dict) or set(defaults) - TOOLS:
             raise PolicyError("Invalid defaults or unknown tool")
-        configured = dict(DEFAULTS)
+        configured = dict.fromkeys(TOOLS, Action.DENY) if fail_closed else dict(DEFAULTS)
         try:
             for tool, value in defaults.items():
                 configured[tool] = Action(value)
@@ -212,6 +212,8 @@ class Policy:
                         raise PolicyError("Duplicate key in policy JSON")
                     result[key] = value
                 return result
-            return cls.from_dict(json.loads(raw, object_pairs_hook=unique_object))
+            # A user-supplied file is a complete policy, not an overlay on the
+            # built-in interactive defaults. Omitted permissions grant nothing.
+            return cls.from_dict(json.loads(raw, object_pairs_hook=unique_object), fail_closed=True)
         except (OSError, UnicodeError, json.JSONDecodeError):
             raise PolicyError("Cannot read valid policy JSON") from None

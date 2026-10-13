@@ -345,7 +345,12 @@ class ChangeJournal:
                 if state.get('kind') != 'file':return encoded(state)+'\n'
                 raw = blobs.get(state['sha256'])
                 return (raw if raw is not None else self.blob(state)).decode('utf-8', errors='replace')
-            parts.extend(difflib.unified_diff(data(entry['before']).splitlines(True), data(entry['after']).splitlines(True), fromfile='before/'+path, tofile='observed/'+path))
+            lines = list(difflib.unified_diff(data(entry['before']).splitlines(True), data(entry['after']).splitlines(True), fromfile='before/'+path, tofile='observed/'+path))
+            parts.extend(line if line.endswith('\n') else line+'\n\\ No newline at end of file\n' for line in lines)
+            if not lines and entry['before'] != entry['after']:
+                # Empty files and mode-only changes have no textual diff, but
+                # must still be visible before the operator attributes them.
+                parts.append(f"File {path}: {encoded(entry['before'])} -> {encoded(entry['after'])}\n")
         return ''.join(parts) or '(no file changes)'
 
     def resolve_changes(self, item, ownership):

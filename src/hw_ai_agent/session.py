@@ -601,12 +601,17 @@ class SessionStore:
             self.db.execute("UPDATE calls SET state='running' WHERE session_id=? AND batch=? AND position=? AND state='awaiting_approval'",
                             (session_id, item["batch"], item["position"]))
 
-    def finish_call(self, session_id: str, item: dict, result: dict, *, task_outcome: dict | None = None):
+    def finish_call(self, session_id: str, item: dict, result: dict, failed: bool | None = None, *, task_outcome: dict | None = None):
         with self.transaction():
             state = self.get(session_id)
             allocation = self._allocation(session_id, item)
             quota = allocation["output_quota"]
-            failed = result["content"].startswith("ERROR:")
+            # Runtime status is independent of file contents and of output
+            # truncation. The fallback supports legacy/operator recovery calls.
+            if failed is None:
+                failed = result["content"].startswith("ERROR:")
+            if type(failed) is not bool:
+                raise SessionError("Tool result status must be a boolean")
             if quota is None:
                 # Legacy uncertain calls have no reservation from the old runtime.
                 quota = max(1, len(result["content"].encode("utf-8")))

@@ -3,6 +3,7 @@ import json
 import socket
 import ssl
 import certifi
+from http.client import HTTPException
 from collections.abc import Mapping, Sequence
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
@@ -56,8 +57,9 @@ class OpenAICompatibleClient:
                 raise ModelClientError("Model response exceeds the size limit")
             body = json.loads(raw)
         except HTTPError as exc:
+            exc.close()
             raise ModelClientError(f"{self.settings.provider} returned HTTP {exc.code}") from None
-        except (URLError, socket.timeout, OSError) as exc:
+        except (URLError, socket.timeout, OSError, HTTPException) as exc:
             raise ModelClientError(f"Cannot reach {self.settings.provider}: {type(exc).__name__}") from None
         except (UnicodeDecodeError, json.JSONDecodeError):
             raise ModelClientError("Model endpoint returned invalid JSON") from None
