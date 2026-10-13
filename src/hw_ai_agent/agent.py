@@ -11,7 +11,8 @@ from typing import Any
 from .client import ModelClient
 from .tools import ToolError, ToolRuntime
 from .policy import ApprovalDeferred, Policy
-from .session import SessionError, SessionStore, UncertainActionError
+from .session import SessionError, SessionStore, UncertainActionError, PlanRejectedError
+from .planning import PLAN_SCHEMA, PLAN_INSTRUCTIONS, validate_plan, PlanError, PlanApprovalDeferred
 
 
 DEFAULT_SYSTEM_PROMPT = """You are a careful coding agent.
@@ -46,9 +47,15 @@ class CodingAgent:
         on_event: Callable[[dict[str, Any]], None] | None = None,
         store: SessionStore | None = None,
         session_metadata: dict | None = None,
+        plan_mode: bool = False,
+        approve_plan: Callable[[dict], bool] | None = None,
+        resolve_uncertain: Callable[[dict], str | None] | None = None,
+        verify_recovery: Callable[[dict], bool] | None = None,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be positive")
+        if type(plan_mode) is not bool:
+            raise ValueError("plan_mode must be a boolean")
         self.client = client
         self.runtime = runtime
         self.system_prompt = system_prompt
@@ -59,6 +66,10 @@ class CodingAgent:
         self.messages: list[dict[str, Any]] = []
         self.store = store
         self.session_metadata = dict(session_metadata or {})
+        self.plan_mode = plan_mode
+        self.approve_plan = approve_plan
+        self.resolve_uncertain = resolve_uncertain
+        self.verify_recovery = verify_recovery
         self.session_id: str | None = None
         self._call_records: dict[str, tuple[tuple, dict | None]] = {}
         self._original_policy_callback = getattr(runtime, "_original_agent_policy_callback", runtime.on_policy_event)
@@ -68,11 +79,14 @@ class CodingAgent:
     def run(self, request: str) -> str:
         if not request.strip():
             raise ValueError("request must not be empty")
+        if self.plan_mode and not self.store:
+            raise SessionError("Plan Mode requires a session store")
+        self.runtime.phase = "planning" if self.plan_mode else "execution"
         self.events = []
         self._call_records = {}
         self.runtime.session_permissions = set()
         self.messages = [
-            {"role": "system", "content": self.system_prompt},
+            {"role": "system", "content": self.system_prompt + (PLAN_INSTRUCTIONS if self.plan_mode else "")},
             {"role": "user", "content": request},
         ]
         if self.store:
@@ -87,6 +101,7 @@ class CodingAgent:
         metadata = {**self.session_metadata, "workspace": str(self.runtime.root),
                     "execution_mode": self.runtime.mode,
                     "approval_contract": 2,
+                    "plan_mode": self.plan_mode,
                     "trash_dir": str(self.runtime.trash_dir),
                     "policy": self.runtime.policy.as_dict(),
                     "runtime_limits": {name: getattr(self.runtime, name) for name in
@@ -121,6 +136,11 @@ class CodingAgent:
             if state.status == "aborted":
                 raise SessionError("This session was terminated by the operator and cannot be resumed")
             self._check_binding(state.metadata)
+            self.plan_mode = state.metadata.get("plan_mode", False)
+            if type(self.plan_mode) is not bool:
+                raise SessionError("Invalid saved planning mode")
+            saved_plan = self.store.plan(session_id)
+            self.runtime.phase = "planning" if saved_plan and saved_plan["state"] != "approved" else "execution"
             self.session_id = session_id
             self.messages, self.events = copy.deepcopy(state.messages), copy.deepcopy(state.events)
             self._call_records = {}
@@ -133,7 +153,23 @@ class CodingAgent:
                     self.on_event({"event": "session_cached", "session_id": session_id})
                 return state.final_answer or ""
             try:
-                self.store.recover(session_id)
+                while True:
+                    try:
+                        self.store.recover(session_id)
+                        break
+                    except UncertainActionError:
+                        item = self.store.calls(session_id, True)[0]
+                        resolution = self.resolve_uncertain(copy.deepcopy(item)) if self.resolve_uncertain else None
+                        if resolution is None:
+                            raise
+                        self.store._resolve(session_id, item["key"], resolution, self.verify_recovery)
+                        if resolution == "abort":
+                            raise SessionError("This session was terminated by the operator")
+                        state = self.store.get(session_id)
+                        self.messages = copy.deepcopy(state.messages)
+                        self._call_records = {}
+                        for saved in self.store.calls(session_id):
+                            self._remember_call(saved["call"], saved["result"])
                 if state.metadata.get("approval_contract") != 2:
                     self.store.upgrade_approval_contract(session_id)
                 self.events = copy.deepcopy(self.store.get(session_id).events)
@@ -141,7 +177,8 @@ class CodingAgent:
                 self._emit({"event": event, "session_id": session_id})
                 # A final assistant message may have been committed just before process death.
                 last = self.messages[-1]
-                if last.get("role") == "assistant" and not last.get("tool_calls") and last.get("content"):
+                if (self.runtime.phase != "planning" and last.get("role") == "assistant"
+                        and not last.get("tool_calls") and last.get("content")):
                     answer = last["content"]
                     self.store.complete(session_id, answer)
                     self._emit({"event": "final", "content": answer}, persist=False)
@@ -149,6 +186,8 @@ class CodingAgent:
                 return self._loop(state.rounds)
             except BaseException as exc:
                 status = ("blocked" if isinstance(exc, UncertainActionError) else
+                          "waiting_plan_approval" if isinstance(exc, PlanApprovalDeferred) else
+                          "aborted" if isinstance(exc, PlanRejectedError) or self.store.get(session_id).status == "aborted" else
                           "waiting_approval" if isinstance(exc, ApprovalDeferred) else
                           "interrupted" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else "failed")
                 try:
@@ -161,12 +200,16 @@ class CodingAgent:
         if self.store and self.session_id:
             for item in self.store.calls(self.session_id, True):
                 self._registered_call(item)
+            self._review_plan()
         while rounds < self.max_rounds:
             if len(json.dumps(self.messages, ensure_ascii=False)) > self.max_context_chars:
                 raise AgentError("Conversation exceeds the context size limit")
             rounds = self.store.start_model(self.session_id) if self.store and self.session_id else rounds + 1
             self._emit({"event": "model_request", "round": rounds}, persist=False)
-            response = self.client.complete(self.messages, self.runtime.tool_schemas)
+            schemas = self.runtime.tool_schemas
+            if self.runtime.phase == "planning":
+                schemas = [*schemas, copy.deepcopy(PLAN_SCHEMA)]
+            response = self.client.complete(self.messages, schemas)
             if self.store and getattr(self.client, "usage", []):
                 last_usage = self.client.usage[-1]
                 usage = {key: last_usage[key] for key in ("prompt_tokens", "completion_tokens", "total_tokens", "cost")
@@ -185,6 +228,11 @@ class CodingAgent:
                 content = assistant.get("content")
                 if not isinstance(content, str) or not content.strip():
                     raise AgentError("Model returned neither tool calls nor a final answer")
+                if self.runtime.phase == "planning":
+                    message = {"role": "user", "content": "Submit the plan with submit_plan; a text answer is not an approved plan."}
+                    self.store.message(self.session_id, message)
+                    self.messages.append(message)
+                    continue
                 if self.store and self.session_id:
                     self.store.complete(self.session_id, content)
                 self._emit({"event": "final", "content": content}, persist=False)
@@ -193,6 +241,7 @@ class CodingAgent:
             if self.store and self.session_id:
                 for item in self.store.calls(self.session_id, True):
                     self._registered_call(item)
+                self._review_plan()
                 continue
             for call in tool_calls:
                 self._emit({"event": "tool_call", "name": call["function"]["name"],
@@ -202,6 +251,34 @@ class CodingAgent:
                 self._emit({"event": "tool_result", **tool_result})
 
         raise AgentError(f"agent exceeded the limit of {self.max_rounds} model rounds")
+
+    def _review_plan(self):
+        if not self.store or not self.session_id:
+            return
+        saved = self.store.plan(self.session_id)
+        if not saved:
+            return
+        if saved["state"] == "awaiting_approval":
+            self._emit({"event": "plan_waiting", "plan": saved["data"]})
+            if self.approve_plan is None:
+                raise PlanApprovalDeferred("План сохранён и ожидает явного утверждения")
+            try:
+                decision = self.approve_plan(copy.deepcopy(saved["data"]))
+            except PlanApprovalDeferred:
+                raise
+            except Exception:
+                raise PlanApprovalDeferred("Ответ на план не получен; решение не сохранено") from None
+            if type(decision) is not bool:
+                raise PlanApprovalDeferred("План требует явного ответа: утвердить или отклонить")
+            self.store._decide_plan(self.session_id, decision)
+            state = self.store.get(self.session_id)
+            self.messages, self.events = copy.deepcopy(state.messages), copy.deepcopy(state.events)
+            if not decision:
+                raise PlanRejectedError("План отклонён. Сессия завершена без исполнения плана.")
+        saved = self.store.plan(self.session_id)
+        self.runtime.phase = "execution" if saved["state"] == "approved" else "planning"
+        if self.runtime.phase == "execution":
+            self.store.set_status(self.session_id, "running")
 
     @staticmethod
     def _call_signature(call: dict) -> tuple:
@@ -317,8 +394,16 @@ class CodingAgent:
                 arguments = raw_arguments
             if not isinstance(arguments, Mapping):
                 raise ToolError("tool arguments must be a JSON object")
-            content = self.runtime.execute(name, arguments)
-        except (ToolError, json.JSONDecodeError, OSError) as exc:
+            if name == "submit_plan":
+                if self.runtime.phase != "planning" or not self.store or not self.session_id:
+                    raise ToolError("submit_plan is available only during planning")
+                if self.store.plan(self.session_id)["state"] != "planning":
+                    raise ToolError("PLAN_ALREADY_SAVED: wait for the operator decision")
+                validate_plan(dict(arguments))
+                content = "PLAN_SAVED: runtime will request explicit operator approval before execution"
+            else:
+                content = self.runtime.execute(name, arguments)
+        except (ToolError, PlanError, json.JSONDecodeError, OSError) as exc:
             content = f"ERROR: {exc}"
 
         result = {

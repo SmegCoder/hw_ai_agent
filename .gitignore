@@ -13,5 +13,6 @@ build/
 !.env.example
 workspace/demo-*/
 workspace/workflow-*/
+workspace/plan-demo-*/
 .agent/
 .DS_Store

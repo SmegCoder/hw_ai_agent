@@ -17,17 +17,26 @@ from .tools import ToolError, ToolRuntime
 from .filesystem import open_read_file
 from .policy import ApprovalDeferred, ApprovalRequest, Policy, PolicyError
 from .policy_demo import run_policy_demo
-from .session import SessionError, SessionStore
+from .session import SessionError, SessionStore, UncertainActionError
 from .session_demo import run_session_demo
 from .workflow_demo import WorkflowClient, run_workflow_demo, verify_workflow
+from .planning import PlanApprovalDeferred
+from .terminal import visible, confirm_plan, choose_session, confirm_conflict
+from .plan_demo import PlanDemoClient, run_plan_demo
 
 def show_event(event: dict) -> None:
     if event["event"] == "model_request":
         print(f"\nМодель: обращение {event['round']}", flush=True)
     elif event["event"] == "tool_result":
-        print(f"\n[{event['name']}]\n{event['content']}", flush=True)
+        if event['name'] == 'submit_plan' and not event['content'].startswith('ERROR:'):
+            print("План сохранён.", flush=True)
+        else:
+            print(f"\n[{event['name']}]\n{visible(event['content'])}", flush=True)
     elif event["event"] == "tool_call":
-        print(f"Вызов {event['name']}: {event['arguments']}", flush=True)
+        if event['name'] == 'submit_plan':
+            print("Модель подготовила план.", flush=True)
+        else:
+            print(f"Вызов {event['name']}: {visible(event['arguments'])}", flush=True)
     elif event["event"] == "policy_decision":
         print(f"Policy: {event['tool']} → {event['action']} / {event['outcome']}", flush=True)
         if event.get("source") == "session_grant":
@@ -39,9 +48,6 @@ def confirm_action(request: ApprovalRequest) -> bool:
     if not sys.stdin.isatty():
         raise ApprovalDeferred("Подтверждение требует интерактивного терминала; продолжите эту сессию через resume")
 
-    # Escape terminal control characters in model-provided filenames and diffs.
-    def visible(value: str) -> str:
-        return "".join(c if c.isprintable() or c in "\n\t" else repr(c)[1:-1] for c in value)
     print(f"\nТребуется подтверждение: {request.tool} {visible(request.target)}")
     print(f"Причина: {visible(request.reason)}")
     print(f"SHA-256 запроса: {request.fingerprint}")
@@ -96,17 +102,18 @@ def setup(provider: str, model: str | None, path: Path) -> None:
         stream.write("\n".join(f"{k}={v}" for k, v in values.items()) + "\n")
     print(f"Настройки сохранены в {path}; ключ не отображается.")
 
-def doctor(settings: Settings) -> bool:
+def doctor(settings: Settings, *, check_sandbox=True) -> bool:
     print(f"Provider: {settings.provider}; model: {settings.model}")
     success = True
-    with tempfile.TemporaryDirectory() as temporary:
-        try:
-            result = ToolRuntime(temporary).bash("pwd")
-            success = result.startswith("exit_code=0\n")
-            print("Bash sandbox: " + ("OK" if success else result))
-        except ToolError as exc:
-            success = False
-            print(f"Bash sandbox: {exc}")
+    if check_sandbox:
+        with tempfile.TemporaryDirectory() as temporary:
+            try:
+                result = ToolRuntime(temporary).bash("pwd")
+                success = result.startswith("exit_code=0\n")
+                print("Bash sandbox: " + ("OK" if success else result))
+            except ToolError as exc:
+                success = False
+                print(f"Bash sandbox: {exc}")
     if settings.provider == "ollama":
         try:
             with urlopen(settings.base_url.removesuffix("/v1") + "/api/tags", timeout=5) as response:
@@ -187,6 +194,8 @@ def session_command(args):
         if args.action == "sessions":
             print(json.dumps(store.list_sessions(), ensure_ascii=False, indent=2))
             return 0
+        if args.action == "resume":
+            args.session_id = choose_session(store, args.session_id)
         state = store.get(args.session_id)
         if args.action == "session":
             calls = []
@@ -202,7 +211,11 @@ def session_command(args):
                 "provider": state.metadata.get("provider"), "model": state.metadata.get("model"),
                 "rounds": state.rounds, "max_rounds": state.max_rounds, "error": state.error,
                 "mode": state.metadata.get("execution_mode", "safe"),
-                "unfinished_calls": calls}, ensure_ascii=False, indent=2))
+                "plan": store.plan(args.session_id), "unfinished_calls": calls}, ensure_ascii=False, indent=2))
+            return 0
+        if args.action in {"approve-plan", "reject-plan"}:
+            store.decide_plan(args.session_id, args.action == "approve-plan")
+            print("Решение по плану сохранено." + (" Продолжение: hw-ai-agent resume" if args.action == "approve-plan" else " Сессия завершена."))
             return 0
         listener = event_listener(getattr(args, "stop_after_tools", None))
         if args.action == "resolve":
@@ -220,8 +233,21 @@ def session_command(args):
             raise SessionError("This session was terminated by the operator and cannot be resumed")
         runtime = saved_runtime(state, store.path, getattr(args, "approvals", None), listener)
         metadata = state.metadata
+        interactive = {"approve_plan": confirm_plan,
+                       "resolve_uncertain": lambda item: confirm_conflict(runtime, item, lambda i: verify_applied(runtime, i)),
+                       "verify_recovery": lambda item: verify_applied(runtime, item)}
+        if metadata.get("kind") == "plan-demo" and metadata.get("provider") not in PROVIDERS:
+            if not metadata["demo"].get("offline", metadata.get("provider") == "scripted"):
+                raise SessionError("Real-model plan session cannot resume with a scripted client")
+            client = PlanDemoClient()
+            client.max_tokens = metadata.get("max_tokens", 2048)
+            agent = CodingAgent(client, runtime, store=store, on_event=listener, **interactive)
+            answer = agent.resume(args.session_id)
+            demo = metadata["demo"]
+            return report_demo(verify_demo(client, runtime.root, runtime, demo["baseline"], demo["test_hash"],
+                                          answer, agent.events, session_id=args.session_id))
         if metadata.get("kind") == "workflow" and metadata.get("provider") not in PROVIDERS:
-            agent = CodingAgent(WorkflowClient(), runtime, store=store, on_event=listener)
+            agent = CodingAgent(WorkflowClient(), runtime, store=store, on_event=listener, **interactive)
             agent.resume(args.session_id)
             return report_workflow(verify_workflow(agent, runtime, metadata))
         load_env(args.env_file)
@@ -230,11 +256,11 @@ def session_command(args):
         settings = Settings.from_env(metadata["provider"], metadata["model"])
         client = OpenAICompatibleClient(settings, timeout=180 if settings.provider == "ollama" else 90,
                                         max_tokens=metadata["max_tokens"])
-        agent = CodingAgent(client, runtime, store=store, on_event=listener)
+        agent = CodingAgent(client, runtime, store=store, on_event=listener, **interactive)
         answer = agent.resume(args.session_id)
         if metadata.get("kind") == "workflow":
             return report_workflow(verify_workflow(agent, runtime, metadata))
-        if metadata.get("kind") == "demo":
+        if metadata.get("kind") in {"demo", "plan-demo"}:
             demo = metadata["demo"]
             report = verify_demo(client, runtime.root, runtime, demo["baseline"], demo["test_hash"],
                                  answer, agent.events, session_id=args.session_id)
@@ -261,11 +287,25 @@ def main() -> int:
     workflow.add_argument("--stop-after-tools", type=int)
     workflow.add_argument("--crash-after-write", action="store_true",
                           help="Exit with code 86 after the first write, before its result checkpoint")
-    for action in ("sessions", "session", "resume", "resolve"):
+    plan_demo = subparsers.add_parser("plan-demo", help="Real-model Plan Mode; --offline for deterministic demo")
+    plan_demo.add_argument("--offline", action="store_true", help="Use scripted planning without a model or API key")
+    plan_demo.add_argument("--provider", choices=list(PROVIDERS))
+    plan_demo.add_argument("--model")
+    plan_demo.add_argument("--env-file", type=Path, default=Path(".env"))
+    plan_demo.add_argument("--max-rounds", type=int, default=20)
+    plan_demo.add_argument("--max-tokens", type=int, default=2048)
+    plan_demo.add_argument("--approvals", choices=["ask", "deny"], default="ask")
+    plan_demo.add_argument("--policy", type=Path)
+    plan_demo.add_argument("--stop-after-tools", type=int)
+    plan_demo.add_argument("--mode", choices=["safe", "auto"], default="safe")
+    plan_demo.add_argument("--state-db", type=Path, default=Path(".agent/sessions.sqlite3"))
+    plan_demo.add_argument("--workspace", type=Path)
+    plan_demo.add_argument("--crash-after-write", action="store_true")
+    for action in ("sessions", "session", "resume", "resolve", "approve-plan", "reject-plan"):
         command = subparsers.add_parser(action)
         command.add_argument("--state-db", type=Path, default=Path(".agent/sessions.sqlite3"))
         if action != "sessions":
-            command.add_argument("session_id")
+            command.add_argument("session_id", nargs="?" if action == "resume" else None)
         if action == "resume":
             command.add_argument("--env-file", type=Path, default=Path(".env"))
             command.add_argument("--approvals", choices=["ask", "deny"], default=None)
@@ -273,12 +313,13 @@ def main() -> int:
         if action == "resolve":
             command.add_argument("--call", required=True, help="Uncertain call key, for example 1:0")
             command.add_argument("--resolution", choices=["applied", "retry", "skip", "abort"], required=True)
-    for action in ("setup", "doctor", "demo", "run"):
+    for action in ("setup", "doctor", "demo", "run", "plan"):
         command = subparsers.add_parser(action)
         command.add_argument("--provider", choices=list(PROVIDERS))
         command.add_argument("--model")
         command.add_argument("--env-file", type=Path, default=Path(".env"))
-        if action in {"demo", "run"}:
+        if action in {"demo", "run", "plan"}:
+            command.add_argument("--plan", action="store_true", default=action == "plan", help="Read-only planning before explicit approval")
             command.add_argument("--mode", choices=["safe", "auto"], default="safe")
             command.add_argument("--state-db", type=Path, default=Path(".agent/sessions.sqlite3"))
             command.add_argument("--stop-after-tools", type=int, default=None,
@@ -289,14 +330,36 @@ def main() -> int:
             command.add_argument("--policy", type=Path, help="Trusted JSON policy outside workspace")
             command.add_argument("--approvals", choices=["ask", "deny"], default="ask",
                                  help="Prompt for ask decisions, or refuse them without prompting")
-        if action == "run":
+        if action in {"run", "plan"}:
             command.add_argument("request", nargs="+")
     args = parser.parse_args()
     try:
         if getattr(args, "stop_after_tools", None) is not None and args.stop_after_tools < 1:
             raise ConfigurationError("--stop-after-tools must be positive")
-        if args.action in {"sessions", "session", "resume", "resolve"}:
+        if args.action in {"sessions", "session", "resume", "resolve", "approve-plan", "reject-plan"}:
             return session_command(args)
+        if args.action == "plan-demo":
+            if args.max_rounds < 1 or args.max_tokens < 1:
+                raise ConfigurationError("Limits must be positive")
+            client = None
+            if not args.offline:
+                load_env(args.env_file)
+                settings = Settings.from_env(args.provider, args.model)
+                if not doctor(settings, check_sandbox=False):
+                    return 1
+                client = OpenAICompatibleClient(settings, timeout=180 if settings.provider == "ollama" else 90,
+                                                max_tokens=args.max_tokens)
+            workspace = (args.workspace or Path("workspace") / ("plan-demo-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"))).resolve()
+            policy = load_policy(args.policy, workspace)
+            metadata = {"policy_path": str(args.policy.resolve()) if args.policy else None,
+                        "policy_source": "file" if args.policy else "default", "max_tokens": args.max_tokens}
+            print(f"Demo workspace: {workspace}", flush=True)
+            return report_demo(run_plan_demo(workspace, args.state_db, mode=args.mode,
+                                            approve=confirm_action if args.approvals == "ask" else None,
+                                            approve_plan=confirm_plan, on_event=event_listener(args.stop_after_tools),
+                                            crash_after_write=args.crash_after_write, client=client, offline=args.offline,
+                                            max_rounds=args.max_rounds, approvals=args.approvals, policy=policy,
+                                            session_metadata=metadata))
         if args.action == "session-demo":
             report = run_session_demo(show_event)
             print(json.dumps(report["checks"], ensure_ascii=False, indent=2))
@@ -339,7 +402,7 @@ def main() -> int:
                                         max_tokens=args.max_tokens)
         if args.action == "demo":
             # This preflight precedes every potentially billable model request.
-            if not doctor(settings):
+            if not doctor(settings, check_sandbox=not args.plan):
                 return 1
             workspace = args.workspace or Path("workspace") / ("demo-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
             workspace = workspace.resolve()
@@ -354,29 +417,30 @@ def main() -> int:
                 report = run_demo(client, workspace, args.max_rounds, listener,
                     policy=policy, approve=confirm_action if args.approvals == "ask" else None,
                     store=store, session_metadata=metadata, mode=args.mode,
-                    trash_dir=args.state_db.resolve().parent / "trash")
+                    trash_dir=args.state_db.resolve().parent / "trash", plan_mode=args.plan, approve_plan=confirm_plan)
             return report_demo(report)
         workspace = args.workspace or Path(os.getenv("AGENT_WORKSPACE", "workspace"))
         runtime = ToolRuntime(workspace, policy=load_policy(args.policy, workspace), mode=args.mode,
                               trash_dir=args.state_db.resolve().parent / "trash",
                               approve=confirm_action if args.approvals == "ask" else None,
                               on_policy_event=listener)
-        preflight = runtime.bash("pwd")
-        if not preflight.startswith("exit_code=0\n"):
-            raise ToolError("Bash preflight failed")
+        if not args.plan:
+            preflight = runtime.bash("pwd")
+            if not preflight.startswith("exit_code=0\n"):
+                raise ToolError("Bash preflight failed")
         metadata = {"kind": "run", "policy_path": str(args.policy.resolve()) if args.policy else None,
                     "policy_source": "file" if args.policy else "default", "approvals": args.approvals,
                     "max_tokens": args.max_tokens}
         with SessionStore(args.state_db) as store:
             agent = CodingAgent(client, runtime, max_rounds=args.max_rounds, on_event=listener,
-                                store=store, session_metadata=metadata)
+                                store=store, session_metadata=metadata, plan_mode=args.plan, approve_plan=confirm_plan)
             print(agent.run(" ".join(args.request)))
         return 0
     except ApprovalDeferred as exc:
         print(f"\nОжидается подтверждение: {exc}", file=sys.stderr)
         return 130
     except KeyboardInterrupt:
-        print("\nРабота остановлена. Найдите ID через hw-ai-agent sessions и продолжите через resume.", file=sys.stderr)
+        print("\nРабота остановлена. Продолжите через hw-ai-agent resume и выберите сессию в терминале.", file=sys.stderr)
         return 130
     except (ConfigurationError, ModelClientError, AgentError, ToolError, PolicyError, SessionError, OSError, ValueError) as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)

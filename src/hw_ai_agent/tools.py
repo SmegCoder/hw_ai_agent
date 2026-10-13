@@ -52,6 +52,7 @@ class ToolRuntime:
         if mode not in {"safe", "auto"}:
             raise ValueError("Execution mode must be safe or auto")
         self.mode = mode
+        self.phase = "execution"
         self.trash_dir = Path(trash_dir or self.root.parent / ".agent" / "trash").expanduser().resolve()
         if self.trash_dir.is_relative_to(self.root):
             raise ValueError("Recovery directory must be outside the workspace")
@@ -77,11 +78,18 @@ class ToolRuntime:
             "name": name, "description": description,
             "parameters": {"type": "object", "properties": props,
                            "required": required, "additionalProperties": False},
-        }} for name, description, props, required in definitions]
+        }} for name, description, props, required in definitions
+            if self.phase != "planning" or name in {"list_files", "read_file"}]
+
+    def _check_phase(self, name: str):
+        if self.phase == "planning" and name not in {"list_files", "read_file"}:
+            self._policy_event(name, "deny", "blocked", "Plan is not approved", "planning_boundary")
+            raise ToolError("PLAN_MODE: only reading is allowed before explicit plan approval")
 
     def execute(self, name: str, arguments: Mapping[str, Any]) -> str:
         """Single entry point for model calls, policy and mode approvals."""
         name = "Bash" if name == "bash" else name
+        self._check_phase(name)
         # Own an immutable-value snapshot: an approval callback cannot alter the call.
         if isinstance(arguments, Mapping):
             arguments = dict(arguments)
@@ -277,6 +285,7 @@ class ToolRuntime:
         return result
 
     def write_file(self, path: str, content: str) -> str:
+        self._check_phase("write_file")
         file = self._safe_path(path)
         if is_test(Path(path)) or is_test(file.relative_to(self.root)):
             raise ToolError("Test files are read-only")
@@ -347,6 +356,7 @@ class ToolRuntime:
         return ["/usr/bin/sandbox-exec", "-p", "\n".join(profile), *argv]
 
     def bash(self, command: str, cwd: str = ".") -> str:
+        self._check_phase("Bash")
         directory = self._safe_path(cwd)
         if not directory.is_dir():
             raise ToolError("Bash cwd must be an existing workspace directory")

@@ -42,18 +42,19 @@ def initialize_demo(workspace: Path) -> None:
 def run_demo(client: OpenAICompatibleClient, workspace: Path, max_rounds: int = 12,
              on_event=None, *, policy: Policy | None = None, approve=None,
              store: SessionStore | None = None, session_metadata: dict | None = None,
-             mode: str = "safe", trash_dir: Path | None = None) -> dict:
+             mode: str = "safe", trash_dir: Path | None = None, plan_mode=False, approve_plan=None) -> dict:
     initialize_demo(workspace)
     runtime = ToolRuntime(workspace, policy=policy, approve=approve, on_policy_event=on_event,
                           mode=mode, trash_dir=trash_dir)
-    before = runtime.bash("python -m unittest discover -v")
-    if not before.startswith("exit_code=1\n"):
+    before = ("Baseline not run: Bash is disabled until plan approval." if plan_mode
+              else runtime.bash("python -m unittest discover -v"))
+    if not plan_mode and not before.startswith("exit_code=1\n"):
         raise AgentError("Demo baseline did not produce the expected failing tests")
     test = workspace / "test_order.py"
     test_hash = hashlib.sha256(test.read_bytes()).hexdigest()
     metadata = {**(session_metadata or {}), "kind": "demo", "demo": {"baseline": before, "test_hash": test_hash}}
     agent = CodingAgent(client, runtime, max_rounds=max_rounds, on_event=on_event,
-                        store=store, session_metadata=metadata)
+                        store=store, session_metadata=metadata, plan_mode=plan_mode, approve_plan=approve_plan)
     error = None
     answer = ""
     try:

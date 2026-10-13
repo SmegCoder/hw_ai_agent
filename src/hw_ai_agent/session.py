@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from .planning import validate_plan, PlanError
 
 
 class SessionError(RuntimeError):
@@ -22,6 +23,10 @@ class SessionBusyError(SessionError):
 
 
 class UncertainActionError(SessionError):
+    pass
+
+
+class PlanRejectedError(SessionError):
     pass
 
 
@@ -66,7 +71,7 @@ class SessionStore:
             self.db = sqlite3.connect(self.path, timeout=5, isolation_level=None)
             self.db.row_factory = sqlite3.Row
             version = self.db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1):
+            if version not in (0, 1, 2):
                 raise SessionError("Unsupported session database version")
             self.db.execute("PRAGMA foreign_keys=ON")
             self.db.execute("PRAGMA synchronous=FULL")
@@ -83,7 +88,11 @@ class SessionStore:
                     call TEXT NOT NULL, state TEXT NOT NULL, result TEXT,
                     PRIMARY KEY (session_id, batch, position)
                 );
-                PRAGMA user_version=1;
+                CREATE TABLE IF NOT EXISTS plans (
+                    session_id TEXT PRIMARY KEY REFERENCES sessions(id),
+                    state TEXT NOT NULL, data TEXT, updated_at TEXT NOT NULL
+                );
+                PRAGMA user_version=2;
             ''')
         except (sqlite3.Error, SessionError):
             if hasattr(self, "db"):
@@ -143,6 +152,8 @@ class SessionStore:
             self.db.execute("INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (session_id, encoded(metadata), encoded(messages), "[]", "ready", 0,
                  max_rounds, max_context_chars, None, None, now, now))
+            if metadata.get("plan_mode"):
+                self.db.execute("INSERT INTO plans VALUES (?, 'planning', NULL, ?)", (session_id, now))
         return session_id
 
     def get(self, session_id: str) -> SessionState:
@@ -159,7 +170,7 @@ class SessionStore:
             if not messages or any(not isinstance(m, dict) or m.get("role") not in
                 {"system", "user", "assistant", "tool"} for m in messages):
                 raise SessionError("Invalid saved messages")
-            if row["status"] not in {"ready", "running", "interrupted", "waiting_approval", "failed", "blocked", "completed", "aborted"}:
+            if row["status"] not in {"ready", "running", "interrupted", "waiting_approval", "waiting_plan_approval", "failed", "blocked", "completed", "aborted"}:
                 raise SessionError("Invalid session status")
             if row["status"] == "completed" and not isinstance(row["final_answer"], str):
                 raise SessionError("Completed session has no final answer")
@@ -180,6 +191,56 @@ class SessionStore:
         with self.transaction():
             self.db.execute("UPDATE sessions SET status=?,error=?,updated_at=? WHERE id=?",
                             (status, error, stamp(), session_id))
+
+    def plan(self, session_id: str) -> dict | None:
+        self.validate_id(session_id)
+        row = self.db.execute("SELECT * FROM plans WHERE session_id=?", (session_id,)).fetchone()
+        if row is None:
+            if self.get(session_id).metadata.get("plan_mode"):
+                raise SessionError("Planning session has no saved planning state")
+            return None
+        if self.get(session_id).metadata.get("plan_mode") is not True:
+            raise SessionError("Saved plan does not match session planning mode")
+        try:
+            data = validate_plan(json.loads(row["data"])) if row["data"] is not None else None
+            if row["state"] not in {"planning", "awaiting_approval", "approved", "rejected"}:
+                raise SessionError("Invalid plan state")
+            if (row["state"] == "planning") != (data is None):
+                raise SessionError("Invalid saved plan")
+            return {"state": row["state"], "data": data}
+        except (ValueError, TypeError):
+            raise SessionError("Invalid saved plan") from None
+
+    def message(self, session_id: str, message: dict):
+        with self.transaction():
+            state = self.get(session_id)
+            self.db.execute("UPDATE sessions SET messages=?,updated_at=? WHERE id=?",
+                            (encoded([*state.messages, message]), stamp(), session_id))
+
+    def decide_plan(self, session_id: str, approved: bool):
+        with self.lock(session_id):
+            self._decide_plan(session_id, approved)
+
+    def _decide_plan(self, session_id: str, approved: bool):
+        if type(approved) is not bool:
+            raise SessionError("Plan decision must be explicitly true or false")
+        with self.transaction():
+            saved = self.plan(session_id)
+            if self.get(session_id).status == "aborted" or not saved or saved["state"] != "awaiting_approval":
+                raise SessionError("This plan is not waiting for a decision")
+            if self.calls(session_id, True):
+                raise SessionError("Finish or resolve pending planning calls before deciding the plan")
+            decision = "approved" if approved else "rejected"
+            self.db.execute("UPDATE plans SET state=?,updated_at=? WHERE session_id=?", (decision, stamp(), session_id))
+            self.db.execute("UPDATE sessions SET status=?,error=?,updated_at=? WHERE id=?",
+                            ("interrupted" if approved else "aborted", None if approved else "PlanRejected",
+                             stamp(), session_id))
+            message = {"role": "user", "content":
+                "The operator approved this plan. Execute it now, following runtime permissions.\n" + encoded(saved["data"])
+                if approved else "The operator rejected the plan. Do not execute it."}
+            state = self.get(session_id)
+            self.db.execute("UPDATE sessions SET messages=? WHERE id=?", (encoded([*state.messages, message]), session_id))
+            self._event(session_id, {"event": "plan_decision", "decision": decision})
 
     def upgrade_approval_contract(self, session_id: str):
         with self.transaction():
@@ -271,6 +332,17 @@ class SessionStore:
             self.db.execute("UPDATE sessions SET messages=?,updated_at=? WHERE id=?",
                             (encoded([*state.messages, result]), stamp(), session_id))
             self._event(session_id, {"event": "tool_result", **result})
+            if item["call"]["function"]["name"] == "submit_plan" and not result["content"].startswith("ERROR:"):
+                plan = validate_plan(json.loads(item["call"]["function"]["arguments"]))
+                saved = self.plan(session_id)
+                if saved and saved["data"] == plan:
+                    return
+                if not saved or saved["state"] != "planning":
+                    raise SessionError("Cannot replace a saved plan")
+                self.db.execute("UPDATE plans SET state='awaiting_approval',data=?,updated_at=? WHERE session_id=?",
+                                (encoded(plan), stamp(), session_id))
+                self.db.execute("UPDATE sessions SET status='waiting_plan_approval' WHERE id=?", (session_id,))
+                self._event(session_id, {"event": "plan_saved", "plan": plan})
 
     def complete(self, session_id: str, answer: str):
         with self.transaction():
@@ -303,7 +375,7 @@ class SessionStore:
             raise SessionError("Resolve only the first uncertain call")
         item = calls[0]
         if resolution == "retry":
-            if item["call"]["function"]["name"] not in {"write_file", "delete_file", "read_file", "list_files", "Bash", "bash"}:
+            if item["call"]["function"]["name"] not in {"write_file", "delete_file", "read_file", "list_files", "Bash", "bash", "submit_plan"}:
                 raise SessionError("This instrument has no supported safe retry contract")
             with self.transaction():
                 self.db.execute("UPDATE calls SET state='pending' WHERE session_id=? AND batch=? AND position=?",
