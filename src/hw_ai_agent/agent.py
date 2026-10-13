@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import copy
 import json
-import math
 import uuid
 from collections.abc import Callable
 from collections.abc import Mapping
 from typing import Any
 
 from .client import ModelClient
+from .pricing import Price, estimate, actual_cost, clean_usage, cost_summary
 from .tools import ToolError, ToolRuntime
 from .policy import ApprovalDeferred, Policy
 from .session import SessionError, SessionStore, UncertainActionError, PlanRejectedError
@@ -58,6 +58,7 @@ class CodingAgent:
         plan_mode: bool = False,
         task_mode: bool = False,
         journal_mode: bool = False,
+        cost_estimate: bool = True,
         attribute_changes: Callable[[dict], str | None] | None = None,
         approve_plan: Callable[[dict], bool] | None = None,
         resolve_uncertain: Callable[[dict], str | None] | None = None,
@@ -71,6 +72,9 @@ class CodingAgent:
             raise ValueError("task_mode must be a boolean")
         if type(plan_mode) is not bool:
             raise ValueError("plan_mode must be a boolean")
+        if type(cost_estimate) is not bool:
+            raise ValueError("cost_estimate must be a boolean")
+        self.cost_estimate = cost_estimate
         self.client = client
         self.runtime = runtime
         self.system_prompt = system_prompt
@@ -140,6 +144,11 @@ class CodingAgent:
             # Explicit whitelist: API credentials and client internals never enter metadata.
             metadata.update({name: getattr(settings, name) for name in ("provider", "model", "base_url")})
         metadata.setdefault("max_tokens", getattr(self.client, "max_tokens", 2048))
+        route = getattr(self.client, "routing", None)
+        if route:
+            metadata["routing"] = {key: copy.deepcopy(route[key]) for key in
+                ("level", "score", "reasons", "method", "selected_model", "candidates",
+                 "required_context_estimate", "catalog_updated_at", "catalog_status") if key in route}
         return metadata
 
     def _check_binding(self, metadata: dict):
@@ -196,6 +205,7 @@ class CodingAgent:
             if state.status == "completed":
                 if self.on_event:
                     self.on_event({"event": "session_cached", "session_id": session_id})
+                    self.on_event({"event": "session_cost", "cost": self.store.cost(session_id)})
                 return state.final_answer or ""
             try:
                 while True:
@@ -230,6 +240,7 @@ class CodingAgent:
                 self.store.set_status(session_id, "running")
                 self._emit({"event": event, "session_id": session_id})
                 self._emit_budget()
+                self._emit({"event": "session_cost", "cost": self.store.cost(session_id)}, persist=False)
                 # A final assistant message may have been committed just before process death.
                 last = self.messages[-1]
                 if (self.runtime.phase != "planning" and last.get("role") == "assistant"
@@ -278,12 +289,26 @@ class CodingAgent:
             elif self.task_mode:
                 task = self.store.current_task(self.session_id)
                 schemas = ([schema for schema in schemas if schema["function"]["name"] in task["tools"]] + copy.deepcopy(TASK_SCHEMAS)) if task else []
-            response = self.client.complete(self.messages, schemas)
-            if self.store and getattr(self.client, "usage", []):
-                last_usage = self.client.usage[-1]
-                usage = {key: last_usage[key] for key in ("prompt_tokens", "completion_tokens", "total_tokens", "cost")
-                         if type(last_usage.get(key)) in (int, float) and math.isfinite(last_usage[key])}
-                self._emit({"event": "model_usage", "usage": usage})
+            price = getattr(self.client, "price", None)
+            provider = getattr(getattr(self.client, "settings", None), "provider", getattr(self.client, "billing_provider", None))
+            if price is None and provider in {'ollama', 'scripted'}:
+                price = Price('0', '0', source='local API / offline')
+            if self.cost_estimate:
+                self._emit({"event": "model_cost_estimate", "round": rounds,
+                            **estimate(price, self.messages, schemas, self.session_metadata.get('max_tokens', getattr(self.client, "max_tokens", 2048)))})
+            previous_usage = len(getattr(self.client, "usage", []))
+            failed = True
+            try:
+                response = self.client.complete(self.messages, schemas)
+                failed = False
+            finally:
+                usages = getattr(self.client, "usage", [])
+                latest = usages[-1] if len(usages) > previous_usage else {}
+                cost = actual_cost(provider, price, latest, failed=failed)
+                self._emit({"event": "model_cost", "round": rounds, **cost})
+                if latest:
+                    self._emit({"event": "model_usage", "usage": clean_usage(latest)})
+                self._emit({"event": "session_cost", "cost": cost_summary(self.events, rounds)}, persist=False)
             assistant = self._assistant_message(response)
             tool_calls = assistant.get("tool_calls") or []
             for call in tool_calls:

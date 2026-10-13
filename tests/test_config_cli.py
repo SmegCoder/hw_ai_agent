@@ -71,7 +71,8 @@ class ConfigCLITests(unittest.TestCase):
             '--max-side-effects', 0, '--max-result-bytes', 20000, '--mode', 'auto',
             '--approvals', 'deny', '--workspace', self.root / 'project',
             '--state-db', self.root / 'state.sqlite3', '--policy', self.root / 'policy.json',
-            '--plan', '--tasks', '--journal')
+            '--plan', '--tasks', '--journal', '--route', '--cost-estimate',
+            '--route-simple-model', 'small', '--route-medium-model', 'medium', '--route-complex-model', 'large')
         self.assertEqual(status, 0, err)
         values = parse_env(self.env.read_text())
         self.assertEqual(set(values), {option.env for option in LAUNCH_OPTIONS.values()})

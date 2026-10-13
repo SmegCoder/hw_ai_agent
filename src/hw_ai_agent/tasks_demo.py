@@ -80,7 +80,7 @@ class TasksDemoClient:
 
 def run_tasks_demo(workspace: Path, db_path: Path, *, client=None, offline=False, mode='safe', approve=None,
                    approve_plan=None, on_event=None, max_rounds=30, budget_limits=None, policy=None,
-                   session_metadata=None, approvals='ask', crash_after_write=False, max_tokens=3072, journal_mode=False):
+                   session_metadata=None, approvals='ask', crash_after_write=False, max_tokens=3072, journal_mode=False, cost_estimate=True):
     if offline:
         if client is not None:
             raise ValueError('Offline demo cannot use a real model client')
@@ -99,7 +99,7 @@ def run_tasks_demo(workspace: Path, db_path: Path, *, client=None, offline=False
                 'demo': {'offline': offline, 'test_hash': hashlib.sha256(TESTS.encode()).hexdigest()}}
     with SessionStore(db_path) as store:
         agent = CodingAgent(client, runtime, task_mode=True, store=store, approve_plan=approve_plan,
-                            on_event=on_event, max_rounds=max_rounds, budget_limits=budget_limits, journal_mode=journal_mode, session_metadata=metadata)
+                            on_event=on_event, max_rounds=max_rounds, budget_limits=budget_limits, journal_mode=journal_mode, cost_estimate=cost_estimate, session_metadata=metadata)
         error, answer = None, ''
         try:
             answer = agent.run('Изучи файлы и составь план минимум из трёх задач с зависимостями и проверяемыми результатами. '
@@ -129,7 +129,7 @@ def verify_tasks_demo(client, runtime, store, session_id, answer, metadata, erro
               'verification': output, 'tests_unchanged': unchanged, 'task_calls_scoped': scoped,
               'planning_calls': [i for i in calls if i['phase'] == 'planning'],
               'execution_calls': [i for i in calls if i['phase'] == 'execution'],
-              'verified_test_task': verified_tests, 'budget': store.budget(session_id), 'error': error,
+              'verified_test_task': verified_tests, 'budget': store.budget(session_id), 'cost': store.cost(session_id), 'error': error,
               'success': error is None and complete and dependencies and scoped and verified_tests and unchanged and output.startswith('exit_code=0\n')}
     (runtime.root / 'tasks-report.json').write_text(json.dumps(public_report(report, runtime.root), ensure_ascii=False, indent=2), encoding='utf-8')
     return report

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .pricing import cost_summary
 import difflib
 import hashlib
 import json
@@ -43,7 +44,7 @@ def initialize_demo(workspace: Path) -> None:
 def run_demo(client: OpenAICompatibleClient, workspace: Path, max_rounds: int = 12,
              on_event=None, *, policy: Policy | None = None, approve=None,
              store: SessionStore | None = None, session_metadata: dict | None = None,
-             mode: str = "safe", trash_dir: Path | None = None, plan_mode=False, task_mode=False, approve_plan=None, budget_limits=None, journal_mode=False) -> dict:
+             mode: str = "safe", trash_dir: Path | None = None, plan_mode=False, task_mode=False, approve_plan=None, budget_limits=None, journal_mode=False, cost_estimate=True) -> dict:
     initialize_demo(workspace)
     runtime = ToolRuntime(workspace, policy=policy, approve=approve, on_policy_event=on_event,
                           mode=mode, trash_dir=trash_dir)
@@ -55,7 +56,7 @@ def run_demo(client: OpenAICompatibleClient, workspace: Path, max_rounds: int = 
     test_hash = hashlib.sha256(test.read_bytes()).hexdigest()
     metadata = {**(session_metadata or {}), "kind": "demo", "demo": {"baseline": before, "test_hash": test_hash}}
     agent = CodingAgent(client, runtime, max_rounds=max_rounds, on_event=on_event,
-                        store=store, session_metadata=metadata, plan_mode=plan_mode, task_mode=task_mode, approve_plan=approve_plan, budget_limits=budget_limits, journal_mode=journal_mode)
+                        store=store, session_metadata=metadata, plan_mode=plan_mode, task_mode=task_mode, approve_plan=approve_plan, budget_limits=budget_limits, journal_mode=journal_mode, cost_estimate=cost_estimate)
     error = None
     answer = ""
     try:
@@ -87,6 +88,7 @@ def verify_demo(client, workspace, runtime, before, test_hash, answer, events, e
               "success": error is None and unchanged and model_ran_tests and after.startswith("exit_code=0\n"),
               "error": error,
               "diff": diff, "answer": answer,
+              "cost": cost_summary(events),
               "usage": [e["usage"] for e in events if e.get("event") == "model_usage"] or client.usage,
               "events": events,
               "session_id": session_id,

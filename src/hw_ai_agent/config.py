@@ -76,6 +76,11 @@ LAUNCH_OPTIONS = {
     "plan": LaunchOption("AGENT_PLAN", False, bool),
     "tasks": LaunchOption("AGENT_TASKS", False, bool),
     "journal": LaunchOption("AGENT_JOURNAL", False, bool),
+    "route": LaunchOption("AGENT_ROUTE", False, bool),
+    "cost_estimate": LaunchOption("AGENT_COST_ESTIMATE", True, bool),
+    "route_simple_model": LaunchOption("AGENT_ROUTE_SIMPLE_MODEL", None, str),
+    "route_medium_model": LaunchOption("AGENT_ROUTE_MEDIUM_MODEL", None, str),
+    "route_complex_model": LaunchOption("AGENT_ROUTE_COMPLEX_MODEL", None, str),
 }
 
 START_COMMANDS = {"run", "plan", "demo", "plan-demo", "workflow-demo", "tasks-demo", "rollback-demo"}

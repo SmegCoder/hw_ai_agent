@@ -6,6 +6,9 @@ import textwrap
 
 
 COMMAND_HELP = {
+    "models": "Сравнить модели по актуальным тарифам, контексту и цене одинакового сценария",
+    "cost": "Стоимость сохранённой сессии; без ID — выбор в терминале",
+    "cost-demo": "Автономное демо оценки стоимости, учёта и выбора модели по сложности",
     "help": "Краткая инструкция и флаги; help КОМАНДА — подробная справка команды",
     "set": "Сохранить настройки будущих запусков в .env, не изменяя API-ключи",
     "setup": "Создать .env с настройками провайдера и скрытым вводом ключа",
@@ -33,7 +36,7 @@ COMMAND_HELP = {
 # The same descriptions are used in the guide and each command's --help.
 FLAG_HELP = {
     "--provider": "Выберите одного из 3 провайдеров: openrouter, openai или ollama. Без флага — AGENT_PROVIDER из настроек, иначе openrouter; setup использует openrouter.",
-    "--model": "Точный ID модели выбранного провайдера. Без флага — модель из настроек или встроенное значение, если оно есть.",
+    "--model": "ID модели; '?' — выбор с ценами в терминале, auto — автоматический роутинг. Без флага — модель из настроек или встроенное значение, если оно есть.",
     "--env-file": "Файл настроек и ключей (по умолчанию .env). Переменные окружения имеют приоритет.",
     "--workspace": "AGENT_WORKSPACE в .env для run/plan. Рабочая папка: для run/plan она должна существовать; для демо укажите новую папку. Без флага демо создаёт отдельную папку автоматически.",
     "--mode": "AGENT_MODE в .env; без настройки safe: подтверждать каждую запись и Bash; auto: выполнять их после проверок. Каждое удаление подтверждается в обоих режимах.",
@@ -58,6 +61,23 @@ FLAG_HELP = {
     "--no-plan": "Отключить AGENT_PLAN для run/demo или сохранить false через set. Команда plan всегда планирует.",
     "--no-tasks": "Отключить AGENT_TASKS для run/plan/demo или сохранить false через set. tasks-demo всегда использует задачи.",
     "--no-journal": "Отключить AGENT_JOURNAL для нового запуска или сохранить false через set. В rollback-demo журнал обязателен.",
+    "--route": "AGENT_ROUTE=true/false в .env. Выбирать модель один раз по сложности задачи; явный --model ID имеет приоритет.",
+    "--no-route": "Отключить AGENT_ROUTE для нового запуска или сохранить false через set. --model auto сам включает роутинг.",
+    "--route-simple-model": "AGENT_ROUTE_SIMPLE_MODEL: модель для простых задач; должна поддерживать tools и иметь известный тариф.",
+    "--route-medium-model": "AGENT_ROUTE_MEDIUM_MODEL: модель для задач средней сложности.",
+    "--route-complex-model": "AGENT_ROUTE_COMPLEX_MODEL: модель для сложных задач.",
+    "--refresh": "Заново получить тарифы для models; при сбое старый кэш явно помечается устаревшим.",
+    "--search": "Фильтр models по части ID модели, например deepseek или gpt-4.1.",
+    "--limit": "Сколько моделей показать в models (1..5000, по умолчанию 50).",
+    "--all": "Показать весь каталог models после фильтров; имеет приоритет над --limit.",
+    "--sort": "Сортировка models: name — по имени (по умолчанию), price — по цене сценария. Сначала модели с tools.",
+    "--paid": "Только модели с ненулевым тарифом входных или выходных токенов. Не совмещается с --free.",
+    "--free": "Только модели с нулевыми тарифами входных и выходных токенов. Неизвестные цены исключаются.",
+    "--cost-estimate": "AGENT_COST_ESTIMATE=true/false в .env. Включить предварительную оценку перед каждым обращением; учёт фактического расхода работает всегда.",
+    "--no-cost-estimate": "Отключить предварительную оценку только для этого запуска (также resume), либо сохранить false через set.",
+    "--input-tokens": "Входные токены одинакового сценария сравнения models (по умолчанию 1000).",
+    "--output-tokens": "Выходные токены сценария сравнения models (по умолчанию 1000).",
+    "--json": "Вывести сравнение models в JSON: тарифы, источник, время и цена сценария.",
     "--help": "Показать справку. Флаги конкретной команды: hw-ai-agent КОМАНДА --help.",
 }
 
@@ -104,6 +124,24 @@ def project_guide() -> str:
   AGENT_MAX_ROUNDS и остальные лимиты из .env общие для всех новых запусков.
   --env-file позволяет выбрать другой файл настроек.
 
+ЦЕНЫ И ВЫБОР МОДЕЛИ
+  hw-ai-agent models --provider openrouter --refresh
+  hw-ai-agent models --paid --limit 100
+  hw-ai-agent models --all
+  hw-ai-agent run --workspace ./my-project --model '?' "Исправь ошибку"
+  hw-ai-agent run --workspace ./my-project --model auto "Исправь ошибку"
+  hw-ai-agent set --route
+  hw-ai-agent cost
+  hw-ai-agent run --workspace ./my-project --no-cost-estimate "Исправь ошибку"
+  hw-ai-agent set --no-cost-estimate
+  По умолчанию — 50 моделей по имени, таблица с колонками; --all показывает весь каталог.
+  --cost-estimate / --no-cost-estimate управляют оценкой; AGENT_COST_ESTIMATE — настройка .env.
+  До каждого обращения — приблизительная оценка; после — списание или расчёт по токенам.
+  Итог задачи — сумма всей сессии. Неизвестные расходы не считаются нулевыми.
+  OpenRouter: live API; OpenAI: официальная таблица Standard; Ollama: оплата API $0.
+  Кэш тарифов — 1 час, время источника показывается; --refresh обновляет его.
+  Роутинг — локальная эвристика; модель фиксируется на всю сессию, включая resume.
+
 СВОЯ ЗАДАЧА
   hw-ai-agent run --workspace ./my-project "Исправь ошибку и проверь тестами"
   hw-ai-agent plan --tasks --journal --workspace ./my-project --max-rounds 30 "Исправь ошибку"
@@ -116,6 +154,7 @@ def project_guide() -> str:
   hw-ai-agent policy-demo
   hw-ai-agent session-demo
   hw-ai-agent budget-demo
+  hw-ai-agent cost-demo
   hw-ai-agent tasks-demo --offline --mode auto
   hw-ai-agent rollback-demo --offline --mode auto
   Без --offline демо с моделью используют настоящий API или локальную Ollama.

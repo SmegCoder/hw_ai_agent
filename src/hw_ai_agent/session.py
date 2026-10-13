@@ -14,6 +14,7 @@ from pathlib import Path
 from .planning import validate_plan, PlanError
 from .tasks import validate_task_plan, validate_proof, TaskError
 from .budget import BudgetLimits, BudgetExceeded, DIMENSIONS, snapshot, debit, batch_cost, truncate_result
+from .pricing import cost_summary, PricingError
 
 
 class SessionError(RuntimeError):
@@ -485,6 +486,13 @@ class SessionStore:
     def event(self, session_id: str, event: dict):
         with self.transaction():
             self._event(session_id, event)
+
+    def cost(self, session_id: str) -> dict:
+        state = self.get(session_id)
+        try:
+            return cost_summary(state.events, state.rounds)
+        except PricingError:
+            raise SessionError("Invalid saved session costs") from None
 
     def start_model(self, session_id: str) -> int:
         with self.transaction():

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .pricing import cost_summary
 
 import json
 import os
@@ -64,6 +65,7 @@ def call(call_id, name, arguments):
 
 
 class WorkflowClient:
+    billing_provider = 'scripted'
     usage: list = []
 
     def complete(self, messages, tools):
@@ -88,7 +90,7 @@ class CrashAfterWriteRuntime(ToolRuntime):
 
 def run_workflow_demo(workspace: Path, db_path: Path, *, mode="safe", approve=None,
                       approvals="ask", on_event=None, crash_after_write=False,
-                      client=None, max_rounds=20, budget_limits=None, journal_mode=False):
+                      client=None, max_rounds=20, budget_limits=None, journal_mode=False, cost_estimate=True):
     if db_path.resolve().is_relative_to(workspace.resolve()):
         raise ValueError("Session database must be outside workspace")
     workspace.mkdir(parents=True, exist_ok=False)
@@ -113,7 +115,7 @@ def run_workflow_demo(workspace: Path, db_path: Path, *, mode="safe", approve=No
                          "cleanup_required": real_model}}
     with SessionStore(db_path) as store:
         agent = CodingAgent(client if real_model else WorkflowClient(), runtime, store=store,
-                            on_event=on_event, session_metadata=metadata, max_rounds=max_rounds, budget_limits=budget_limits, journal_mode=journal_mode,
+                            on_event=on_event, session_metadata=metadata, max_rounds=max_rounds, budget_limits=budget_limits, journal_mode=journal_mode, cost_estimate=cost_estimate,
                             system_prompt=WORKFLOW_SYSTEM_PROMPT if real_model else DEFAULT_SYSTEM_PROMPT)
         error = None
         try:
@@ -143,6 +145,7 @@ def verify_workflow(agent, runtime, metadata, error=None):
               "events": agent.events,
               "provider": getattr(getattr(agent.client, "settings", None), "provider", "scripted"),
               "model": getattr(getattr(agent.client, "settings", None), "model", "scripted"),
+              "cost": cost_summary(agent.events),
               "usage": [e["usage"] for e in agent.events if e.get("event") == "model_usage"]}
     (runtime.root / "workflow-report.json").write_text(
         json.dumps(public_report(report, runtime.root), ensure_ascii=False, indent=2), encoding="utf-8")

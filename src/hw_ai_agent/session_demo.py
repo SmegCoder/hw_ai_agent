@@ -38,10 +38,12 @@ def run_session_demo(on_event=None):
                 "        raise ValueError('invalid discount')\n"
                 "    return sum(prices) * (1 - discount_percent / 100)\n")
         class FirstClient:
+            billing_provider = 'scripted'
             def complete(self, messages, tools):
                 return {"tool_calls": [call("write", "write_file", {"path": "order.py", "content": code}),
                                        call("tests", "Bash", {"command": "python -m unittest discover -v"})]}
         class ResumedClient:
+            billing_provider = 'scripted'
             def complete(self, messages, tools):
                 if not any(m.get("role") == "tool" and "Ran 6 tests" in m.get("content", "")
                            and m["content"].startswith("exit_code=0") for m in messages):

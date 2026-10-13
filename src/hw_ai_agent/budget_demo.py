@@ -15,6 +15,7 @@ def call(identifier, name, **arguments):
 
 
 class BudgetDemoClient:
+    billing_provider = 'scripted'
     """Fixed responses test runtime decisions without a model or API key."""
     def __init__(self, *responses):
         self.responses = iter(responses)
