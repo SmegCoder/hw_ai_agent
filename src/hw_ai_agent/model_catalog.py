@@ -21,6 +21,7 @@ import certifi
 
 from .client import NoRedirect
 from .pricing import Price, PricingError, amount, usd
+from .text import json_text
 
 OPENROUTER_MODELS = 'https://openrouter.ai/api/v1/models'
 OPENAI_PRICING = 'https://developers.openai.com/api/docs/pricing.md'
@@ -64,7 +65,8 @@ def openrouter_models(body: dict, updated: str) -> list[Model]:
                               rates.get('input_cache_write'), source=OPENROUTER_MODELS, updated_at=updated)
             top = row.get('top_provider') or {}
             text_output = 'text' in row.get('architecture', {}).get('output_modalities', ['text'])
-            models.append(Model(row['id'], price, row.get('context_length') or None,
+            context = row.get('context_length') or top.get('context_length') or None
+            models.append(Model(row['id'], price, context,
                                 top.get('max_completion_tokens') or None,
                                 'tools' in row.get('supported_parameters', []) and text_output and not row['id'].endswith(':batch')))
         except (KeyError, TypeError, ValueError, AttributeError):
@@ -197,8 +199,8 @@ class ModelCatalog:
             descriptor, temporary = tempfile.mkstemp(prefix='models-', dir=self.cache_dir)
             try:
                 with os.fdopen(descriptor, 'w', encoding='utf-8') as target:
-                    json.dump({'source': self.source, 'fetched_at': time.time(), 'updated_at': self.updated_at,
-                               'models': [asdict(m) for m in self.models]}, target, ensure_ascii=False, allow_nan=False)
+                    target.write(json_text({'source': self.source, 'fetched_at': time.time(),
+                                            'updated_at': self.updated_at, 'models': [asdict(m) for m in self.models]}))
                 os.replace(temporary, path)
             finally:
                 if os.path.exists(temporary):

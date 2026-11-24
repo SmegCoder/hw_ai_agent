@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from .text import escape_surrogates
 
 
 DIMENSIONS = ("model_requests", "tool_calls", "side_effects", "result_bytes")
@@ -64,6 +65,7 @@ def batch_cost(calls: list[dict], cached_ids=()) -> dict:
 def truncate_result(content: str, quota: int) -> str:
     if type(quota) is not int or quota < 1:
         raise ValueError("Output quota must be positive")
+    content = escape_surrogates(content)
     data = content.encode("utf-8")
     if len(data) <= quota:
         return content

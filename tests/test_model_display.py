@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from agent_fixtures import PLAN, tool_call
 from hw_ai_agent import cli
 from hw_ai_agent.agent import CodingAgent
 from hw_ai_agent.config import Settings
@@ -127,10 +128,10 @@ class DisplayTests(unittest.TestCase):
         self.env.write_text('AGENT_PROVIDER=ollama\nAGENT_COST_ESTIMATE=false\n')
         for flags, expected in (([], False), (['--cost-estimate'], True), (['--no-cost-estimate'], False)):
             with patch('hw_ai_agent.cli.OpenAICompatibleClient', side_effect=Client):
-                status, out, err = self.invoke('run', '--env-file', self.env, '--workspace', workspace, '--state-db', self.root/'state', *flags, 'Task')
+                status, out, err = self.invoke('run', '--verbose', '--env-file', self.env, '--workspace', workspace, '--state-db', self.root/'state', *flags, 'Task')
             self.assertEqual(status, 0, err)
             self.assertEqual('Оценка запроса:' in out, expected)
-            self.assertIn('Оплата API', out)
+            self.assertIn('Оплата локального API', out)
 
     def test_set_persists_estimate_toggle(self):
         self.assertEqual(self.invoke('set', '--env-file', self.env, '--no-cost-estimate')[0], 0)
@@ -139,20 +140,31 @@ class DisplayTests(unittest.TestCase):
         self.assertIn('AGENT_COST_ESTIMATE="true"', self.env.read_text())
 
     def test_resume_toggle_changes_display_without_changing_saved_limits(self):
-        workspace, db = self.root/'demo', self.root/'state'
-        self.env.write_text('AGENT_COST_ESTIMATE=false\n')
-        status, out, err = self.invoke('plan-demo', '--offline', '--env-file', self.env, '--workspace', workspace,
-            '--state-db', db, '--stop-after-tools', 1, '--max-rounds', 17, '--max-tokens', 1400)
+        workspace, db = self.root / 'project', self.root / 'state'
+        workspace.mkdir()
+        config = 'AGENT_PROVIDER=ollama\nAGENT_COST_ESTIMATE=false\n'
+        self.env.write_text(config)
+
+        def client(settings, *, max_tokens, **kwargs):
+            response = ({'tool_calls': [tool_call('ls', 'list_files', {'path': '.'})]} if first
+                        else {'tool_calls': [tool_call('plan', 'submit_plan', PLAN)]})
+            return SimpleNamespace(settings=settings, max_tokens=max_tokens, complete=lambda *_: response)
+
+        first = True
+        with patch('hw_ai_agent.cli.OpenAICompatibleClient', side_effect=client):
+            status, out, err = self.invoke('plan', '--env-file', self.env, '--workspace', workspace,
+                '--state-db', db, '--stop-after-tools', 1, '--max-rounds', 17, '--max-tokens', 1400, 'Inspect')
         self.assertEqual(status, 130, err)
         self.assertNotIn('Оценка запроса:', out)
         with SessionStore(db) as store:
             identifier = store.list_sessions()[0]['id']
             before = store.budget(identifier)['limits']
-        # Invalid NEW limits must not be applied to the saved session.
-        self.env.write_text('AGENT_COST_ESTIMATE=false\nAGENT_MAX_ROUNDS=bad\n')
+        self.env.write_text(config + 'AGENT_MAX_ROUNDS=bad\n')
         os.environ.clear()
-        with patch('hw_ai_agent.cli.confirm_plan', return_value=False):
-            status, out, err = self.invoke('resume', identifier, '--state-db', db, '--env-file', self.env, '--cost-estimate')
+        first = False
+        with patch('hw_ai_agent.cli.confirm_plan', return_value=False), \
+             patch('hw_ai_agent.cli.OpenAICompatibleClient', side_effect=client):
+            status, out, err = self.invoke('resume', identifier, '--state-db', db, '--env-file', self.env, '--cost-estimate', '--verbose')
         self.assertEqual(status, 1, err)
         self.assertIn('Оценка запроса:', out)
         with SessionStore(db) as store:

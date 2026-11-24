@@ -12,15 +12,17 @@ from pathlib import Path
 from unittest.mock import patch
 
 from hw_ai_agent.agent import CodingAgent, AgentError
-from hw_ai_agent.budget import BudgetLimits
 from hw_ai_agent.cli import main, verify_applied
-from hw_ai_agent.config import Settings
 from hw_ai_agent.planning import PlanError, PlanApprovalDeferred
 from hw_ai_agent.session import SessionStore, SessionError, UncertainActionError
 from hw_ai_agent.tasks import validate_task_plan, passing_tests, checklist
-from hw_ai_agent.tasks_demo import TASK_PLAN, TasksDemoClient, TAX_FIXED, RECEIPT_FIXED, TESTS, run_tasks_demo
+from agent_fixtures import PLAN, TASK_PLAN
 from hw_ai_agent.tools import ToolRuntime
 from hw_ai_agent.policy import Policy
+
+
+TAX_FIXED = 'def add_tax(amount):\n    return amount * 1.2\n'
+RECEIPT_FIXED = 'from tax import add_tax\n\ndef receipt_total(prices):\n    return add_tax(sum(prices))\n'
 
 
 def call(identifier, name, **args):
@@ -297,8 +299,7 @@ class TaskGraphTests(unittest.TestCase):
         self.assertIn('permitted',self.store.calls(agent.session_id)[-1]['result']['content'])
 
     def test_v3_legacy_plan_and_budget_migrate_without_conversion_or_reset(self):
-        from hw_ai_agent.plan_demo import DEMO_PLAN
-        first=CodingAgent(Client(plan(DEMO_PLAN)),Runtime(self.workspace),store=self.store,plan_mode=True)
+        first=CodingAgent(Client(plan(PLAN)),Runtime(self.workspace),store=self.store,plan_mode=True)
         with self.assertRaises(PlanApprovalDeferred):first.run('Task')
         before=self.store.budget(first.session_id);old_plan=self.store.plan(first.session_id)
         self.store.db.execute('DROP TABLE call_tasks');self.store.db.execute('DROP TABLE tasks')
@@ -333,85 +334,103 @@ class TaskValidationTests(unittest.TestCase):
 
 
 @unittest.skipUnless(os.getenv('REQUIRE_SANDBOX_TESTS') == '1', 'Requires native macOS sandbox')
-class TaskDemoIntegrationTests(unittest.TestCase):
-    def test_native_offline_demo_passes_and_keeps_tests(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root=Path(directory)
-            report=run_tasks_demo(root/'workspace', root/'state.db', offline=True, mode='auto', approve_plan=lambda p:True)
-            self.assertTrue(report['success'],report)
-            self.assertEqual((root/'workspace/test_checkout.py').read_bytes(),TESTS.encode())
-            self.assertEqual(len(report['tasks']),3)
-            self.assertEqual(report['budget']['spent']['model_requests'],6)
-
+class TaskCLIIntegrationTests(unittest.TestCase):
     def test_cli_pause_after_task_resume_without_id_and_preserve_limits(self):
         with tempfile.TemporaryDirectory() as directory:
-            root=Path(directory);workspace=root/'workspace';db=root/'state.db'
-            args=['hw-ai-agent','tasks-demo','--offline','--mode','auto','--workspace',str(workspace),'--state-db',str(db),'--stop-after-tasks','1','--max-tokens','1800']
-            with patch.object(sys,'argv',args),patch('hw_ai_agent.cli.confirm_plan',return_value=True),redirect_stdout(io.StringIO()) as output,redirect_stderr(io.StringIO()):
-                self.assertEqual(main(),130)
-                self.assertIn('[x] tax',output.getvalue())
-            with SessionStore(db) as store:
-                identifier=store.list_sessions()[0]['id'];before=store.budget(identifier)
-                self.assertEqual(store.tasks(identifier)[0]['state'],'completed')
-            with patch.object(sys,'argv',['hw-ai-agent','resume','--state-db',str(db)]),patch('sys.stdin.isatty',return_value=True),redirect_stdout(io.StringIO()) as output:
-                self.assertEqual(main(),0);self.assertIn('TASKS DEMO PASS',output.getvalue())
-            with SessionStore(db) as store:
-                self.assertEqual(store.get(identifier).metadata['max_tokens'],1800)
-                self.assertEqual(store.budget(identifier)['spent']['side_effects'],3)
-                starts=[e['task_id'] for e in store.get(identifier).events if e['event']=='task_started'];self.assertEqual(starts,['tax','receipt','tests'])
-                self.assertEqual(store.budget(identifier)['limits'],before['limits'])
+            root = Path(directory)
+            workspace, db = root / 'workspace', root / 'state.db'
+            workspace.mkdir()
+            tests = ("import unittest\nfrom receipt import receipt_total\n"
+                     "class ReceiptTest(unittest.TestCase):\n"
+                     "    def test_total(self): self.assertAlmostEqual(receipt_total([100]), 120)\n")
+            (workspace / 'test_receipt.py').write_text(tests)
 
-    def test_default_real_client_is_saved_and_not_replaced_on_resume(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root=Path(directory);workspace=root/'workspace';db=root/'state.db'
-            settings=Settings('ollama','example','http://127.0.0.1:11434/v1','ollama')
-            def real(*args,**kwargs):
-                client=TasksDemoClient();client.settings=settings;client.max_tokens=kwargs['max_tokens'];return client
-            args=['hw-ai-agent','tasks-demo','--mode','auto','--workspace',str(workspace),'--state-db',str(db),'--stop-after-tasks','1']
-            with patch.object(sys,'argv',args),patch('hw_ai_agent.cli.load_env'),patch('hw_ai_agent.cli.Settings.from_env',return_value=settings),patch('hw_ai_agent.cli.doctor',return_value=True),patch('hw_ai_agent.cli.OpenAICompatibleClient',side_effect=real) as factory,patch('hw_ai_agent.cli.confirm_plan',return_value=True),redirect_stdout(io.StringIO()),redirect_stderr(io.StringIO()):
-                self.assertEqual(main(),130);factory.assert_called_once()
+            def client(settings, *, max_tokens, **kwargs):
+                model = Client(*responses)
+                model.settings, model.max_tokens = settings, max_tokens
+                return model
+
+            responses = [
+                plan(), {'tool_calls': [fix('tax', TAX_FIXED), done('tax')]},
+            ]
+            env = root / '.env'
+            env.write_text('AGENT_PROVIDER=ollama\nOLLAMA_MODEL=test-model\n')
+            argv = ['hw-ai-agent', 'run', '--tasks', '--mode', 'auto', '--workspace', str(workspace),
+                    '--state-db', str(db), '--env-file', str(env), '--stop-after-tasks', '1', '--max-tokens', '1800',
+                    'Fix tax and receipt']
+            with patch.object(sys, 'argv', argv), patch('hw_ai_agent.cli.confirm_plan', return_value=True), \
+                 patch('hw_ai_agent.cli.OpenAICompatibleClient', side_effect=client), \
+                 redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()):
+                self.assertEqual(main(), 130)
+                self.assertIn('[x] tax', output.getvalue())
             with SessionStore(db) as store:
-                identifier=store.list_sessions()[0]['id'];self.assertFalse(store.get(identifier).metadata['demo']['offline'])
-            with patch.object(sys,'argv',['hw-ai-agent','resume',identifier,'--state-db',str(db)]),patch('hw_ai_agent.cli.load_env'),patch('hw_ai_agent.cli.Settings.from_env',return_value=settings),patch('hw_ai_agent.cli.OpenAICompatibleClient',side_effect=real),patch('hw_ai_agent.cli.TasksDemoClient',side_effect=AssertionError('No scripted fallback')),redirect_stdout(io.StringIO()):
-                self.assertEqual(main(),0)
+                identifier = store.list_sessions()[0]['id']
+                before = store.budget(identifier)
+                self.assertEqual(store.tasks(identifier)[0]['state'], 'completed')
+
+            responses = [
+                {'tool_calls': [fix('receipt', RECEIPT_FIXED), done('receipt')]},
+                {'tool_calls': [call('tests', 'Bash', command='python -m unittest discover -v'), done('tests')]},
+                {'content': 'All tasks completed.'},
+            ]
+            argv = ['hw-ai-agent', 'resume', '--state-db', str(db), '--env-file', str(env)]
+            with patch.object(sys, 'argv', argv), patch('sys.stdin.isatty', return_value=True), \
+                 patch('hw_ai_agent.cli.OpenAICompatibleClient', side_effect=client), redirect_stdout(io.StringIO()):
+                self.assertEqual(main(), 0)
+            with SessionStore(db) as store:
+                self.assertEqual(store.get(identifier).metadata['max_tokens'], 1800)
+                self.assertEqual(store.budget(identifier)['spent']['side_effects'], 3)
+                self.assertEqual(store.budget(identifier)['limits'], before['limits'])
+                self.assertEqual([t['state'] for t in store.tasks(identifier)], ['completed'] * 3)
+            self.assertEqual((workspace / 'test_receipt.py').read_text(), tests)
 
     def test_hard_crash_after_effect_blocks_then_applied_resumes_same_task(self):
         with tempfile.TemporaryDirectory() as directory:
-            root=Path(directory);workspace=root/'workspace';db=root/'state.db'
-            script='''import sys
-from pathlib import Path
-from hw_ai_agent.tasks_demo import run_tasks_demo
-run_tasks_demo(Path(sys.argv[1]),Path(sys.argv[2]),offline=True,mode='auto',approve_plan=lambda p:True,crash_after_write=True)
-'''
-            env=os.environ.copy();env['PYTHONPATH']=str(Path(__file__).resolve().parents[1]/'src')
-            result=subprocess.run([sys.executable,'-c',script,str(workspace),str(db)],env=env,capture_output=True,timeout=10)
-            self.assertEqual(result.returncode,86,result.stderr.decode())
+            root = Path(directory)
+            workspace, db = root / 'workspace', root / 'state.db'
+            workspace.mkdir()
+            script = """
+import os
+import sys
+from test_tasks import CodingAgent, SessionStore, Client, ToolRuntime, TASK_PLAN, TAX_FIXED, plan, fix
+class CrashAfterWrite(ToolRuntime):
+    def execute(self, name, arguments):
+        result = super().execute(name, arguments)
+        if name == 'write_file':
+            os._exit(86)
+        return result
+task_plan = {**TASK_PLAN, 'steps': TASK_PLAN['steps'][:1]}
+with SessionStore(sys.argv[2]) as store:
+    runtime = CrashAfterWrite(sys.argv[1], mode='auto', trash_dir=store.path.parent / 'trash')
+    client = Client(plan(task_plan), {'tool_calls': [fix('tax', TAX_FIXED)]})
+    CodingAgent(client, runtime, store=store, task_mode=True, approve_plan=lambda _: True).run('Fix tax')
+"""
+            repo = Path(__file__).resolve().parents[1]
+            env = {**os.environ, 'PYTHONPATH': os.pathsep.join(map(str, (repo / 'src', repo / 'tests')))}
+            result = subprocess.run([sys.executable, '-c', script, str(workspace), str(db)], env=env,
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 86, result.stderr)
             with SessionStore(db) as store:
-                identifier=store.list_sessions()[0]['id'];runtime=ToolRuntime(workspace,mode='auto',trash_dir=root/'trash')
-                agent=CodingAgent(TasksDemoClient(),runtime,store=store)
-                with self.assertRaises(UncertainActionError):agent.resume(identifier)
-                item=next(i for i in store.calls(identifier,True) if i['state']=='uncertain')
-                before=store.budget(identifier)
-                store.resolve(identifier,item['key'],'applied',lambda i:verify_applied(runtime,i))
-                self.assertEqual(store.budget(identifier),before)
-                self.assertEqual(agent.resume(identifier),'Все три задачи завершены; результаты подтверждены runtime.')
-                self.assertTrue(all(t['state']=='completed' for t in store.tasks(identifier)))
+                identifier = store.list_sessions()[0]['id']
+                runtime = ToolRuntime(workspace, mode='auto', trash_dir=root / 'trash')
+                client = Client({'tool_calls': [done('tax')]}, {'content': 'Task completed.'})
+                agent = CodingAgent(client, runtime, store=store)
+                with self.assertRaises(UncertainActionError):
+                    agent.resume(identifier)
+                item = next(i for i in store.calls(identifier, True) if i['state'] == 'uncertain')
+                before = store.budget(identifier)
+                store.resolve(identifier, item['key'], 'applied', lambda i: verify_applied(runtime, i))
+                self.assertEqual(store.budget(identifier), before)
+                self.assertEqual(agent.resume(identifier), 'Task completed.')
+                self.assertEqual(store.tasks(identifier)[0]['state'], 'completed')
 
 
 class TaskCLITests(unittest.TestCase):
     def test_flags_are_available_and_budget_limits_cannot_change_on_resume(self):
-        for action in ['run','plan','tasks-demo']:
+        for action in ['run','plan']:
             with patch.object(sys,'argv',['hw-ai-agent',action,'--help']),redirect_stdout(io.StringIO()) as output:
                 with self.assertRaises(SystemExit) as result:main()
                 self.assertEqual(result.exception.code,0)
                 self.assertIn('--stop-after-tasks',output.getvalue())
-                self.assertIn('--tasks' if action!='tasks-demo' else '--offline',output.getvalue())
-    def test_new_demo_has_no_silent_offline_fallback(self):
-        with tempfile.TemporaryDirectory() as directory,self.assertRaisesRegex(ValueError,'Real model'):
-            root=Path(directory);run_tasks_demo(root/'workspace',root/'state.db')
-    def test_task_demo_invalid_limits_precede_model_setup(self):
-        with patch.object(sys,'argv',['hw-ai-agent','tasks-demo','--max-tool-calls','-1']),patch('hw_ai_agent.cli.load_env') as load,redirect_stderr(io.StringIO()):
-            self.assertEqual(main(),1);load.assert_not_called()
-
-
+                self.assertIn('--tasks',output.getvalue())
 if __name__=='__main__':unittest.main()

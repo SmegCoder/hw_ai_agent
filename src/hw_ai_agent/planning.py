@@ -16,8 +16,11 @@ class PlanApprovalDeferred(ApprovalDeferred):
 PLAN_INSTRUCTIONS = '''
 This run begins in a planning phase. Inspect the workspace using only list_files
 and read_file. Do not call Bash, write_file or delete_file before plan approval.
-Submit your structured plan with submit_plan, in Russian. Include the goal,
-ordered steps and their tools, risks, assumptions and verifiable done_criteria.
+Submit your structured plan with submit_plan, in Russian. Keep the goal and
+each step to one short sentence. For a simple request, use one to three steps.
+Use [] for risks and assumptions unless they materially affect the decision.
+Include one or two concrete done_criteria, and plan testing only when relevant
+existing tests are available and the user has not asked to skip them.
 The runtime will request an explicit operator decision. Only after it reports
 approval may you execute the plan using the normal tools and permission rules.
 A rejected plan must not be executed. Tool errors are recoverable: correct the

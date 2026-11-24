@@ -6,9 +6,9 @@ from unittest.mock import patch
 
 from hw_ai_agent.agent import CodingAgent
 from hw_ai_agent.journal import ChangeJournal,JournalError,JournalConflict
-from hw_ai_agent.session import SessionStore,SessionError,UncertainActionError
+from hw_ai_agent.session import SessionStore,SessionError
 from hw_ai_agent.tools import ToolRuntime
-from hw_ai_agent.policy import Policy,ApprovalDeferred
+from hw_ai_agent.policy import Policy
 from hw_ai_agent.cli import main,verify_applied
 
 
@@ -52,6 +52,18 @@ class JournalTests(unittest.TestCase):
   journal.rollback()
   self.assertEqual((self.workspace/'obsolete.bin').read_bytes(),b'\x00\xffold');self.assertFalse((self.workspace/'notes.txt').exists())
   self.assertEqual((self.workspace/'external.txt').read_text(),'foreign')
+
+ def test_checkpoint_preserves_undecodable_native_names(self):
+  agent=self.run_actions(self.write());journal=agent.journal
+  entry=journal.entries()['order.py']
+  native_name='raw\udcd0.py'
+  tree=journal.image(journal.head()['revision'])
+  tree['files'][native_name]=entry['after']
+  with self.store.transaction():
+   revision=journal._save_image(tree,{})
+   journal._replace_entries({'order.py':entry,native_name:entry})
+  self.assertEqual(journal.image(revision),tree)
+  self.assertEqual(journal.entries(),{'order.py':entry,native_name:entry})
 
  def test_multiple_writes_keep_first_before_and_last_after(self):
   agent=self.run_actions(self.write('one',content='first'),self.write('two',content='last'))
@@ -283,6 +295,25 @@ class JournalTests(unittest.TestCase):
   with patch.object(sys,'argv',['hw-ai-agent','rollback',agent.session_id,'--state-db',str(self.path)]),redirect_stdout(io.StringIO()):self.assertEqual(main(),0)
   self.assertEqual((self.workspace/'order.py').read_bytes(),b'original\r\n')
 
+ def test_run_with_journal_shows_and_rolls_back_changes(self):
+  def client(settings, *, max_tokens, **kwargs):
+   model = Client({'tool_calls': [self.write()]}, {'content': 'Done'})
+   model.settings, model.max_tokens = settings, max_tokens
+   return model
+
+  common = ['--state-db', str(self.path), '--env-file', str(self.root / '.env')]
+  argv = ['hw-ai-agent', 'run', '--provider', 'ollama', '--model', 'test-model',
+          '--workspace', str(self.workspace), '--mode', 'auto', '--journal', *common, 'Fix order']
+  with patch.object(sys, 'argv', argv), patch('hw_ai_agent.cli.OpenAICompatibleClient', side_effect=client), redirect_stdout(io.StringIO()):
+   self.assertEqual(main(), 0)
+  identifier = self.store.list_sessions()[0]['id']
+  with patch.object(sys, 'argv', ['hw-ai-agent', 'changes', identifier, *common]), redirect_stdout(io.StringIO()) as output:
+   self.assertEqual(main(), 0)
+   self.assertIn('+fixed', output.getvalue())
+  with patch.object(sys, 'argv', ['hw-ai-agent', 'rollback', identifier, *common]), redirect_stdout(io.StringIO()):
+   self.assertEqual(main(), 0)
+  self.assertEqual((self.workspace / 'order.py').read_bytes(), b'original\r\n')
+
  def test_changes_can_select_completed_session_without_id(self):
   self.run_actions(self.write())
   with patch.object(sys,'argv',['hw-ai-agent','changes','--state-db',str(self.path)]),patch('sys.stdin.isatty',return_value=True),redirect_stdout(io.StringIO()) as output:
@@ -295,17 +326,6 @@ class JournalTests(unittest.TestCase):
 
 @unittest.skipUnless(os.getenv('REQUIRE_SANDBOX_TESTS')=='1','Requires native macOS sandbox')
 class JournalIntegrationTests(unittest.TestCase):
- def test_new_demo_changes_and_rollback_in_native_runtime(self):
-  with tempfile.TemporaryDirectory() as folder:
-   root=Path(folder);workspace=root/'workspace';db=root/'state.db'
-   with patch.object(sys,'argv',['hw-ai-agent','rollback-demo','--offline','--mode','auto','--workspace',str(workspace),'--state-db',str(db)]),patch('hw_ai_agent.cli.confirm_plan',return_value=True),redirect_stdout(io.StringIO()) as output:
-    self.assertEqual(main(),0);self.assertIn('DEMO PASS',output.getvalue())
-   with SessionStore(db) as store:
-    identifier=store.list_sessions()[0]['id'];self.assertTrue(store.get(identifier).metadata['journal_mode'])
-   with patch.object(sys,'argv',['hw-ai-agent','rollback',identifier,'--state-db',str(db)]),redirect_stdout(io.StringIO()):self.assertEqual(main(),0)
-   from hw_ai_agent.demo import BROKEN_ORDER
-   self.assertEqual((workspace/'order.py').read_bytes(),BROKEN_ORDER.encode())
-
  def test_hard_process_crash_requires_attribution_before_rollback(self):
   with tempfile.TemporaryDirectory() as folder:
    root=Path(folder);workspace=root/'workspace';workspace.mkdir();(workspace/'order.py').write_text('original');db=root/'state.db'

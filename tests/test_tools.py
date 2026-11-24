@@ -28,6 +28,21 @@ class ToolRuntimeTests(unittest.TestCase):
             with self.subTest(path=path), self.assertRaises(ToolError):
                 self.runtime.read_file(path)
 
+    def test_list_files_omits_undecodable_names_without_losing_valid_files(self):
+        (self.root / "обычный.txt").write_text("ok")
+        directories = ["dir\udcd0"]
+
+        def walk(*args, dir_fd, **kwargs):
+            yield ".", directories, ["file\udcd0", "обычный.txt"], dir_fd
+
+        with patch("hw_ai_agent.tools.os.fwalk", side_effect=walk):
+            with self.runtime.output_budget(256):
+                result = self.runtime.list_files(recursive=True)
+        self.assertIn("обычный.txt", result)
+        self.assertIn("names are not valid UTF-8", result)
+        self.assertNotIn("\udcd0", result)
+        self.assertEqual(directories, [])
+
     def test_external_symlink_is_blocked(self):
         (self.root / "outside").symlink_to(self.root.parent)
         with self.assertRaisesRegex(ToolError, "escapes"):

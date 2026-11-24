@@ -19,6 +19,7 @@ from typing import Any
 from .policy import Action, ApprovalDeferred, ApprovalRequest, Decision, Policy, PolicyError
 from .budget import truncate_result
 from .filesystem import TargetChangedError, capture_target, write_target, remove_target, open_read_file, open_directory
+from .text import has_surrogates
 
 class ToolError(RuntimeError):
     pass
@@ -152,8 +153,10 @@ class ToolRuntime:
                 try:
                     with self.output_budget(None):
                         original = self.read_file(arguments["path"]) if file.is_file() else ""
-                    preview = "".join(difflib.unified_diff(original.splitlines(True),
-                                arguments["content"].splitlines(True), fromfile="current", tofile="proposed"))
+                    lines = difflib.unified_diff(original.splitlines(True),
+                                arguments["content"].splitlines(True), fromfile="current", tofile="proposed")
+                    preview = "".join(line if line.endswith("\n") else line + "\n\\ No newline at end of file\n"
+                                      for line in lines)
                 except (ToolError, OSError, UnicodeError):
                     preview = "Existing content could not be previewed. Proposed content:\n" + arguments["content"]
                 preview = preview[:4000] + ("\n... preview truncated ..." if len(preview) > 4000 else "")
@@ -163,7 +166,9 @@ class ToolRuntime:
                     preview += f"\nSize: {target.file_signature[2]} bytes."
             elif name == "Bash":
                 preview = f"Working directory: {arguments.get('cwd', '.')}\nCommand: {command}"
-            request = ApprovalRequest(name, path or command or ".", decision.reason, preview, fingerprint)
+            working_directory = checked_cwd[0].relative_to(self.root).as_posix() if checked_cwd else None
+            request = ApprovalRequest(name, path or command or ".", decision.reason, preview, fingerprint,
+                                      working_directory=working_directory)
             approved = False
             source = "policy"
             self._policy_event(name, "ask", "waiting", decision.reason, "policy", fingerprint, request.scope)
@@ -299,6 +304,7 @@ class ToolRuntime:
         if not directory.is_dir():
             raise ToolError(f"Not a directory: {path}")
         entries = []
+        skipped_names = False
         try:
             with open_directory(self.root, directory) as directory_fd:
                 for current, directories, files, current_fd in os.fwalk(".", follow_symlinks=False, dir_fd=directory_fd):
@@ -308,6 +314,11 @@ class ToolRuntime:
                     for name in directories + sorted(files):
                         item = relative / name
                         if protected(item) or not self.policy.directory_allowed(item.as_posix()):
+                            continue
+                        if has_surrogates(item.as_posix()):
+                            if name in directories:
+                                directories.remove(name)
+                            skipped_names = True
                             continue
                         try:
                             info = os.stat(name, dir_fd=current_fd, follow_symlinks=False)
@@ -322,6 +333,8 @@ class ToolRuntime:
                         break
         except TargetChangedError:
             raise ToolError("TARGET_CHANGED: cannot list the checked workspace directory safely") from None
+        if skipped_names:
+            entries.append("[Some paths were omitted because their names are not valid UTF-8]")
         return self._truncate("\n".join(entries) or "(empty)")
 
     def read_file(self, path: str) -> str:

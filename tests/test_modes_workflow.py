@@ -16,7 +16,7 @@ from hw_ai_agent.cli import load_policy
 from hw_ai_agent.policy import Policy
 from hw_ai_agent.session import SessionError, SessionStore, UncertainActionError
 from hw_ai_agent.tools import ToolError, ToolRuntime
-from hw_ai_agent.workflow_demo import FIXED_TAX, call, run_workflow_demo
+from agent_fixtures import tool_call as call
 
 
 class Client:
@@ -161,7 +161,7 @@ class ModeSessionTests(unittest.TestCase):
     def test_legacy_single_call_permission_is_not_promoted_to_session_grant(self):
         runtime = self.runtime(approve=lambda request: False)
         agent = CodingAgent(Client({"content": "done"}), runtime, store=self.store)
-        session_id = self.store.create(agent._binding(), [{"role": "user", "content": "Task"}], 12, 120000)
+        session_id = self.store.create(agent.binding(), [{"role": "user", "content": "Task"}], 12, 120000)
         self.store.event(session_id, {"event": "policy_decision", "tool": "write_file", "outcome": "approved"})
         self.store.assistant(session_id, {"role": "assistant", "tool_calls": [write("a")]}, 0)
         agent.resume(session_id)
@@ -224,50 +224,61 @@ class ModeSessionTests(unittest.TestCase):
         self.assertIn("terminated", output.getvalue())
 
 
-@unittest.skipUnless(os.getenv("REQUIRE_SANDBOX_TESTS") == "1", "Requires native macOS sandbox")
 class WorkflowIntegrationTests(unittest.TestCase):
-    def test_safe_multifile_demo_asks_for_each_action(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            approve = Mock(return_value=True)
-            report = run_workflow_demo(root / "workspace", root / ".agent/state.sqlite3", approve=approve)
-            self.assertTrue(report["success"])
-            self.assertEqual(report["permission_requests"], {"write_file": 2, "Bash": 2})
-            self.assertEqual(approve.call_count, 4)
-            self.assertEqual(report["write_attempts"], {"tax.py": 1, "receipt.py": 1})
-
-    def test_auto_multifile_demo_does_not_prompt(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            approve = Mock(return_value=True)
-            report = run_workflow_demo(root / "workspace", root / ".agent/state.sqlite3", mode="auto", approve=approve)
-            self.assertTrue(report["success"])
-            self.assertEqual(report["permission_requests"], {})
-            approve.assert_not_called()
-
     def test_real_process_crash_and_all_three_resolutions(self):
+        script = """
+import os
+from hw_ai_agent import cli
+from hw_ai_agent.tools import ToolRuntime
+from agent_fixtures import tool_call
+
+class Client:
+    def __init__(self, settings, *, max_tokens, **kwargs):
+        self.settings, self.max_tokens = settings, max_tokens
+
+    def complete(self, messages, tools):
+        if any(message['role'] == 'tool' for message in messages):
+            return {'content': 'Finished.'}
+        return {'tool_calls': [tool_call('write', 'write_file', {'path': 'tax.py', 'content': 'fixed'})]}
+
+class CrashAfterWrite(ToolRuntime):
+    def execute(self, name, arguments):
+        result = super().execute(name, arguments)
+        if name == 'write_file':
+            os._exit(86)
+        return result
+
+cli.OpenAICompatibleClient = Client
+if cli.sys.argv[1] == 'run':
+    cli.ToolRuntime = CrashAfterWrite
+raise SystemExit(cli.main())
+"""
+        project = Path(__file__).resolve().parents[1]
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join(map(str, (project / "src", project / "tests")))}
         for resolution in ("retry", "skip", "abort"):
             with self.subTest(resolution=resolution), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 workspace, db = root / "workspace", root / ".agent/state.sqlite3"
-                env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
+                workspace.mkdir()
+                (workspace / "tax.py").write_text("original")
+
                 def cli(*args):
-                    script = "import hw_ai_agent.cli as cli; cli.confirm_action=lambda request: True; raise SystemExit(cli.main())"
-                    return subprocess.run([sys.executable, "-c", script, *args],
+                    return subprocess.run([sys.executable, "-c", script, *args, "--state-db", str(db)],
                                           cwd=root, env=env, capture_output=True, text=True, timeout=20)
-                crashed = cli("workflow-demo", "--offline", "--mode", "auto", "--workspace", str(workspace),
-                              "--state-db", str(db), "--crash-after-write")
+
+                crashed = cli("run", "--provider", "ollama", "--model", "test-model", "--mode", "auto",
+                              "--workspace", str(workspace), "Fix tax")
                 self.assertEqual(crashed.returncode, 86, crashed.stderr)
-                self.assertEqual((workspace / "tax.py").read_text(), FIXED_TAX)
+                self.assertEqual((workspace / "tax.py").read_text(), "fixed")
                 with SessionStore(db) as store:
                     session_id = store.list_sessions()[0]["id"]
                     self.assertEqual(store.calls(session_id, True)[0]["state"], "running")
-                blocked = cli("resume", session_id, "--state-db", str(db))
+                blocked = cli("resume", session_id)
                 self.assertEqual(blocked.returncode, 1, blocked.stdout + blocked.stderr)
                 self.assertIn("unknown result", blocked.stderr)
-                resolved = cli("resolve", session_id, "--state-db", str(db), "--call", "1:0", "--resolution", resolution)
+                resolved = cli("resolve", session_id, "--call", "1:0", "--resolution", resolution)
                 self.assertEqual(resolved.returncode, 1 if resolution == "abort" else 0, resolved.stderr)
-                resumed = cli("resume", session_id, "--state-db", str(db))
+                resumed = cli("resume", session_id)
                 self.assertEqual(resumed.returncode, 1 if resolution == "abort" else 0, resumed.stdout + resumed.stderr)
                 with SessionStore(db) as store:
                     self.assertEqual(store.get(session_id).status, "aborted" if resolution == "abort" else "completed")
@@ -275,11 +286,9 @@ class WorkflowIntegrationTests(unittest.TestCase):
                     if resolution == "skip":
                         self.assertEqual(first_call["state"], "failed")
                         self.assertIn("RECOVERY_SKIPPED", first_call["result"]["content"])
-                if resolution != "abort":
-                    report = json.loads((workspace / "workflow-report.json").read_text())
-                    self.assertTrue(report["success"])
-                    self.assertEqual(report["write_attempts"]["tax.py"], 2 if resolution == "retry" else 1)
-                    self.assertNotIn(str(workspace), json.dumps(report))
+                    elif resolution == "retry":
+                        self.assertEqual(first_call["state"], "completed")
+                        self.assertEqual(store.budget(session_id)["spent"]["side_effects"], 2)
 
 
 if __name__ == "__main__":

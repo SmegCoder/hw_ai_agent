@@ -11,7 +11,7 @@ from hw_ai_agent.agent import CodingAgent
 from hw_ai_agent.policy import Policy
 from hw_ai_agent.session import SessionStore, UncertainActionError
 from hw_ai_agent.tools import ToolError, ToolRuntime
-from hw_ai_agent.workflow_demo import WORKFLOW_REQUEST, WORKFLOW_SYSTEM_PROMPT, OPTIONAL_FILES, call
+from agent_fixtures import tool_call as call
 
 
 class Client:
@@ -193,58 +193,6 @@ class DeletionTests(unittest.TestCase):
     def test_legacy_policy_cannot_gain_deletion_permission_on_restore(self):
         policy = Policy.restore({"defaults": {"write_file": "allow", "Bash": "allow"}, "rules": []})
         self.assertEqual(policy.decide("delete_file").action.value, "deny")
-
-    def test_prompt_does_not_name_cleanup_candidates_or_request_deletion(self):
-        for filename in OPTIONAL_FILES:
-            self.assertNotIn(filename, WORKFLOW_REQUEST)
-            self.assertNotIn(filename, WORKFLOW_SYSTEM_PROMPT)
-        self.assertIn("optimize", WORKFLOW_REQUEST)
-        self.assertIn("remove files", WORKFLOW_REQUEST)
-        self.assertNotIn("unused", WORKFLOW_REQUEST)
-
-
-@unittest.skipUnless(os.getenv("REQUIRE_SANDBOX_TESTS") == "1", "Requires native macOS sandbox")
-class ExpandedWorkflowTests(unittest.TestCase):
-    def run_expanded(self, mode, remove_files=True):
-        from types import SimpleNamespace
-        from hw_ai_agent.workflow_demo import run_workflow_demo, FIXED_TAX, FIXED_RECEIPT
-        class ModelClient(Client):
-            settings = SimpleNamespace(provider="ollama", model="test-double", base_url="http://localhost:11434/v1")
-            usage = []
-            max_tokens = 2048
-        actions = [call("tax", "write_file", {"path": "tax.py", "content": FIXED_TAX}),
-                   call("receipt", "write_file", {"path": "receipt.py", "content": FIXED_RECEIPT})]
-        if remove_files:
-            actions.extend(remove(name) for name in OPTIONAL_FILES[:2])
-        actions.extend([call("ls", "Bash", {"command": "ls"}),
-                        call("tests", "Bash", {"command": "python -m unittest discover -v"})])
-        client = ModelClient({"tool_calls": actions}, {"content": "done"})
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            approve = Mock(return_value=True)
-            report = run_workflow_demo(root / "workspace", root / ".agent/state.sqlite3",
-                                       mode=mode, approve=approve, client=client)
-            self.assertIn("Ran 4 tests", report["verification"])
-            self.assertTrue(report["tests_unchanged"])
-            self.assertTrue((root / "workspace/formatting.py").exists())
-            return report, approve.call_count
-
-    def test_expanded_workflow_in_both_modes(self):
-        for mode in ("safe", "auto"):
-            with self.subTest(mode=mode):
-                report, prompts = self.run_expanded(mode)
-                self.assertTrue(report["success"])
-                self.assertEqual(len(report["removed_optional_files"]), 2)
-                self.assertEqual(prompts, 6 if mode == "safe" else 2)
-                self.assertEqual(report["permission_requests"],
-                                 {"write_file": 2, "delete_file": 2, "Bash": 2} if mode == "safe" else {"delete_file": 2})
-
-    def test_functional_pass_without_cleanup_is_not_full_demo_pass(self):
-        report, _ = self.run_expanded("auto", remove_files=False)
-        self.assertTrue(report["functional_success"])
-        self.assertFalse(report["cleanup_complete"])
-        self.assertFalse(report["success"])
-
 
 if __name__ == "__main__":
     unittest.main()

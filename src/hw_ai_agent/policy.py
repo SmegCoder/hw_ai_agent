@@ -64,6 +64,7 @@ class ApprovalRequest:
     preview: str
     fingerprint: str
     scope: str = "call"
+    working_directory: str | None = None
 
 
 @dataclass(frozen=True)

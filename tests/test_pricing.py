@@ -2,19 +2,18 @@ from __future__ import annotations
 
 import io
 import json
-import os
 import tempfile
 import unittest
-from contextlib import redirect_stdout, redirect_stderr
+from contextlib import redirect_stdout
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 from hw_ai_agent.agent import CodingAgent, AgentError
 from hw_ai_agent.client import OpenAICompatibleClient, ModelClientError
 from hw_ai_agent.config import Settings
-from hw_ai_agent.cost_demo import run_cost_demo
 from hw_ai_agent.model_catalog import ModelCatalog, openai_models, openrouter_models, comparison
 from hw_ai_agent.pricing import Price, PricingError, amount, usd, estimate, estimate_tokens, actual_cost, cost_summary
 from hw_ai_agent.session import SessionStore
@@ -67,7 +66,6 @@ class PriceTests(unittest.TestCase):
 
     def test_local_api_cost_is_zero_not_electricity_cost(self):
         self.assertEqual(actual_cost('ollama', None, {})['kind'], 'local')
-        self.assertEqual(actual_cost('scripted', None, {})['usd'], '0')
 
     def test_quote_includes_tools_and_complete_history(self):
         messages = [{'role': 'user', 'content': 'Привет'}]
@@ -103,9 +101,10 @@ class CatalogTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
 
     def test_router_units_and_unknown_price_are_preserved(self):
-        models = openrouter_models({'data': ROUTER['data'] + [{'id': 'fixture/unknown', 'supported_parameters': ['tools']}, 'junk']}, 'now')
+        models = openrouter_models({'data': ROUTER['data'] + [{'id': 'fixture/unknown', 'supported_parameters': ['tools'], 'top_provider': {'context_length': 4096}}, 'junk']}, 'now')
         self.assertEqual(models[0].price.calculate(1000, 1000), Decimal('0.003000'))
         self.assertIsNone(models[1].price)
+        self.assertEqual(models[1].context, 4096)
         self.assertIn('неизвестно', comparison(models))
 
     def test_openai_uses_standard_and_converts_per_million(self):
@@ -167,9 +166,10 @@ class AccountingIntegrationTests(unittest.TestCase):
             with self.assertRaises(ModelClientError): agent.run('Task')
             self.assertEqual(store.cost(agent.session_id)['reported_usd'], '0.005')
             self.assertEqual(store.cost(agent.session_id)['unknown_requests'], 0)
+            self.assertIn("Model output was cut off", store.get(agent.session_id).error)
 
-    def test_local_scripted_client_quote_and_total_are_zero(self):
-        client = SimpleNamespace(billing_provider='scripted', complete=lambda messages, tools: {'content': 'ok'})
+    def test_ollama_quote_and_total_are_zero(self):
+        client = SimpleNamespace(billing_provider='ollama', complete=lambda messages, tools: {'content': 'ok'})
         agent = CodingAgent(client, ToolRuntime(self.workspace))
         agent.run('Task')
         quote = next(e for e in agent.events if e['event']=='model_cost_estimate')
@@ -198,6 +198,43 @@ class AccountingIntegrationTests(unittest.TestCase):
             with self.assertRaises(ModelClientError): agent.run('Task')
             result = store.cost(agent.session_id)
             self.assertEqual(result['known_usd'], '0'); self.assertEqual(result['unknown_requests'], 1)
+            self.assertEqual(store.get(agent.session_id).error, "Cannot reach openrouter: OSError")
+
+    def test_openrouter_retry_uses_model_budget_without_replaying_tools(self):
+        client = OpenAICompatibleClient(Settings('openrouter', 'fixture', 'https://example.org/v1', 'key'))
+        call = {"id": "read", "type": "function", "function": {"name": "list_files", "arguments": "{}"}}
+        tool = {"choices": [{"message": {"tool_calls": [call]}}], "usage": {"cost": "0.004"}}
+        final = {"choices": [{"message": {"content": "ok"}}], "usage": {"cost": "0.006"}}
+        responses = [io.BytesIO(json.dumps(tool).encode()),
+                     HTTPError("https://example.org", 429, "", {"Retry-After": "3"}, None),
+                     HTTPError("https://example.org", 503, "", {}, None),
+                     io.BytesIO(json.dumps(final).encode())]
+        with SessionStore(self.root / 'state') as store, \
+                patch.object(client.opener, 'open', side_effect=responses), \
+                patch('hw_ai_agent.agent.time.sleep') as sleep:
+            agent = CodingAgent(client, ToolRuntime(self.workspace), max_rounds=4, store=store)
+            self.assertEqual(agent.run('Task'), 'ok')
+            self.assertEqual([item.args[0] for item in sleep.call_args_list], [3, 2])
+            self.assertEqual(agent.budget['spent']['model_requests'], 4)
+            self.assertEqual(len(store.calls(agent.session_id)), 1)
+            self.assertEqual(amount(store.cost(agent.session_id)['reported_usd']), Decimal('0.01'))
+            self.assertEqual(store.cost(agent.session_id)['unknown_requests'], 2)
+            self.assertEqual(len([e for e in store.get(agent.session_id).events if e['event'] == 'model_retry']), 2)
+
+    def test_openrouter_retry_stops_at_model_budget_and_saves_error(self):
+        client = OpenAICompatibleClient(Settings('openrouter', 'fixture', 'https://example.org/v1', 'key'))
+        responses = [TimeoutError(), HTTPError("https://example.org", 503, "", {}, None)]
+        with SessionStore(self.root / 'state') as store, \
+                patch.object(client.opener, 'open', side_effect=responses) as transport, \
+                patch('hw_ai_agent.agent.time.sleep') as sleep:
+            agent = CodingAgent(client, ToolRuntime(self.workspace), max_rounds=2, store=store)
+            with self.assertRaisesRegex(ModelClientError, 'HTTP 503'):
+                agent.run('Task')
+            self.assertEqual(transport.call_count, 2)
+            sleep.assert_called_once_with(1)
+            state = store.get(agent.session_id)
+            self.assertEqual(state.rounds, 2)
+            self.assertIn('HTTP 503', state.error)
 
     def test_provider_charge_saved_even_if_protocol_rejects_answer(self):
         client = OpenAICompatibleClient(Settings('openrouter', 'fixture', 'https://example.org/v1', 'private-key'))
@@ -231,10 +268,6 @@ class AccountingIntegrationTests(unittest.TestCase):
             self.assertEqual(main(), 0)
             self.assertEqual(json.loads(out.getvalue())['cost']['unknown_requests'], 1)
             client.assert_not_called()
-
-    def test_offline_cost_demo_checks_resume_and_routing(self):
-        report = run_cost_demo()
-        self.assertTrue(report['success']); self.assertEqual(report['cost']['known_usd'], '0.0030005')
 
     def test_custom_endpoint_does_not_borrow_official_rates(self):
         settings = Settings('openai', 'gpt-4.1', 'https://custom.example/v1', 'key')

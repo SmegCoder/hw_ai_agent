@@ -14,12 +14,14 @@ from .tools import ToolError, protected, is_test
 from .policy import Action, ApprovalRequest
 from .filesystem import (open_directory, open_read_file, signature, same_signature,
                          capture_target, verify_target, write_bytes_target, remove_target)
+from .text import has_surrogates, json_text
 
 
 MAX_FILES = 2000
 MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_TREE_BYTES = 20 * 1024 * 1024
-REPORTS = {'demo': 'demo-report.json', 'plan-demo': 'demo-report.json',
+# Old journal snapshots excluded these generated reports. Keep their rollback compatible.
+LEGACY_REPORTS = {'demo': 'demo-report.json', 'plan-demo': 'demo-report.json',
            'workflow': 'workflow-report.json', 'tasks-demo': 'tasks-report.json',
            'rollback-demo': 'rollback-report.json'}
 
@@ -37,7 +39,7 @@ class JournalUncertain(JournalError):
 
 
 def encoded(value):
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False)
+    return json_text(value, sort_keys=True)
 
 
 def digest(data):
@@ -75,7 +77,7 @@ class ChangeJournal:
     def __init__(self, store, session_id, runtime):
         self.store, self.id, self.runtime = store, session_id, runtime
         self.db = store.db
-        self.excluded_report = REPORTS.get(store.get(session_id).metadata.get('kind'))
+        self.excluded_report = LEGACY_REPORTS.get(store.get(session_id).metadata.get('kind'))
         self.active_call = None
         self.reviewed_tree = None
 
@@ -220,10 +222,12 @@ class ChangeJournal:
         rows = self.db.execute('SELECT * FROM journal_entries WHERE session_id=? ORDER BY path', (self.id,)).fetchall()
         result = {}
         for row in rows:
-            valid_path(row['path'])
+            key = row['path']
+            path = os.fsdecode(key) if isinstance(key, bytes) else key
+            valid_path(path)
             try:
-                result[row['path']] = {'before': json.loads(row['before_state']), 'after': json.loads(row['after_state'])}
-                valid_entry(result[row['path']]['before']);valid_entry(result[row['path']]['after'])
+                result[path] = {'before': json.loads(row['before_state']), 'after': json.loads(row['after_state'])}
+                valid_entry(result[path]['before']);valid_entry(result[path]['after'])
             except (ValueError, TypeError):
                 raise JournalError('Invalid saved file change') from None
         return result
@@ -232,7 +236,9 @@ class ChangeJournal:
         self.db.execute('DELETE FROM journal_entries WHERE session_id=?', (self.id,))
         for path, entry in entries.items():
             valid_path(path);valid_entry(entry['before']);valid_entry(entry['after'])
-            self.db.execute('INSERT INTO journal_entries VALUES (?,?,?,?)', (self.id, path, encoded(entry['before']), encoded(entry['after'])))
+            # Keep existing TEXT keys and store undecodable native names losslessly.
+            key = os.fsencode(path) if has_surrogates(path) else path
+            self.db.execute('INSERT INTO journal_entries VALUES (?,?,?,?)', (self.id, key, encoded(entry['before']), encoded(entry['after'])))
 
     def _own_changes(self, before, after, entries):
         result = copy.deepcopy(entries)
@@ -256,7 +262,7 @@ class ChangeJournal:
         if current != expected:
             raise JournalConflict('JOURNAL_CONFLICT: workspace differs from last checkpoint; inspect changes')
         if self.excluded_report is not None and path == self.excluded_report:
-            raise JournalConflict('Generated demo reports cannot be changed by model tools')
+            raise JournalConflict('Generated reports cannot be changed by model tools')
         key = self.active_call['key']
         prior = self.entries()
         with self.store.transaction():

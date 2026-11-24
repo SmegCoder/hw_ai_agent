@@ -16,7 +16,7 @@ from hw_ai_agent.budget import BudgetLimits, BudgetExceeded, DIMENSIONS, truncat
 from hw_ai_agent.policy import ApprovalDeferred
 from hw_ai_agent.session import SessionError, SessionStore, UncertainActionError
 from hw_ai_agent.tools import ToolRuntime, ToolError
-from hw_ai_agent.plan_demo import DEMO_PLAN
+from agent_fixtures import PLAN
 
 
 def call(identifier, name, **arguments):
@@ -71,6 +71,16 @@ class BudgetTests(unittest.TestCase):
 
     def spent(self, agent):
         return self.store.budget(agent.session_id)['spent']
+
+    def test_result_budget_counts_the_safe_utf8_representation(self):
+        client = Client({'tool_calls': [call('read', 'read_file', path='a.py')]}, {'content': 'done'})
+        agent = self.agent(client)
+        with patch.object(agent.runtime, 'execute', return_value='✓\udcd0'):
+            self.assertEqual(agent.run('Task'), 'done')
+        result = self.store.calls(agent.session_id)[0]['result']['content']
+        self.assertEqual(result, r'✓\udcd0')
+        self.assertEqual(self.spent(agent)['result_bytes'], len(result.encode('utf-8')))
+        self.assertLessEqual(len(truncate_result('✓\udcd0', 6).encode('utf-8')), 6)
 
     def pause_after_result(self, event):
         if event['event'] == 'tool_result':
@@ -255,7 +265,7 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(self.spent(resumed)['result_bytes'], before['result_bytes'])
 
     def test_plan_approval_and_resume_share_all_counters(self):
-        responses = [{'tool_calls': [call('ls', 'list_files', path='.'), call('plan', 'submit_plan', **DEMO_PLAN)]}]
+        responses = [{'tool_calls': [call('ls', 'list_files', path='.'), call('plan', 'submit_plan', **PLAN)]}]
         first = self.agent(Client(*responses), plan_mode=True)
         with self.assertRaises(ApprovalDeferred):
             first.run('Task')
@@ -511,25 +521,7 @@ class RuntimeOutputBudgetTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             truncate_result('x', 0)
 
-
 class BudgetCLITests(unittest.TestCase):
-    def test_budget_demo_is_offline_and_checks_all_dimensions(self):
-        from hw_ai_agent.budget_demo import run_budget_demo
-        report = run_budget_demo()
-        self.assertTrue(report['success'], report['checks'])
-        for name in DIMENSIONS:
-            self.assertTrue(report['checks'][name + '_exhausted'])
-        self.assertTrue(report['checks']['resume_preserves_counters'])
-        self.assertTrue(report['checks']['crash_does_not_refund'])
-
-    def test_budget_demo_cli_passes_without_loading_model_settings(self):
-        from hw_ai_agent.cli import main
-        with patch.object(sys, 'argv', ['hw-ai-agent', 'budget-demo']), \
-             patch('hw_ai_agent.cli.load_env') as load, redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(main(), 0)
-            load.assert_not_called()
-            self.assertIn('BUDGET DEMO PASS', output.getvalue())
-
     def test_run_zero_effects_has_no_unbudgeted_bash_preflight(self):
         from hw_ai_agent.cli import main
         from hw_ai_agent.config import Settings
@@ -552,7 +544,7 @@ class BudgetCLITests(unittest.TestCase):
 
     def test_flags_on_start_commands_and_not_resume(self):
         from hw_ai_agent.cli import main
-        for action in ['run', 'plan', 'demo', 'plan-demo', 'workflow-demo']:
+        for action in ['run', 'plan']:
             with self.subTest(action=action), patch.object(sys, 'argv', ['hw-ai-agent', action, '--help']), redirect_stdout(io.StringIO()) as output:
                 with self.assertRaises(SystemExit) as result:
                     main()
@@ -569,7 +561,7 @@ class BudgetCLITests(unittest.TestCase):
         from hw_ai_agent.cli import main
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory) / 'workspace'
-            with patch.object(sys, 'argv', ['hw-ai-agent', 'plan-demo', '--workspace', str(workspace), '--max-side-effects', '-1']), \
+            with patch.object(sys, 'argv', ['hw-ai-agent', 'plan', '--workspace', str(workspace), '--max-side-effects', '-1', 'Task']), \
                  patch('hw_ai_agent.cli.load_env') as load, redirect_stderr(io.StringIO()):
                 self.assertEqual(main(), 1)
                 load.assert_not_called()

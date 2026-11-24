@@ -2,23 +2,19 @@ from __future__ import annotations
 
 import copy
 import io
-import json
-import os
 import tempfile
 import unittest
 from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from hw_ai_agent.agent import CodingAgent, AgentError
+from hw_ai_agent.agent import CodingAgent
 from hw_ai_agent.cli import main, verify_applied
-from hw_ai_agent.plan_demo import DEMO_PLAN, PlanDemoClient, run_plan_demo
-from hw_ai_agent.config import Settings
 from hw_ai_agent.planning import PlanApprovalDeferred, PlanError, validate_plan
-from hw_ai_agent.session import SessionStore, SessionError, PlanRejectedError, UncertainActionError
+from hw_ai_agent.session import SessionStore, SessionError, PlanRejectedError
 from hw_ai_agent.terminal import confirm_plan, confirm_conflict, choose_session
 from hw_ai_agent.tools import ToolRuntime, ToolError
-from hw_ai_agent.workflow_demo import call
+from agent_fixtures import PLAN, tool_call as call
 
 
 class Client:
@@ -34,7 +30,7 @@ class Client:
 
 
 def submit(identifier='plan', value=None):
-    return call(identifier, 'submit_plan', DEMO_PLAN if value is None else value)
+    return call(identifier, 'submit_plan', PLAN if value is None else value)
 
 
 def write(identifier='write'):
@@ -112,7 +108,7 @@ class PlanningTests(unittest.TestCase):
                 def decide(plan):
                     saved = self.store.plan(agent.session_id)
                     self.assertEqual(saved['state'], 'awaiting_approval')
-                    self.assertEqual(saved['data'], DEMO_PLAN)
+                    self.assertEqual(saved['data'], PLAN)
                     self.assertEqual((self.workspace / 'order.py').read_text(), 'original')
                     self.assertEqual(self.store.calls(agent.session_id, True), [])
                     decisions.append(plan)
@@ -153,7 +149,12 @@ class PlanningTests(unittest.TestCase):
         identifier = first.session_id
         self.store.db.close()
         self.store = SessionStore(self.root / '.agent/state.sqlite3')
-        decide = Mock(return_value=True)
+        def confirm(plan):
+            status = self.store.db.execute("SELECT status FROM sessions WHERE id=?", (identifier,)).fetchone()[0]
+            self.assertEqual(status, "waiting_plan_approval")
+            return True
+
+        decide = Mock(side_effect=confirm)
         client = Client({'tool_calls': [write()]}, {'content': 'done'})
         self.assertEqual(CodingAgent(client, self.runtime('auto'), store=self.store, approve_plan=decide).resume(identifier), 'done')
         decide.assert_called_once()
@@ -176,7 +177,7 @@ class PlanningTests(unittest.TestCase):
         with self.assertRaises(PlanApprovalDeferred):
             agent.run('Task')
         self.assertTrue(client.requests[1][-1]['content'].startswith('ERROR:'))
-        self.assertEqual(self.store.plan(agent.session_id)['data'], DEMO_PLAN)
+        self.assertEqual(self.store.plan(agent.session_id)['data'], PLAN)
 
     def test_text_answer_cannot_complete_planning(self):
         agent = CodingAgent(Client({'content': 'I approve my own plan'}, {'tool_calls': [submit()]}),
@@ -199,7 +200,7 @@ class PlanningTests(unittest.TestCase):
         agent = CodingAgent(Client({'tool_calls': [submit()]}, {'content': 'done'}), self.runtime(),
                             store=self.store, plan_mode=True, approve_plan=decide)
         agent.run('Task')
-        self.assertEqual(self.store.plan(agent.session_id)['data'], DEMO_PLAN)
+        self.assertEqual(self.store.plan(agent.session_id)['data'], PLAN)
 
     def test_external_approval_and_rejection_commands(self):
         for command in ('approve-plan', 'reject-plan'):
@@ -212,7 +213,7 @@ class PlanningTests(unittest.TestCase):
 
     def test_approval_cannot_bypass_uncertain_or_pending_plan_calls(self):
         agent = CodingAgent(Client(), self.runtime(), store=self.store, plan_mode=True)
-        identifier = self.store.create(agent._binding(), [{'role': 'user', 'content': 'Task'}], 12, 120000)
+        identifier = self.store.create(agent.binding(), [{'role': 'user', 'content': 'Task'}], 12, 120000)
         with self.assertRaises(SessionError):
             self.store.decide_plan(identifier, True)
 
@@ -230,7 +231,7 @@ class PlanningTests(unittest.TestCase):
         self.store.resolve(first.session_id, '1:0', 'retry')
         with self.assertRaises(PlanApprovalDeferred):
             CodingAgent(Client(), self.runtime(), store=self.store).resume(first.session_id)
-        self.assertEqual(self.store.plan(first.session_id)['data'], DEMO_PLAN)
+        self.assertEqual(self.store.plan(first.session_id)['data'], PLAN)
 
     def test_plan_mode_requires_persistence(self):
         with self.assertRaises(SessionError):
@@ -295,21 +296,12 @@ class PlanningTests(unittest.TestCase):
 
 
 class PlanValidationTests(unittest.TestCase):
-    def test_demo_never_silently_falls_back_to_scripted_model(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            with self.assertRaisesRegex(ValueError, 'Real model client required'):
-                run_plan_demo(root / 'workspace', root / '.agent/state.sqlite3')
-            self.assertFalse((root / 'workspace').exists())
-            with self.assertRaisesRegex(ValueError, 'Offline demo cannot'):
-                run_plan_demo(root / 'workspace', root / '.agent/state.sqlite3', offline=True, client=PlanDemoClient())
-
     def test_invalid_fields_steps_tools_and_criteria_are_rejected(self):
-        cases = [None, {}, {**DEMO_PLAN, 'extra': 1}, {**DEMO_PLAN, 'steps': []},
-                 {**DEMO_PLAN, 'steps': [{'description': 'x', 'tools': ['unknown']}]},
-                 {**DEMO_PLAN, 'done_criteria': []}, {**DEMO_PLAN, 'goal': ' '},
-                 {**DEMO_PLAN, 'risks': ['x' * 4001]}, {**DEMO_PLAN, 'steps': [{'description': 'x', 'tools': 'Bash'}]},
-                 {**DEMO_PLAN, 'risks': ['x' * 4000] * 30}]
+        cases = [None, {}, {**PLAN, 'extra': 1}, {**PLAN, 'steps': []},
+                 {**PLAN, 'steps': [{'description': 'x', 'tools': ['unknown']}]},
+                 {**PLAN, 'done_criteria': []}, {**PLAN, 'goal': ' '},
+                 {**PLAN, 'risks': ['x' * 4001]}, {**PLAN, 'steps': [{'description': 'x', 'tools': 'Bash'}]},
+                 {**PLAN, 'risks': ['x' * 4000] * 30}]
         for value in cases:
             with self.subTest(value=value), self.assertRaises(PlanError):
                 validate_plan(value)
@@ -326,12 +318,12 @@ class TerminalTests(unittest.TestCase):
                     return_value=response), redirect_stdout(io.StringIO()) as output:
                 if result is None:
                     with self.assertRaises(PlanApprovalDeferred):
-                        confirm_plan(DEMO_PLAN)
+                        confirm_plan(PLAN)
                 else:
-                    self.assertIs(confirm_plan(DEMO_PLAN), result)
-            self.assertIn('Критерии готовности', output.getvalue())
+                    self.assertIs(confirm_plan(PLAN), result)
+            self.assertIn('Критерии готовности · ', output.getvalue())
         with patch('sys.stdin.isatty', return_value=False), redirect_stdout(io.StringIO()), self.assertRaises(PlanApprovalDeferred):
-            confirm_plan(DEMO_PLAN)
+            confirm_plan(PLAN)
 
     def test_session_selection_does_not_require_typing_ids(self):
         identifiers = [self.store.create({'workspace': str(self.workspace)}, [{'role': 'user', 'content': 'Task'}], 12, 120000) for _ in range(2)]
@@ -358,15 +350,14 @@ class TerminalTests(unittest.TestCase):
             self.assertEqual(main(), 1)
         self.assertIn('SESSION_ID', output.getvalue())
 
-    def test_cli_run_and_demo_planning_never_preflight_bash(self):
-        for action in ('plan', 'run', 'demo'):
+    def test_cli_planning_never_preflights_bash(self):
+        for action in ('plan', 'run'):
             argv = ['hw-ai-agent', action, '--provider', 'ollama', '--model', 'fake-model',
-                    '--workspace', str(self.workspace if action != 'demo' else self.root / 'new-demo'),
+                    '--workspace', str(self.workspace),
                     '--state-db', str(self.store.path), '--mode', 'auto']
             if action != 'plan':
                 argv.append('--plan')
-            if action != 'demo':
-                argv.append('Task')
+            argv.append('Task')
             client = Client({'tool_calls': [submit()]})
             with patch('sys.argv', argv), patch('hw_ai_agent.cli.OpenAICompatibleClient', return_value=client), \
                  patch('hw_ai_agent.cli.doctor', return_value=True) as doctor, \
@@ -375,88 +366,5 @@ class TerminalTests(unittest.TestCase):
                 self.assertEqual(main(), 1)
             bash.assert_not_called()
             self.assertEqual(len(client.requests), 1)
-            if action == 'demo':
-                self.assertEqual(doctor.call_args.kwargs, {'check_sandbox': False})
+            doctor.assert_not_called()
             self.assertEqual((self.workspace / 'order.py').read_text(), 'original')
-
-
-@unittest.skipUnless(os.getenv('REQUIRE_SANDBOX_TESTS') == '1', 'Requires native sandbox')
-class PlanDemoTests(unittest.TestCase):
-    def test_cli_plan_demo_and_resume_without_id(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary); db = root / '.agent/state.sqlite3'; workspace = root / 'workspace'
-            with patch('sys.argv', ['hw-ai-agent', 'plan-demo', '--offline', '--mode', 'auto', '--workspace', str(workspace), '--state-db', str(db)]), \
-                 patch('sys.stdin.isatty', return_value=False), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                self.assertEqual(main(), 130)
-            with SessionStore(db) as store:
-                saved = store.list_sessions()[0]
-                self.assertEqual(saved['status'], 'waiting_plan_approval')
-                self.assertEqual((workspace / 'order.py').read_text(), 'def calculate_total(prices, discount_percent):\n    return sum(prices) - discount_percent\n')
-            with patch('sys.argv', ['hw-ai-agent', 'resume', '--state-db', str(db)]), patch('sys.stdin.isatty', return_value=True), \
-                 patch('builtins.input', return_value='y'), redirect_stdout(io.StringIO()) as output:
-                self.assertEqual(main(), 0)
-            self.assertIn('DEMO PASS', output.getvalue())
-            with SessionStore(db) as store:
-                self.assertEqual(store.list_sessions()[0]['rounds'], 4)
-                self.assertEqual(store.plan(saved['id'])['state'], 'approved')
-
-    def test_default_uses_model_client_and_resume_keeps_backend_and_limits(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary); db = root / '.agent/state.sqlite3'; workspace = root / 'workspace'
-            settings = Settings('ollama', 'example-model', 'http://localhost:11434/v1', 'ollama')
-            clients = []
-            def factory(chosen, **kwargs):
-                c = PlanDemoClient()
-                c.settings, c.max_tokens = chosen, kwargs['max_tokens']
-                c.complete = Mock(wraps=c.complete)
-                clients.append(c)
-                return c
-            argv = ['hw-ai-agent', 'plan-demo', '--workspace', str(workspace), '--state-db', str(db),
-                    '--mode', 'auto', '--max-tokens', '1472', '--max-rounds', '9']
-            with patch('sys.argv', argv), patch('hw_ai_agent.cli.Settings.from_env', return_value=settings) as config, \
-                 patch('hw_ai_agent.cli.OpenAICompatibleClient', side_effect=factory) as model, \
-                 patch('hw_ai_agent.cli.doctor', return_value=True) as doctor, patch('sys.stdin.isatty', return_value=False), \
-                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                self.assertEqual(main(), 130)
-            model.assert_called_once()
-            config.assert_called_once_with(None, None)
-            self.assertEqual(doctor.call_args.kwargs, {'check_sandbox': False})
-            with SessionStore(db) as store:
-                state = store.get(store.list_sessions()[0]['id'])
-                self.assertEqual(state.metadata['provider'], 'ollama')
-                self.assertEqual(state.metadata['model'], 'example-model')
-                self.assertEqual(state.metadata['max_tokens'], 1472)
-                self.assertEqual(state.max_rounds, 9)
-                self.assertFalse(state.metadata['demo']['offline'])
-            with patch('sys.argv', ['hw-ai-agent', 'resume', state.id, '--state-db', str(db)]), \
-                 patch('hw_ai_agent.cli.Settings.from_env', return_value=settings), \
-                 patch('hw_ai_agent.cli.OpenAICompatibleClient', side_effect=factory) as restored_model, \
-                 patch('hw_ai_agent.cli.PlanDemoClient', side_effect=AssertionError('No scripted fallback')), \
-                 patch('sys.stdin.isatty', return_value=True), patch('builtins.input', return_value='y'), \
-                 redirect_stdout(io.StringIO()) as output:
-                self.assertEqual(main(), 0)
-            self.assertIn('DEMO PASS', output.getvalue())
-            self.assertEqual(restored_model.call_args.kwargs['max_tokens'], 1472)
-            self.assertEqual(len(clients), 2)
-            report = json.loads((workspace / 'demo-report.json').read_text())
-            self.assertEqual(report['provider'], 'ollama')
-            self.assertEqual(report['model'], 'example-model')
-            self.assertTrue(report['success'])
-
-    def test_offline_skips_model_configuration_even_with_custom_token_limit(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary); db = root / '.agent/state.sqlite3'; workspace = root / 'workspace'
-            argv = ['hw-ai-agent', 'plan-demo', '--offline', '--workspace', str(workspace), '--state-db', str(db),
-                    '--mode', 'auto', '--max-tokens', '4096']
-            with patch('sys.argv', argv), patch('hw_ai_agent.cli.OpenAICompatibleClient') as model, \
-                 patch('hw_ai_agent.cli.load_env') as env, patch('sys.stdin.isatty', return_value=False), \
-                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                self.assertEqual(main(), 130)
-            model.assert_not_called()
-            env.assert_not_called()
-            with patch('sys.argv', ['hw-ai-agent', 'resume', '--state-db', str(db)]), \
-                 patch('hw_ai_agent.cli.OpenAICompatibleClient') as model, patch('sys.stdin.isatty', return_value=True), \
-                 patch('builtins.input', return_value='y'), redirect_stdout(io.StringIO()) as output:
-                self.assertEqual(main(), 0)
-            model.assert_not_called()
-            self.assertIn('DEMO PASS', output.getvalue())

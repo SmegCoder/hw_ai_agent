@@ -348,34 +348,5 @@ class Check(unittest.TestCase):
             Path('denied.txt').read_text()
 """)
 
-    def test_original_demo_still_passes_with_scoped_policy(self):
-        from hw_ai_agent.config import Settings
-        from hw_ai_agent.demo import run_demo
-        class ScriptedClient:
-            settings = Settings("openrouter", "test-model", "https://example.invalid/v1", "test")
-            usage = []
-            def __init__(self):
-                code = ("def calculate_total(prices, discount_percent):\n"
-                        "    if not 0 <= discount_percent <= 100:\n"
-                        "        raise ValueError('invalid discount')\n"
-                        "    return sum(prices) * (1 - discount_percent / 100)\n")
-                self.responses = iter([
-                    {"tool_calls": [
-                        {"id": "write", "function": {"name": "write_file", "arguments":
-                            json.dumps({"path": "order.py", "content": code})}},
-                        {"id": "test", "function": {"name": "Bash", "arguments":
-                            json.dumps({"command": "python -m unittest discover -v"})}}]},
-                    {"content": "Tests pass."},
-                ])
-            def complete(self, messages, tools):
-                return next(self.responses)
-        policy = Policy.load(Path(__file__).resolve().parents[1] / "policies/demo.json")
-        report = run_demo(ScriptedClient(), self.root / "demo", policy=policy, mode="auto", approve=lambda request: True)
-        self.assertTrue(report["success"])
-        self.assertTrue(report["tests_unchanged"])
-        self.assertTrue(report["model_ran_passing_tests"])
-        self.assertIn("Ran 6 tests", report["verification"])
-
-
 if __name__ == "__main__":
     unittest.main()

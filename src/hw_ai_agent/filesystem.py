@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import os
 import hashlib
-import json
 import stat
 import uuid
 from dataclasses import dataclass
 from contextlib import contextmanager
 from pathlib import Path
+from .text import json_text
 
 
 class TargetChangedError(OSError):
@@ -240,8 +240,8 @@ def remove_target(target: WriteTarget, trash_dir: Path) -> str | None:
         trash_fd = os.open(trash_dir, flags)
         os.mkdir(recovery_id, mode=0o700, dir_fd=trash_fd)
         backup_fd = os.open(recovery_id, flags, dir_fd=trash_fd)
-        manifest = json.dumps({"workspace": str(target.root),
-                               "path": target.path.relative_to(target.root).as_posix()}, ensure_ascii=False).encode("utf-8")
+        manifest = json_text({"workspace": str(target.root),
+                              "path": target.path.relative_to(target.root).as_posix()}).encode("utf-8")
         manifest_fd = os.open("info.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                               0o600, dir_fd=backup_fd)
         try:

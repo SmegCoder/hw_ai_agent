@@ -2,8 +2,19 @@ from __future__ import annotations
 
 import difflib
 import json
+import os
+import re
+import shlex
+import shutil
 import sys
-from .planning import PlanApprovalDeferred
+from time import monotonic
+from datetime import date
+from itertools import count
+from pathlib import Path
+
+from .planning import PlanApprovalDeferred, PlanError
+from .pricing import amount, usd
+from .tasks import passing_tests, test_command
 from .session import SessionError
 from .tools import ToolError
 
@@ -12,23 +23,239 @@ def visible(value: str) -> str:
     return ''.join(c if c.isprintable() or c in '\n\t' else repr(c)[1:-1] for c in str(value))
 
 
-def confirm_plan(plan: dict) -> bool:
-    print('\nПлан работы:')
-    print('Цель: ' + visible(plan['goal']))
+def emphasis(text: str, style: str = "1") -> str:
+    if sys.stdout.isatty() and os.environ.get("TERM") != "dumb" and "NO_COLOR" not in os.environ:
+        return f"\x1b[{style}m{text}\x1b[0m"
+    return text
+
+
+def visible_line(value: str) -> str:
+    return visible(value).replace("\n", "\\n").replace("\t", "\\t")
+
+
+DIFF_HUNK = re.compile(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
+
+
+def color_diff(diff: str) -> str:
+    lines = []
+    remaining = 0
+    for line in visible(diff).splitlines(keepends=True):
+        hunk = DIFF_HUNK.match(line)
+        if hunk:
+            remaining = sum(int(count or "1") for count in hunk.groups())
+        elif remaining and line.startswith(" "):
+            remaining -= 2
+        elif remaining and line.startswith(("+", "-")):
+            remaining -= 1
+            ending = "\n" if line.endswith("\n") else ""
+            line = emphasis(line.removesuffix("\n"), "32" if line.startswith("+") else "31") + ending
+        lines.append(line)
+    return "".join(lines)
+
+
+class ProgressDisplay:
+    def __init__(self, enabled: bool = False):
+        self.enabled = enabled
+        self.started_at = monotonic()
+        self.target = ""
+        self.is_test = False
+
+    def render(self, event: dict) -> bool:
+        """Render a progress line when this event has useful information."""
+        kind = event["event"]
+        if kind in {"session_created", "session_resumed"}:
+            self.started_at = monotonic()
+            self.target, self.is_test = "", False
+        elif kind == "model_request":
+            self.line(f"Запрос к модели · {event['round']}")
+            return True
+        elif kind == "tool_call":
+            self.tool_start(event)
+        elif kind == "tool_result":
+            self.tool_result(event)
+        return False
+
+    def tool_start(self, event: dict) -> None:
+        self.target, self.is_test = "", False
+        name = event["name"]
+        try:
+            arguments = json.loads(event["arguments"])
+        except (ValueError, TypeError):
+            return
+        if not isinstance(arguments, dict):
+            return
+        target = arguments.get("command" if name in {"Bash", "bash"} else "path", ".")
+        if not isinstance(target, str):
+            return
+        self.target = visible_line(target)
+        if len(self.target) > 120:
+            self.target = self.target[:119] + "…"
+        if name in {"Bash", "bash"}:
+            try:
+                test_command(target)
+                self.is_test = True
+            except PlanError:
+                pass
+            self.line(f"{'Проверка' if self.is_test else 'Команда'} · {self.target}")
+        elif name in {"read_file", "list_files"}:
+            self.line(f"{'Чтение' if name == 'read_file' else 'Список файлов'} · {self.target}")
+
+    def tool_result(self, event: dict) -> None:
+        name, content = event["name"], event["content"]
+        if content.startswith("ERROR:"):
+            return
+        if name == "write_file" and content.startswith("wrote "):
+            self.line(f"Файл записан · {self.target}")
+        elif name == "delete_file" and content.startswith(("removed ", "already absent:")):
+            label = "Файл уже отсутствовал" if content.startswith("already absent:") else "Файл удалён"
+            self.line(f"{label} · {self.target}")
+        elif name in {"Bash", "bash"}:
+            if self.is_test and passing_tests(content):
+                self.line("Тесты прошли")
+            elif self.is_test and re.search(r"^Ran 0 tests? in ", content, re.MULTILINE):
+                self.line("Тесты не найдены")
+            else:
+                status = re.match(r"exit_code=(-?\d+)\n", content)
+                if status:
+                    label = "Успех тестов не подтверждён" if self.is_test else "Команда завершена"
+                    self.line(f"{label} · код {status[1]}")
+
+    def line(self, text: str) -> None:
+        minutes, seconds = divmod(int(monotonic() - self.started_at), 60)
+        print(f"{emphasis(f'{minutes:02}:{seconds:02}', '2')}  {text}", flush=True)
+
+
+def report_header(action, workspace: Path, settings, request: str | None = None) -> None:
+    command = f"agi {action}"
+    if request:
+        preview = visible_line(request)
+        if len(preview) > 100:
+            preview = preview[:97] + "…"
+        command += " " + shlex.quote(preview)
+    cwd = Path.cwd()
+    if workspace == cwd:
+        path = "."
+    elif workspace.is_relative_to(cwd):
+        path = "./" + workspace.relative_to(cwd).as_posix()
+    else:
+        path = str(workspace)
+    context = path
+    if settings is not None:
+        provider = {"openrouter": "OpenRouter", "openai": "OpenAI", "ollama": "Ollama"}.get(settings.provider, settings.provider)
+        context += f" · {provider} · {settings.model}"
+    print(emphasis(command, "1;36"))
+    print(emphasis(visible_line(context), "2"))
+
+
+def result_details(agent):
+    files, tests = {}, None
+    for item in agent.store.calls(agent.session_id):
+        function = item["call"]["function"]
+        name = function["name"]
+        if name not in {"write_file", "delete_file", "Bash", "bash"} or not item["result"]:
+            continue
+        try:
+            arguments = json.loads(function["arguments"])
+        except ValueError:
+            continue
+        if not isinstance(arguments, dict):
+            continue
+        if name in {"write_file", "delete_file"} and item["state"] == "completed":
+            path = arguments.get("path")
+            if isinstance(path, str):
+                files[path] = "записан" if name == "write_file" else "удалён"
+        elif name in {"Bash", "bash"}:
+            try:
+                test_command(arguments.get("command"))
+            except PlanError:
+                continue
+            tests = item["result"]["content"]
+    if agent.journal:
+        files = {}
+        for path, entry in agent.journal.entries().items():
+            before, after = entry["before"], entry["after"]
+            if before != after:
+                files[path] = "удалён" if after is None else "создан" if before is None else "обновлён"
+    return files, tests
+
+
+def report_answer(agent, answer: str, *, verbose: bool, chat: bool = False) -> None:
+    if verbose:
+        print("\n" + visible(answer))
+        return
+    files, tests = result_details(agent)
+    passed = passing_tests(tests) if tests is not None else False
+    count = re.search(r"^Ran ([1-9][0-9]*) tests? in ", tests, re.MULTILINE) if passed else None
+    all_passed = count is not None and tests.rstrip().endswith("\nOK")
+    if sys.stdout.isatty():
+        width = min(96, shutil.get_terminal_size().columns)
+        print("\n" + emphasis("─" * width, "2"))
+    print(emphasis("Задача выполнена" if files and all_passed else "Результат", "1;36"))
+    check = emphasis("✓", "32")
+    for path, operation in list(files.items())[:5]:
+        print(f"  {check}  {visible_line(path)} {operation}")
+    if len(files) > 5:
+        print(f"  …  Ещё файлов {len(files) - 5}")
+    if all_passed:
+        print(f"  {check}  Тесты прошли · {count[1]} из {count[1]}")
+    elif passed:
+        details = f" · запущено {count[1]}" if count else ""
+        print(f"  {check}  unittest завершился успешно{details}")
+    elif tests is not None and re.search(r"^Ran 0 tests? in ", tests, re.MULTILINE):
+        print("  ·  Тесты не найдены")
+    elif tests is not None:
+        print(f"  {emphasis('!', '33')}  Успех тестов не подтверждён")
+    elif files:
+        print("  ·  Тесты не запускались")
+
+    cost = agent.store.cost(agent.session_id)
+    unknown = cost["unknown_requests"]
+    known = unknown < cost["requests"]
+    value = "$0.00" if amount(cost["known_usd"]) == 0 else usd(cost["known_usd"])
+    if known and unknown:
+        value += f" · без данных по {unknown} запросам"
+    mark = check if known and not unknown else emphasis("·", "2")
+    print(f"  {mark}  Расход API · {value if known else 'неизвестно'}")
+    if files and agent.journal:
+        command = "/changes"
+        if not chat:
+            arguments = ["agi", "changes", agent.session_id]
+            if agent.store.path != Path(".agent/sessions.sqlite3").resolve():
+                arguments.extend(("--state-db", str(agent.store.path)))
+            command = shlex.join(arguments)
+        print(f"\n{emphasis('▶ Изменения', '36')} · {visible_line(command)}")
+    if answer.strip():
+        print("\n" + visible(answer))
+
+
+def confirm_plan(plan: dict, *, verbose=False) -> bool:
+    print('\n' + emphasis('План готов', '1;36'))
+    plan_text = visible if verbose else visible_line
+    print("Цель · " + plan_text(plan['goal']))
     for number, step in enumerate(plan['steps'], 1):
-        print(f"{number}. {visible(step['description'])}\n   Инструменты: {', '.join(step['tools'])}")
+        print(f"{number}. {plan_text(step['description'])}")
+        if verbose:
+            print(f"   Инструменты: {', '.join(step['tools'])}")
         if 'id' in step:
-            print('   Задача: ' + step['id'] + '; зависит от: ' + (', '.join(step['depends_on']) or '—'))
             verification = step['verification']
-            descriptions = {'file_written': 'Файл соответствует выполненной записи', 'file_read': 'Прочитано актуальное содержимое файла', 'file_absent': 'Файл отсутствует после удаления', 'tests_passed': 'Контрольные тесты проходят'}
+            descriptions = {'file_written': 'запись', 'file_read': 'чтение', 'file_absent': 'удаление',
+                            'tests_passed': 'тесты'}
             target = verification.get('path', verification.get('command', ''))
-            print('   Проверка: ' + descriptions[verification['kind']] + ': ' + visible(target))
+            details = [step['id']]
+            if step['depends_on']:
+                details.append("после " + ", ".join(step['depends_on']))
+            details.append(descriptions[verification['kind']] + " " + plan_text(target))
+            print("   " + " · ".join(details))
     for key, title in (('risks', 'Риски'), ('assumptions', 'Допущения'), ('done_criteria', 'Критерии готовности')):
-        print(title + ':')
-        for item in plan[key]:
-            print('  - ' + visible(item))
-        if not plan[key]:
-            print('  (не указаны)')
+        items = plan[key]
+        if verbose:
+            print(title)
+            for item in items:
+                print("  - " + visible(item))
+            if not items:
+                print("  (не указаны)")
+        elif items:
+            print(title + " · " + " · ".join(visible_line(item) for item in items))
     if not sys.stdin.isatty():
         raise PlanApprovalDeferred('План сохранён; запустите resume в терминале для утверждения')
     try:
@@ -45,12 +272,80 @@ def confirm_plan(plan: dict) -> bool:
         raise PlanApprovalDeferred('Ответ не получен; план сохранён без утверждения') from None
 
 
-def choose_session(store, identifier: str | None, *, include_completed=False, journal_only=False) -> str:
+def choose_workspace(root: Path) -> Path | None:
+    root = root.absolute()
+    try:
+        while True:
+            try:
+                folders = sorted((path for path in root.iterdir() if not path.is_symlink() and path.is_dir()),
+                                 key=lambda path: (path.name.casefold(), path.name))
+            except FileNotFoundError:
+                folders = []
+            choices = {str(number): path for number, path in enumerate(folders, 1)}
+            print(emphasis("Рабочая папка · workspace", "1;36"))
+            for number, path in choices.items():
+                print(f"  {number}. {visible_line(path.name)}")
+            if not choices:
+                print("  Папок пока нет.")
+            print("  Enter — создать папку с датой · n — создать папку со своим именем")
+            choice = input("Выбор › ").strip().casefold()
+            if not choice:
+                root.mkdir(parents=True, exist_ok=True)
+                today = date.today().isoformat()
+                for number in count(1):
+                    name = today if number == 1 else f"{today}-{number}"
+                    folder = root / name
+                    try:
+                        folder.mkdir()
+                    except FileExistsError:
+                        continue
+                    print(f"Создана папка · workspace/{name}")
+                    return folder
+            elif choice in {"n", "н"}:
+                name = input("Имя новой папки (Enter — назад) › ")
+                if not name:
+                    continue
+                if name in {".", ".."} or Path(name).name != name or "\x00" in name:
+                    print("Введите одно имя папки без пути.")
+                    continue
+                root.mkdir(parents=True, exist_ok=True)
+                folder = root / name
+                try:
+                    folder.mkdir()
+                except FileExistsError:
+                    print("Это имя уже занято. Выберите папку по номеру или введите другое имя.")
+                    continue
+                print(f"Создана папка · workspace/{visible_line(name)}")
+                return folder
+            elif choice in choices:
+                folder = choices[choice]
+                if not folder.is_symlink() and folder.is_dir():
+                    return folder
+                print("Папка больше недоступна. Выберите другую.")
+            else:
+                print("Введите номер из списка, n или нажмите Enter.")
+    except (EOFError, KeyboardInterrupt):
+        return None
+
+
+def choose_session(store, identifier: str | None, *, include_completed=False, journal_only=False, eligible=None) -> str:
     if identifier is not None:
         return identifier
     if not sys.stdin.isatty():
         raise SessionError('Без интерактивного терминала укажите SESSION_ID явно')
-    candidates = [s for s in store.list_sessions() if (include_completed or s['status'] not in {'completed', 'aborted','rolled_back'}) and (not journal_only or store.get(s['id']).metadata.get('journal_mode',False))][:20]
+    candidates = []
+    for session in store.list_sessions():
+        if not include_completed and session['status'] in {'completed', 'aborted', 'rolled_back', 'context_limit', 'budget_exhausted'}:
+            continue
+        if journal_only or eligible is not None:
+            metadata = store.get(session['id']).metadata
+            if journal_only and not metadata.get('journal_mode', False):
+                continue
+            if eligible is not None and not eligible(metadata):
+                continue
+        candidates.append(session)
+        if len(candidates) == 20:
+            break
     if not candidates:
         raise SessionError('Нет незавершённых сессий для продолжения')
     if len(candidates) == 1:
@@ -58,7 +353,7 @@ def choose_session(store, identifier: str | None, *, include_completed=False, jo
         return candidates[0]['id']
     print('\nВыберите сессию для продолжения:')
     for number, item in enumerate(candidates, 1):
-        print(f"{number}. {item['status']} | {visible(item['model'] or 'offline')} | {visible(item['workspace'])}")
+        print(f"{number}. {item['status']} | {visible(item['model'] or 'модель не указана')} | {visible(item['workspace'])}")
     try:
         while True:
             value = input('Номер сессии (Enter — отмена): ').strip()

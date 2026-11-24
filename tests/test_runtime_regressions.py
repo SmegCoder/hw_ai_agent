@@ -16,7 +16,7 @@ from hw_ai_agent.planning import PlanError
 from hw_ai_agent.policy import Policy
 from hw_ai_agent.session import SessionStore
 from hw_ai_agent.tasks import validate_task_plan
-from hw_ai_agent.tasks_demo import TASK_PLAN
+from agent_fixtures import TASK_PLAN
 from hw_ai_agent.tools import ToolError, ToolRuntime
 
 

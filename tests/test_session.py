@@ -324,19 +324,19 @@ class SessionCLITests(unittest.TestCase):
 
 
 @unittest.skipUnless(os.getenv("REQUIRE_SANDBOX_TESTS") == "1", "Requires native macOS sandbox")
-class SessionDemoTests(unittest.TestCase):
-    def test_interrupted_demo_is_resumed_without_repeating_write(self):
-        from hw_ai_agent.session_demo import run_session_demo
-        report = run_session_demo()
-        self.assertTrue(report["success"])
-
+class SessionCLIIntegrationTests(unittest.TestCase):
     def test_cli_pause_and_resume_use_the_same_session(self):
         from hw_ai_agent.cli import main
-        from hw_ai_agent.demo import initialize_demo
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             workspace = root / "workspace"
-            initialize_demo(workspace)
+            workspace.mkdir()
+            (workspace / "order.py").write_text("def calculate_total(prices, discount_percent): return sum(prices)\n")
+            test_file = workspace / "test_order.py"
+            tests = ("import unittest\nfrom order import calculate_total\n"
+                     "class OrderTest(unittest.TestCase):\n"
+                     "    def test_discount(self): self.assertEqual(calculate_total([100], 10), 90)\n")
+            test_file.write_text(tests)
             policy_file = root / "policy.json"
             policy_file.write_text(json.dumps({
                 "directories": {"allow": ["."], "deny": []},
@@ -377,6 +377,11 @@ class SessionDemoTests(unittest.TestCase):
                 writes = [c for c in store.calls(session_id) if c["call"]["function"]["name"] == "write_file"]
                 self.assertEqual(len(writes), 1)
                 self.assertEqual(writes[0]["state"], "completed")
+                test_result = next(c["result"]["content"] for c in store.calls(session_id)
+                                   if c["call"]["function"]["name"] == "Bash")
+                self.assertIn("exit_code=0", test_result)
+                self.assertIn("Ran 1 test", test_result)
+            self.assertEqual(test_file.read_text(), tests)
 
 
 if __name__ == "__main__":

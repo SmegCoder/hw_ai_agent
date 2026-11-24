@@ -1,9 +1,9 @@
 """USD estimates and usage accounting; unknown charges are never zero."""
 from __future__ import annotations
 
-import json
 from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
+from .text import json_text
 
 
 class PricingError(ValueError):
@@ -65,12 +65,12 @@ class Price:
 def estimate_tokens(messages, tools) -> int:
     # Includes history, tool arguments/results, schemas and an overhead allowance.
     # UTF-8 / 3 is a heuristic, not a provider tokenizer or a billing guarantee.
-    data = json.dumps({'messages': messages, 'tools': tools}, ensure_ascii=False).encode('utf-8')
+    data = json_text({'messages': messages, 'tools': tools}, allow_nan=True).encode('utf-8')
     return max(1, (len(data) + 2) // 3 + 32 * (len(messages) + len(tools)))
 
 
-def estimate(price: Price | None, messages, tools, max_tokens: int) -> dict:
-    prompt = estimate_tokens(messages, tools)
+def estimate(price: Price | None, messages, tools, max_tokens: int, *, input_tokens=None) -> dict:
+    prompt = estimate_tokens(messages, tools) if input_tokens is None else input_tokens
     low = price.calculate(prompt, 0) if price else None
     high = price.calculate(prompt, max_tokens) if price else None
     return {'input_tokens_estimate': prompt, 'output_tokens_limit': max_tokens,
@@ -101,7 +101,7 @@ def actual_cost(provider: str | None, price: Price | None, usage: dict, *, faile
     reported = amount(clean.get('cost'))
     if provider == 'openrouter' and reported is not None:
         value, kind = reported, 'reported'
-    elif provider in {'ollama', 'scripted'}:
+    elif provider == 'ollama':
         value, kind = Decimal(0), 'local'
     elif price and not usage.get('_nonstandard_tier') and 'prompt_tokens' in clean and 'completion_tokens' in clean:
         details = clean.get('prompt_tokens_details', {})

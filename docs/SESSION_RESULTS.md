@@ -21,11 +21,11 @@ SQLite `.agent/sessions.sqlite3` хранит задачу, историю, от
 ## Как пользоваться
 
 ```bash
-hw-ai-agent demo --provider ollama --model qwen3:4b --mode auto --stop-after-tools 1
-hw-ai-agent sessions
-hw-ai-agent resume
-hw-ai-agent session SESSION_ID
-hw-ai-agent resume SESSION_ID
+agi run --workspace /path/to/my-project --stop-after-tools 1 "Изучи проект"
+agi sessions
+agi resume
+agi session SESSION_ID
+agi resume SESSION_ID
 ```
 
 Пауза после сохранённого результата возвращает код 130. `resume` без ID в терминале
@@ -40,6 +40,8 @@ hw-ai-agent resume SESSION_ID
 Изменённая policy или несовместимое подключение блокируют продолжение.
 Можно менять `--cost-estimate`/`--no-cost-estimate`, `--approvals` и флаги паузы.
 Стоимость и общий бюджет не сбрасываются.
+Записи старых демонстраций доступны для просмотра через `session ID`.
+`resume` продолжает сессии обычных запусков с поддерживаемым провайдером.
 
 ## Утверждение плана
 
@@ -51,10 +53,10 @@ Enter оставляет её ожидающей. Решение и сообще
 Для автоматизации:
 
 ```bash
-hw-ai-agent approve-plan SESSION_ID
-hw-ai-agent resume SESSION_ID
+agi approve-plan SESSION_ID
+agi resume SESSION_ID
 # Альтернативное решение:
-hw-ai-agent reject-plan SESSION_ID
+agi reject-plan SESSION_ID
 ```
 
 ## Неопределённые вызовы
@@ -85,8 +87,8 @@ hw-ai-agent reject-plan SESSION_ID
 Для автоматизации ключ вызова берите из `unfinished_calls` команды `session`:
 
 ```bash
-hw-ai-agent resolve SESSION_ID --call CALL_KEY --resolution applied --changes own
-hw-ai-agent resume SESSION_ID
+agi resolve SESSION_ID --call CALL_KEY --resolution applied --changes own
+agi resume SESSION_ID
 ```
 
 `--changes` требуется для соответствующего конфликта журнала; без журнала
@@ -96,20 +98,9 @@ hw-ai-agent resume SESSION_ID
 ## Проверка
 
 ```bash
-hw-ai-agent session-demo
 REQUIRE_SANDBOX_TESTS=1 python -m unittest discover -s tests -v
 ```
 
-`SESSION DEMO PASS` подтверждает сохранение записи один раз, открытие базы заново,
-исполнение ожидающих тестов и неизменность контрольного файла. Клиент подставной,
-инструменты настоящие. Тесты дополнительно проверяют реальные аварии между
+Тесты проверяют реальные аварии между
 эффектом и результатом, решения неопределённых вызовов, сохранение плана,
 задач, бюджета и расхода. База использует схему версии 5; миграции сохраняют историю.
-
-## Сохранённый пример Ollama
-
-[session-ollama-demo-report.json](session-ollama-demo-report.json) содержит
-успешное продолжение с настоящей `qwen3:4b-instruct`: завершённый `list_files`
-не повторился, модель исправила код и запустила шесть тестов. Независимая проверка
-прошла, тестовый файл неизменён; итог — `DEMO PASS`.
-Это результат предыдущей версии, а не подтверждение всех текущих функций.

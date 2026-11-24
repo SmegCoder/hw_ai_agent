@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+import io
 import itertools
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from hw_ai_agent.agent import CodingAgent
 from hw_ai_agent.policy import Action, Policy, PolicyError
-from hw_ai_agent.policy_demo import run_policy_demo
 from hw_ai_agent.tools import ToolError, ToolRuntime
 
 
@@ -65,12 +66,6 @@ class PolicyTests(unittest.TestCase):
                     Policy.load(file)
             file.write_text(json.dumps({"defaults": {"write_file": "deny"}}))
             self.assertEqual(Policy.load(file).decide("write_file").action, Action.DENY)
-
-    def test_offline_policy_demo_passes(self):
-        report = run_policy_demo()
-        self.assertTrue(report["success"])
-        self.assertTrue(all(report["checks"].values()))
-
 
 class RuntimePolicyTests(unittest.TestCase):
     def setUp(self):
@@ -198,6 +193,43 @@ class TerminalApprovalTests(unittest.TestCase):
             with self.assertRaises(ApprovalDeferred):
                 confirm_action(request)
         prompt.assert_not_called()
+
+    def test_safe_bash_uses_one_prompt_and_displays_the_checked_directory(self):
+        from hw_ai_agent.cli import confirm_action
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "sub").mkdir()
+            runtime = ToolRuntime(root, mode="safe", approve=confirm_action)
+            with (patch("sys.stdin.isatty", return_value=True),
+                  patch("builtins.input", side_effect=["y", "n"]) as prompt,
+                  patch.object(runtime, "bash", return_value="ok") as bash,
+                  redirect_stdout(io.StringIO()) as output):
+                self.assertEqual(runtime.execute("Bash", {"command": "pwd"}), "ok")
+                with self.assertRaisesRegex(ToolError, "APPROVAL_REQUIRED"):
+                    runtime.execute("Bash", {"command": "pwd", "cwd": "sub"})
+            self.assertEqual(output.getvalue(), "")
+            self.assertEqual([item.args[0] for item in prompt.call_args_list],
+                             ["Выполнить pwd? [y/N] ", "Выполнить pwd (в sub)? [y/N] "])
+            bash.assert_called_once()
+
+    def test_verbose_approval_keeps_bash_details_and_compact_write_keeps_diff(self):
+        from hw_ai_agent.cli import confirm_action
+        from hw_ai_agent.policy import ApprovalRequest
+
+        bash = ApprovalRequest("Bash", "pwd", "safe mode requires approval for Bash",
+                               "Working directory: .\nCommand: pwd", "abc", working_directory=".")
+        write = ApprovalRequest("write_file", "order.py", "safe mode requires approval for write_file",
+                                "--- current\n+++ proposed\n-old\n+new", "def")
+        with (patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="y"),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertTrue(confirm_action(bash, verbose=True))
+            self.assertTrue(confirm_action(write))
+        self.assertIn("SHA-256 запроса: abc", output.getvalue())
+        self.assertIn("Working directory: .", output.getvalue())
+        self.assertIn("Запись · order.py", output.getvalue())
+        self.assertIn("+new", output.getvalue())
+        self.assertNotIn("SHA-256 запроса: def", output.getvalue())
 
     def test_policy_inside_workspace_is_rejected(self):
         from hw_ai_agent.cli import load_policy

@@ -11,10 +11,6 @@ build/
 .env
 .env.*
 !.env.example
-workspace/demo-*/
-workspace/workflow-*/
-workspace/plan-demo-*/
 .agent/
 .DS_Store
-workspace/tasks-demo-*/
-workspace/rollback-demo-*/
+workspace

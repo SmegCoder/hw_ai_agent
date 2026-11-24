@@ -44,7 +44,7 @@ def load_env(path: Path) -> None:
 
 
 def load_launch_env(path: Path) -> None:
-    """Offline demos need launch defaults, but not provider settings or keys."""
+    """Load launch options without importing provider credentials."""
     if not path.exists():
         return
     allowed = {option.env for option in LAUNCH_OPTIONS.values()}
@@ -78,12 +78,13 @@ LAUNCH_OPTIONS = {
     "journal": LaunchOption("AGENT_JOURNAL", False, bool),
     "route": LaunchOption("AGENT_ROUTE", False, bool),
     "cost_estimate": LaunchOption("AGENT_COST_ESTIMATE", True, bool),
+    "progress": LaunchOption("AGENT_PROGRESS", False, bool),
     "route_simple_model": LaunchOption("AGENT_ROUTE_SIMPLE_MODEL", None, str),
     "route_medium_model": LaunchOption("AGENT_ROUTE_MEDIUM_MODEL", None, str),
     "route_complex_model": LaunchOption("AGENT_ROUTE_COMPLEX_MODEL", None, str),
 }
 
-START_COMMANDS = {"run", "plan", "demo", "plan-demo", "workflow-demo", "tasks-demo", "rollback-demo"}
+START_COMMANDS = {"run", "plan", "chat"}
 
 
 def option_value(name: str, value):
@@ -124,22 +125,14 @@ def validate_explicit_options(args) -> None:
 
 
 def apply_launch_defaults(args) -> None:
-    """CLI > process environment > .env (loaded earlier) > legacy defaults."""
+    """CLI > process environment > .env (loaded earlier) > built-in defaults."""
     for name, option in LAUNCH_OPTIONS.items():
         if not hasattr(args, name) or getattr(args, name) is not None:
             continue
-        # Demo workspaces are fresh fixtures, never the configured user's project.
-        env_value = None if name == "workspace" and args.action not in {"run", "plan"} else os.getenv(option.env)
-        default = option.default
-        if name == "max_rounds":
-            default = 30 if args.action == "tasks-demo" else 20 if args.action in {"workflow-demo", "plan-demo", "rollback-demo"} else 12
-        if name == "max_tokens" and args.action == "tasks-demo":
-            default = 3072
-        setattr(args, name, option_value(name, env_value if env_value is not None else default))
+        env_value = os.getenv(option.env)
+        setattr(args, name, option_value(name, env_value if env_value is not None else option.default))
     if args.action == "plan" or getattr(args, "tasks", False):
         args.plan = True
-    if args.action == "rollback-demo":
-        args.journal = True
 
 
 def initial_launch_values() -> dict[str, str]:
@@ -236,7 +229,7 @@ def set_options(args) -> dict[str, str]:
             raise ConfigurationError("Неизвестный провайдер; укажите --provider")
         updates[f"{provider.upper()}_MODEL"] = args.model
     if not updates:
-        raise ConfigurationError("Укажите настройку, например: hw-ai-agent set --provider ollama")
+        raise ConfigurationError("Укажите настройку, например: agi set --provider ollama")
     update_env(args.env_file, updates)
     return updates
 
@@ -258,7 +251,7 @@ class Settings:
             raise ConfigurationError(f"Set {provider.upper()}_MODEL or pass --model")
         key = os.getenv(key_name, "") if key_name else "ollama"
         if key_name and not key:
-            raise ConfigurationError(f"Set {key_name}: run hw-ai-agent setup --provider {provider}")
+            raise ConfigurationError(f"Set {key_name}: run agi setup --provider {provider}")
         url = os.getenv(f"{provider.upper()}_BASE_URL", default_url).rstrip("/")
         parsed = urlparse(url)
         if parsed.username or parsed.password or parsed.query or parsed.fragment:

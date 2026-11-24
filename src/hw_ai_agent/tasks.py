@@ -20,8 +20,8 @@ class TaskError(ToolError):
 
 
 TASK_INSTRUCTIONS = '''
-Task mode is enabled. This overrides the instruction to finish immediately after
-passing tests: first complete the current task with complete_task(task_id).
+Task mode is enabled. Complete the current task with complete_task(task_id)
+after collecting its evidence, before moving on or giving a final answer.
 Every submit_plan step must include id, description, tools, depends_on and
 verification. IDs must be unique. Dependencies must form an acyclic graph.
 Verification is one of {"kind":"file_written","path":"relative/file.py"},
@@ -29,8 +29,9 @@ Verification is one of {"kind":"file_written","path":"relative/file.py"},
 {"kind":"file_absent","path":"relative/unused.py"}, or
 {"kind":"tests_passed","command":"python -m unittest discover -v","cwd":"."}.
 Use file_read for investigation, file_written for a code change, file_absent
-for deletion, tests_passed
-for testing. Include the corresponding tool in each task's tools.
+for deletion, and tests_passed only for a task with relevant existing tests.
+If the workspace has no relevant tests, omit the test task and verify the code
+changes using file_written. Include the corresponding tool in each task's tools.
 Only execute the CURRENT_TASK selected by runtime; you cannot select a task.
 complete_task must be the LAST call in its batch. It checks actual tool evidence;
 your own text is not evidence. Correct errors and retry verification if needed.

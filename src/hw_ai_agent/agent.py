@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import copy
 import json
+import time
 import uuid
 from collections.abc import Callable
 from collections.abc import Mapping
 from typing import Any
 
-from .client import ModelClient
-from .pricing import Price, estimate, actual_cost, clean_usage, cost_summary
+from .client import MAX_RETRY_DELAY, ModelClient, ModelClientError
+from .text import escape_surrogates, has_surrogates
+from .pricing import Price, estimate, estimate_tokens, actual_cost, clean_usage, cost_summary
 from .tools import ToolError, ToolRuntime
 from .policy import ApprovalDeferred, Policy
 from .session import SessionError, SessionStore, UncertainActionError, PlanRejectedError
@@ -20,17 +22,31 @@ from .planning import PLAN_SCHEMA, PLAN_INSTRUCTIONS, validate_plan, PlanError, 
 
 DEFAULT_SYSTEM_PROMPT = """You are a careful coding agent.
 Use the provided tools to inspect and modify only the workspace.
-Run the relevant tests after changes.
-Tests are read-only. Never modify, rename or delete them.
+Choose the smallest useful implementation that meets the request. Avoid
+unrequested features, extra files and repeated rewrites.
 You may create, edit or remove workspace files when justified by the task.
-For testing, call Bash with python -m unittest discover -v.
+Tests are read-only. Do not create, modify, rename or delete test files.
+When relevant existing tests are available, run them after the changes using
+Bash with a supported python -m unittest command. Testing is optional when the
+workspace has no relevant tests or the user asks to skip it. If no tests exist,
+or unittest reports zero tests, stop checking and finish the task. Briefly say
+what was not tested. Do not retry discovery or add tests to application code
+to work around the restriction.
 Bash accepts ONLY python -m unittest, pwd, ls, cat and sleep.
 Do not use python -c, run scripts, or create scratch check scripts.
 Use path='.' for list_files; never use an empty path.
-After relevant tests pass, immediately provide your final summary without more tool calls.
+After the requested work and any applicable checks are complete, provide your
+final summary without further tool calls.
 When a tool reports an error, correct the request or explain the limitation.
 Runtime permissions are authoritative. If the operator refuses an action,
 do not retry it or find a workaround; explain the refusal in your final answer.
+
+Keep final replies brief and use the user's language. After working in the
+workspace, default to one or two short sentences: name the result and mention
+the test outcome or an important blocker when relevant. Do not recap the plan,
+list routine steps, repeat the conclusion, or paste code already written to a
+file. Give more detail only when the user asks for it or needs it to act.
+If the user asks for code in the reply, provide the code with minimal commentary.
 """
 
 
@@ -38,8 +54,15 @@ class AgentError(RuntimeError):
     """Raised when the agent loop cannot finish safely."""
 
 
+class ContextWindowExceeded(AgentError):
+    pass
+
+
 class AgentBudgetExceeded(BudgetExceeded, AgentError, SessionError):
     pass
+
+
+MAX_MODEL_RETRIES = 2
 
 
 class CodingAgent:
@@ -105,11 +128,11 @@ class CodingAgent:
         runtime._original_agent_policy_callback = self._original_policy_callback
         runtime.on_policy_event = self._policy_event
 
-    def run(self, request: str) -> str:
+    def run(self, request: str, *, history=(), conversation_id: str | None = None) -> str:
         if not request.strip():
             raise ValueError("request must not be empty")
-        if (self.plan_mode or self.journal_mode) and not self.store:
-            raise SessionError("Plan Mode requires a session store")
+        if (self.plan_mode or self.journal_mode or conversation_id) and not self.store:
+            raise SessionError("Planning, journaling and chat require a session store")
         self.runtime.phase = "planning" if self.plan_mode else "execution"
         self.events = []
         self._memory_budget = MemoryBudget(self.budget_limits)
@@ -118,15 +141,17 @@ class CodingAgent:
         self.runtime.session_permissions = set()
         self.messages = [
             {"role": "system", "content": self.system_prompt + (PLAN_INSTRUCTIONS if self.plan_mode else "") + (TASK_INSTRUCTIONS if self.task_mode else "")},
-            {"role": "user", "content": request},
+            *copy.deepcopy(list(history)),
+            {"role": "user", "content": escape_surrogates(request)},
         ]
         if self.store:
-            self.session_id = self.store.create(self._binding(), self.messages, self.max_rounds, self.max_context_chars, self.budget_limits)
+            self.session_id = self.store.create(self.binding(), self.messages, self.max_rounds, self.max_context_chars,
+                                                self.budget_limits, conversation_id=conversation_id)
             return self._stored_run(self.session_id, "session_created")
         return self._loop(0)
 
-    def _binding(self) -> dict:
-        allowed_metadata = {"kind", "policy_path", "policy_source", "approvals", "max_tokens", "demo"}
+    def binding(self) -> dict:
+        allowed_metadata = {"kind", "policy_path", "policy_source", "approvals", "max_tokens"}
         if set(self.session_metadata) - allowed_metadata:
             raise SessionError("Unsupported session metadata fields")
         metadata = {**self.session_metadata, "workspace": str(self.runtime.root),
@@ -152,7 +177,7 @@ class CodingAgent:
         return metadata
 
     def _check_binding(self, metadata: dict):
-        current = self._binding()
+        current = self.binding()
         for key in ("workspace", "policy", "runtime_limits", "provider", "model", "base_url", "max_tokens"):
             expected = Policy.restore(metadata[key]).as_dict() if key == "policy" else metadata.get(key)
             if expected != current.get(key):
@@ -174,6 +199,8 @@ class CodingAgent:
             if state.status in {"aborted", "rolled_back"}:
                 raise SessionError("This session was terminated by the operator and cannot be resumed")
             self.store.budget(session_id)  # Validate saved counters before model or tool access.
+            if state.status == "context_limit":
+                raise ContextWindowExceeded(state.error or "Достигнут лимит контекста")
             if state.status == "budget_exhausted":
                 raise SessionError(state.error or "BUDGET_EXHAUSTED: saved budget was exhausted")
             self._check_binding(state.metadata)
@@ -253,6 +280,7 @@ class CodingAgent:
                 return self._loop(state.rounds)
             except BaseException as exc:
                 status = ("journal_conflict" if isinstance(exc, JournalError) else
+                          "context_limit" if isinstance(exc, ContextWindowExceeded) else
                           "budget_exhausted" if isinstance(exc, BudgetExceeded) else
                           "blocked" if isinstance(exc, UncertainActionError) else
                           "waiting_plan_approval" if isinstance(exc, PlanApprovalDeferred) else
@@ -260,7 +288,9 @@ class CodingAgent:
                           "waiting_approval" if isinstance(exc, ApprovalDeferred) else
                           "interrupted" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else "failed")
                 try:
-                    self.store.set_status(session_id, status, str(exc) if isinstance(exc, (BudgetExceeded, JournalError)) else type(exc).__name__)
+                    error = (str(exc) if isinstance(exc, (BudgetExceeded, JournalError, ContextWindowExceeded,
+                                                           ModelClientError)) else type(exc).__name__)
+                    self.store.set_status(session_id, status, error)
                     if isinstance(exc, BudgetExceeded):
                         self._emit_budget()
                 except SessionError:
@@ -273,42 +303,77 @@ class CodingAgent:
             for item in self.store.calls(self.session_id, True):
                 self._registered_call(item)
             self._review_plan()
+        warned = False
+        retries = 0
         while rounds < self.max_rounds:
-            if len(json.dumps(self.messages, ensure_ascii=False)) > self.max_context_chars:
-                raise AgentError("Conversation exceeds the context size limit")
-            if self.store and self.session_id:
-                rounds = self.store.start_model(self.session_id)
-            else:
-                self._memory_budget.charge(model_requests=1)
-                rounds += 1
-            self._emit({"event": "model_request", "round": rounds}, persist=False)
-            self._emit_budget()
             schemas = self.runtime.tool_schemas
             if self.runtime.phase == "planning":
                 schemas = [*schemas, copy.deepcopy(TASK_PLAN_SCHEMA if self.task_mode else PLAN_SCHEMA)]
             elif self.task_mode:
                 task = self.store.current_task(self.session_id)
                 schemas = ([schema for schema in schemas if schema["function"]["name"] in task["tools"]] + copy.deepcopy(TASK_SCHEMAS)) if task else []
+            input_tokens = estimate_tokens(self.messages, schemas)
+            max_tokens = self.session_metadata.get("max_tokens", getattr(self.client, "max_tokens", 2048))
+            context_limit = getattr(self.client, "context_window", None)
+            window = context_limit if type(context_limit) is int and context_limit > 0 else None
+            projected = input_tokens + max_tokens
+            if window is not None and projected > window:
+                raise ContextWindowExceeded(
+                    f"Оценка контекста ≈{projected:,} из {window:,} токенов с учётом резерва ответа. "
+                    "Запрос не отправлен."
+                )
+            if window is not None and not warned and projected * 5 >= window * 4:
+                self._emit({"event": "context_warning", "projected": projected, "window": window})
+                warned = True
+            if len(json.dumps(self.messages, ensure_ascii=False)) > self.max_context_chars:
+                raise ContextWindowExceeded("История превышает внутренний лимит размера агента. Запрос не отправлен.")
+            if self.store and self.session_id:
+                rounds = self.store.start_model(self.session_id, input_tokens_estimate=input_tokens)
+            else:
+                self._memory_budget.charge(model_requests=1)
+                rounds += 1
+            self._emit({"event": "model_request", "round": rounds}, persist=False)
+            self._emit_budget()
             price = getattr(self.client, "price", None)
             provider = getattr(getattr(self.client, "settings", None), "provider", getattr(self.client, "billing_provider", None))
-            if price is None and provider in {'ollama', 'scripted'}:
-                price = Price('0', '0', source='local API / offline')
+            if price is None and provider == 'ollama':
+                price = Price('0', '0', source='local API')
             if self.cost_estimate:
                 self._emit({"event": "model_cost_estimate", "round": rounds,
-                            **estimate(price, self.messages, schemas, self.session_metadata.get('max_tokens', getattr(self.client, "max_tokens", 2048)))})
+                            **estimate(price, self.messages, schemas, max_tokens, input_tokens=input_tokens)})
             previous_usage = len(getattr(self.client, "usage", []))
             failed = True
+            failure = None
             try:
                 response = self.client.complete(self.messages, schemas)
                 failed = False
+            except ModelClientError as exc:
+                failure = exc
             finally:
                 usages = getattr(self.client, "usage", [])
                 latest = usages[-1] if len(usages) > previous_usage else {}
                 cost = actual_cost(provider, price, latest, failed=failed)
                 self._emit({"event": "model_cost", "round": rounds, **cost})
-                if latest:
-                    self._emit({"event": "model_usage", "usage": clean_usage(latest)})
+                usage = clean_usage(latest)
+                if usage or not failed:
+                    estimated_output = None
+                    if not failed and not {"total_tokens", "completion_tokens"}.intersection(usage):
+                        estimated_output = max(1, (len(str(response).encode("utf-8", errors="replace")) + 2) // 3)
+                    self._emit({"event": "model_usage", "round": rounds, "usage": usage,
+                                "output_tokens_estimate": estimated_output})
                 self._emit({"event": "session_cost", "cost": cost_summary(self.events, rounds)}, persist=False)
+            if failure is not None:
+                wait = failure.retry_after
+                if (wait is None or wait > MAX_RETRY_DELAY or latest or
+                        rounds >= self.max_rounds or retries >= MAX_MODEL_RETRIES):
+                    raise failure
+                delay = max(wait, 2 ** retries)
+                retries += 1
+                self._emit({"event": "model_retry", "round": rounds, "retry": retries,
+                            "limit": MAX_MODEL_RETRIES, "delay": delay, "error": str(failure)})
+                time.sleep(delay)
+                continue
+            retries = 0
             assistant = self._assistant_message(response)
             tool_calls = assistant.get("tool_calls") or []
             for call in tool_calls:
@@ -366,6 +431,7 @@ class CodingAgent:
         if not saved:
             return
         if saved["state"] == "awaiting_approval":
+            self.store.set_status(self.session_id, "waiting_plan_approval")
             if self.task_mode:
                 self._emit({"event": "tasks", "tasks": self.store.tasks(self.session_id)}, persist=False)
             self._emit({"event": "plan_waiting", "plan": saved["data"]})
@@ -469,9 +535,10 @@ class CodingAgent:
     def _assistant_message(response: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(response, Mapping):
             raise AgentError("model returned an invalid assistant message")
+        content = response.get("content")
         message: dict[str, Any] = {
             "role": "assistant",
-            "content": response.get("content"),
+            "content": escape_surrogates(content) if isinstance(content, str) else content,
         }
         tool_calls = response.get("tool_calls")
         if tool_calls is not None:
@@ -485,10 +552,11 @@ class CodingAgent:
                 if not isinstance(call, Mapping) or not isinstance(call.get("function"), Mapping):
                     raise AgentError("Malformed tool call from model")
                 function = call["function"]
-                if not isinstance(function.get("name"), str) or not function["name"]:
-                    raise AgentError("Tool call is missing its function name")
+                if (not isinstance(function.get("name"), str) or not function["name"]
+                        or has_surrogates(function["name"])):
+                    raise AgentError("Tool call has an invalid function name")
                 call_id = call.get("id") or "call_" + uuid.uuid4().hex
-                if not isinstance(call_id, str) or call_id in seen_ids:
+                if not isinstance(call_id, str) or has_surrogates(call_id) or call_id in seen_ids:
                     raise AgentError("Invalid or duplicate tool call ID")
                 seen_ids.add(call_id)
                 arguments = function.get("arguments", "{}")
@@ -544,6 +612,8 @@ class CodingAgent:
             name = str(function.get("name") or "unknown")
             raw_arguments = function.get("arguments", "{}")
             if isinstance(raw_arguments, str):
+                if has_surrogates(raw_arguments):
+                    raise ToolError("Tool arguments must contain valid UTF-8 text")
                 arguments = json.loads(raw_arguments)
             else:
                 arguments = raw_arguments

@@ -1,4 +1,4 @@
-# hw-ai-agent
+# agi
 
 Консольный coding agent на Python: получает задачу, изучает файлы, предлагает
 план, изменяет код и запускает проверку. Цикл работы и управление инструментами
@@ -18,9 +18,10 @@ OpenAI-совместимый Chat Completions API.
 - Общие бюджеты запросов к модели, инструментов, действий и объёма результатов.
 - Задачи с зависимостями, чек-листом и проверкой фактического результата.
 - Журнал изменений, просмотр diff и откат с обнаружением внешних правок.
+- Компактный терминальный вывод, цветной diff и опциональный ход работы.
 - Предварительная оценка стоимости, учёт расхода сессии, сравнение тарифов моделей.
 - Выбор модели в терминале и автоматический выбор по сложности задачи при старте.
-- Настройки через `.env` и CLI, русская справка, демонстрации и автоматические тесты.
+- Настройки через `.env` и CLI, русская справка и автоматические тесты.
 
 ## Установка
 
@@ -30,36 +31,36 @@ cd hw_ai_agent
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e .
-hw-ai-agent help
+agi help
 ```
 
 `python3` должен быть версии 3.11 или новее. В PyCharm выберите интерпретатор
 `.venv/bin/python`. Все команды ниже запускаются из корня проекта с активированной
-`.venv`. Можно также использовать `python -m hw_ai_agent` вместо `hw-ai-agent`.
+`.venv`. Можно также использовать `python -m hw_ai_agent` вместо `agi`.
 
 ## Подключение модели
 
 Для нового файла настроек:
 
 ```bash
-hw-ai-agent setup --provider openrouter --model deepseek/deepseek-v3.2
-hw-ai-agent doctor --provider openrouter
-hw-ai-agent demo --provider openrouter --mode safe
+agi setup --provider openrouter --model deepseek/deepseek-v3.2
+agi doctor --provider openrouter
+agi run --workspace /path/to/my-project "Объясни устройство проекта"
 ```
 
 `setup` запрашивает ключ скрытым вводом и создаёт `.env` с правами `0600`.
 Существующий файл не перезаписывается. Если `.env` уже настроен, пропустите
 `setup`; параметры меняйте через `set`, ключи — локально в файле.
-`doctor` проверяет настройки и доступность сервиса. `demo` обращается к настоящей модели.
+`doctor` проверяет песочницу и настройки. Для Ollama он также проверяет доступность сервера и модели.
 
 Для другого провайдера можно создать отдельный профиль:
 
 ```bash
-hw-ai-agent setup --env-file .env.openai --provider openai --model gpt-4.1-mini
-hw-ai-agent demo --env-file .env.openai --provider openai --mode safe
+agi setup --env-file .env.openai --provider openai --model gpt-4.1-mini
+agi run --env-file .env.openai --workspace /path/to/my-project "Объясни устройство проекта"
 
-hw-ai-agent setup --env-file .env.ollama --provider ollama --model qwen3:4b
-hw-ai-agent demo --env-file .env.ollama --provider ollama --mode auto
+agi setup --env-file .env.ollama --provider ollama --model qwen3:4b
+agi run --env-file .env.ollama --workspace /path/to/my-project "Объясни устройство проекта"
 ```
 
 Для Ollama заранее запустите локальный сервер и загрузите модель с поддержкой
@@ -73,10 +74,10 @@ tools. ID должен совпадать с установленным тего
 ключи, policy и база сессий должны находиться вне этой папки.
 
 ```bash
-hw-ai-agent run --workspace /path/to/my-project \
+agi run --workspace /path/to/my-project \
   "Исправь расчёт суммы заказа и проверь существующими unittest-тестами"
 
-hw-ai-agent plan --workspace /path/to/my-project --mode safe \
+agi plan --workspace /path/to/my-project --mode safe \
   --tasks --journal --max-rounds 30 --max-tokens 4096 \
   "Исправь расчёт суммы заказа и проверь существующими unittest-тестами"
 ```
@@ -87,9 +88,114 @@ hw-ai-agent plan --workspace /path/to/my-project --mode safe \
 план, `n` отклоняет и завершает сессию, Enter оставляет её на паузе.
 `run --plan` включает то же поведение. `--tasks` автоматически включает планирование.
 
-План содержит цель, шаги, нужные инструменты, риски, предположения и критерии
-завершения. При режиме задач шаги дополнительно получают ID, зависимости и
-проверку результата. План и решение пользователя сохраняются в SQLite.
+План содержит цель, короткие шаги и критерии готовности. Существенные риски
+и допущения показаны перед утверждением. При режиме задач шаги дополнительно
+получают ID, зависимости и проверку результата. План и решение пользователя
+сохраняются в SQLite.
+
+Агент запускает подходящие существующие тесты. Если их нет, он может закончить
+правку и сообщить, что тесты не запускались. В режиме задач для такой правки
+используется проверка записи файла.
+
+### Выбор рабочей папки
+
+Запустите `agi run "Задача"`, `agi plan "Задача"` или `agi chat` в терминале.
+Без `--workspace` агент покажет папки внутри `./workspace`.
+
+- Введите номер, чтобы открыть существующую папку.
+- Нажмите Enter, чтобы создать папку с сегодняшней датой, например `2026-11-24`.
+  При повторном запуске в тот же день агент добавит суффикс `-2`, `-3` и так далее.
+- Введите `n`, чтобы создать папку со своим именем.
+
+Явный `--workspace` пропускает выбор. При запуске из скрипта используется
+`AGENT_WORKSPACE` из настроек или `./workspace`. Продолжение сессии открывает
+сохранённую рабочую папку.
+
+### Компактный вывод
+
+У каждого запуска `run` или `plan` своя сессия. В начале CLI показывает
+команду, рабочую папку и модель. В конце отдельный блок перечисляет файлы,
+результат тестов и расход API. Если запустить с `--journal`, в блоке появится
+команда просмотра diff. В диалоге для этого есть `/changes`.
+
+В режиме `safe` CLI показывает diff перед подтверждением записи и отдельно
+спрашивает разрешение на Bash. В diff добавленные строки зелёные, а удалённые
+красные. Та же подсветка работает в `agi changes` и `/changes`. При
+`NO_COLOR=1` и перенаправлении вывода остаётся обычный текст со знаками `+` и `-`.
+
+### Ход работы
+
+Для длинных запросов добавьте `--progress`. По мере работы CLI покажет время
+от начала запроса, обращения к модели, чтение и правки файлов, команды и
+результаты тестов. После запроса выводится обычный компактный итог.
+
+```bash
+agi run --progress --workspace /path/to/my-project "Исправь ошибку и проверь"
+agi chat --progress
+agi resume --progress ID
+```
+
+Чтобы включить ход работы по умолчанию, задайте `AGENT_PROGRESS=true` в `.env`
+или выполните `agi set --progress`. Флаг `--no-progress` выключает его при
+конкретном запуске. `--verbose` включает подробный вывод с бюджетами,
+аргументами инструментов и решениями о разрешениях. Если заданы оба флага,
+используется подробный вывод.
+
+## Диалог с агентом
+
+```bash
+agi chat --workspace /path/to/my-project
+agi chat --resume ID
+```
+
+Введите запрос после приглашения `Вы ›`. Следующие запросы получают ваши
+предыдущие сообщения и итоговые ответы агента. Каждый запрос имеет свой бюджет
+и журнал рабочей папки. Снимок создаётся перед выполнением, а правки сохраняются
+после изменяющих действий. У журнала действуют те же правила доступа и проверки
+внешних правок, что у обычного `rollback`.
+
+| Команда | Действие |
+| --- | --- |
+| `/plan ТЕКСТ` | Сначала утвердить план для этого запроса |
+| `/changes` | Посмотреть последние сохранённые правки |
+| `/rollback` | Откатить последний запрос с правками, затем продолжить диалог. Если есть приостановленный запрос, отмена сначала относится к нему. |
+| `/tokens` | Показать суммарный расход токенов за все обращения в диалоге |
+| `/settings` | Показать настройки диалога |
+| `/set ИМЯ ЗНАЧЕНИЕ` | Изменить настройку и сохранить её в диалоге |
+| `/resume` | Довести до конца приостановленный запрос |
+| `/stop` или Ctrl+C | Поставить диалог на паузу и получить команду повторного открытия |
+| `/end` | Окончательно закрыть диалог и сохранить историю |
+| `/help` | Показать команды |
+
+Например, `/set mode safe` включает проверку записи файлов и запуска Bash,
+`/set approvals deny` автоматически отклоняет действия, требующие подтверждения,
+а `/set max-tool-calls 20` ограничивает каждый новый запрос двадцатью вызовами
+инструментов. Также можно менять `max-rounds`, `max-side-effects` и `max-tokens`.
+Настройки сохраняются после `agi chat --resume ID`. Команда `/resume` продолжает
+уже начатый запрос с параметрами его контрольной точки.
+
+`/set progress true` включает ход работы в диалоге, а `/set progress false`
+выключает его. Это настройка вывода, поэтому она применяется и при `/resume`.
+При повторном открытии чата используется сохранённое значение. Флаги
+`--progress` и `--no-progress` у `agi chat --resume ID` действуют на текущее открытие.
+
+После ответа чат показывает суммарный расход токенов одной строкой. При откате
+ранее учтённые токены остаются в счётчике. Знак `≈` означает, что часть данных
+пришлось оценить.
+
+Чат показывает окно контекста модели из каталога OpenRouter при открытии.
+Агент перед каждым обращением оценивает
+размер истории, схем инструментов и резерв под ответ. При 80% окна появляется
+предупреждение. Если оценка выше предела, запрос останавливается до отправки.
+Оценка приблизительная. При переполнении можно сократить новый запрос или
+открыть новый диалог с большим контекстом. История сохраняется без автоматического
+сжатия.
+
+При временном сбое OpenRouter агент повторяет обращение до двух раз, пока
+позволяет лимит обращений к модели. Если сервер прислал `Retry-After`, агент
+ждёт указанное время до 30 секунд или сообщает, когда можно повторить запрос.
+После ошибки чат показывает причину и предлагает `/resume`, если ещё есть
+доступные обращения к модели.
 
 ## Режимы и policy
 
@@ -105,16 +211,15 @@ hw-ai-agent plan --workspace /path/to/my-project --mode safe \
 В Auto для записи/Bash отдельного разрешения на сессию нет. Явный `deny` действует
 в обоих режимах и не может быть отменён ответом пользователя.
 
-Перед записью показывается diff, перед удалением — цель и размер.
+Перед подтверждением записи показывается цветной diff, перед удалением — цель и размер.
 `--approvals ask` задаёт вопросы; `--approvals deny` отклоняет действия, требующие
 этого подтверждения. Это не автоматическое согласие. Утверждение плана и решения
 конфликтов задаются отдельно. Если нужен ответ, а stdin не является терминалом,
 ожидание сохраняется и запуск останавливается с кодом 130; продолжите через `resume`.
 
 ```bash
-hw-ai-agent run --workspace /path/to/my-project --mode safe \
+agi run --workspace /path/to/my-project --mode safe \
   --policy policies/readonly.json "Объясни устройство проекта"
-hw-ai-agent demo --mode auto --policy policies/demo.json --approvals deny
 ```
 
 Готовые профили:
@@ -123,7 +228,6 @@ hw-ai-agent demo --mode auto --policy policies/demo.json --approvals deny
 | --- | --- |
 | [readonly.json](policies/readonly.json) | Только список и чтение; изменения и Bash запрещены |
 | [review.json](policies/review.json) | Просмотр и правки с ограниченным набором команд; каталог `private` закрыт |
-| [demo.json](policies/demo.json) | Запись только `order.py`, конкретная команда тестов, удаление запрещено |
 
 JSON-policy задаёт `defaults`, `rules` и `directories.allow/deny`. Приоритет решений
 — `deny`, затем `ask`, затем `allow`. Загруженный файл является полной конфигурацией:
@@ -151,11 +255,11 @@ Bash допускает ограниченные команды: `python -m unit
 ## Сессии, пауза и продолжение
 
 ```bash
-hw-ai-agent plan --workspace /path/to/my-project --stop-after-tools 2 "Исправь ошибку"
-hw-ai-agent sessions
-hw-ai-agent resume
-hw-ai-agent session SESSION_ID
-hw-ai-agent resume SESSION_ID
+agi plan --workspace /path/to/my-project --stop-after-tools 2 "Исправь ошибку"
+agi sessions
+agi resume
+agi session SESSION_ID
+agi resume SESSION_ID
 ```
 
 Без ID `resume` в интерактивном терминале выбирает единственную незавершённую
@@ -213,8 +317,7 @@ SQLite хранит историю, вызовы и результаты, пла
 `--max-rounds` и `--max-tokens` должны быть не меньше 1; три остальных бюджета
 могут быть нулевыми. Bash учитывается как потенциальный побочный эффект, хотя
 песочница запрещает ему запись. `--max-tokens` не задаёт контекст, общий объём
-токенов или денежный лимит. Отдельные исходные и итоговые проверки демо выполняются
-проверяющим кодом вне бюджета агента.
+токенов или денежный лимит.
 
 ## Задачи с зависимостями
 
@@ -241,9 +344,9 @@ SQLite хранит историю, вызовы и результаты, пла
 Для старого запуска без журнала откат недоступен.
 
 ```bash
-hw-ai-agent plan --workspace /path/to/my-project --journal "Исправь ошибку"
-hw-ai-agent changes
-hw-ai-agent rollback
+agi plan --workspace /path/to/my-project --journal "Исправь ошибку"
+agi changes
+agi rollback
 ```
 
 `changes [SESSION_ID]` показывает diff, `rollback [SESSION_ID]` возвращает исходные
@@ -264,7 +367,7 @@ hw-ai-agent rollback
 и исполнение агента не возобновляется. История, стоимость и бюджет сохраняются.
 
 Ограничения снимка: 2000 путей, 10 MiB на файл, 20 MiB на дерево.
-Защищённые служебные файлы и собственный JSON-отчёт демо исключаются;
+Защищённые служебные файлы исключаются;
 обычные JSON-файлы отслеживаются. Снимок не обходит запрет чтения policy.
 Восстанавливаются байты и mode, но не владелец, ACL или xattr; пустые каталоги
 могут остаться. Подробнее — [Руководство по workflow](docs/WORKFLOW_GUIDE.md).
@@ -277,11 +380,11 @@ hw-ai-agent rollback
 После ответа и по завершении показывается накопленный расход сессии.
 
 ```bash
-hw-ai-agent run --workspace /path/to/my-project --no-cost-estimate "Исправь ошибку"
-hw-ai-agent resume --cost-estimate
-hw-ai-agent cost
-hw-ai-agent cost SESSION_ID
-hw-ai-agent set --no-cost-estimate
+agi run --workspace /path/to/my-project --no-cost-estimate "Исправь ошибку"
+agi resume --cost-estimate
+agi cost
+agi cost SESSION_ID
+agi set --no-cost-estimate
 ```
 
 `AGENT_COST_ESTIMATE=true/false` задаёт значение по умолчанию.
@@ -299,13 +402,13 @@ Ollama и подставные клиенты имеют нулевую плат
 ### Сравнение тарифов
 
 ```bash
-hw-ai-agent models --provider openrouter --refresh
-hw-ai-agent models --provider openrouter --paid --limit 100
-hw-ai-agent models --provider openrouter --free --sort price
-hw-ai-agent models --provider openrouter --search deepseek --all
-hw-ai-agent models --provider openai --search gpt-4.1
-hw-ai-agent models --provider ollama
-hw-ai-agent models --provider openrouter --input-tokens 10000 --output-tokens 2000 --json
+agi models --provider openrouter --refresh
+agi models --provider openrouter --paid --limit 100
+agi models --provider openrouter --free --sort price
+agi models --provider openrouter --search deepseek --all
+agi models --provider openai --search gpt-4.1
+agi models --provider ollama
+agi models --provider openrouter --input-tokens 10000 --output-tokens 2000 --json
 ```
 
 Колонки показывают полный ID, тариф входа/выхода за миллион токенов, контекст,
@@ -323,10 +426,10 @@ Ollama — установленные модели и их capabilities. Кэш 
 ### Ручной и автоматический выбор
 
 ```bash
-hw-ai-agent run --workspace /path/to/my-project --model '?' "Исправь ошибку"
-hw-ai-agent plan --workspace /path/to/my-project --model auto "Исправь ошибку"
-hw-ai-agent set --route
-hw-ai-agent set --no-route
+agi run --workspace /path/to/my-project --model '?' "Исправь ошибку"
+agi plan --workspace /path/to/my-project --model auto "Исправь ошибку"
+agi set --route
+agi set --no-route
 ```
 
 `--model '?'` показывает до 20 вариантов с ценами и номерами; кавычки защищают
@@ -352,13 +455,13 @@ hw-ai-agent set --no-route
 переменная продолжает иметь приоритет над записанным файлом.
 
 ```bash
-hw-ai-agent set --provider ollama --model qwen3:4b
-hw-ai-agent set --max-rounds 30 --max-tokens 4096 --mode safe
-hw-ai-agent set --plan --tasks --journal --cost-estimate
-hw-ai-agent set --no-plan --no-tasks --no-journal --no-route
-hw-ai-agent set --env-file .env.local --provider ollama --max-rounds 40
-hw-ai-agent help set
-hw-ai-agent help run
+agi set --provider ollama --model qwen3:4b
+agi set --max-rounds 30 --max-tokens 4096 --mode safe
+agi set --plan --tasks --journal --cost-estimate
+agi set --no-plan --no-tasks --no-journal --no-route
+agi set --env-file .env.local --provider ollama --max-rounds 40
+agi help set
+agi help run
 ```
 
 | Переменная `.env` | Флаг / назначение |
@@ -380,6 +483,7 @@ hw-ai-agent help run
 | `AGENT_PLAN` | `--plan` / `--no-plan` |
 | `AGENT_TASKS` | `--tasks` / `--no-tasks` |
 | `AGENT_JOURNAL` | `--journal` / `--no-journal` |
+| `AGENT_PROGRESS` | `--progress` / `--no-progress` (по умолчанию выключен) |
 | `AGENT_COST_ESTIMATE` | `--cost-estimate` / `--no-cost-estimate` |
 | `AGENT_ROUTE` | `--route` / `--no-route` |
 | `AGENT_ROUTE_SIMPLE_MODEL` | `--route-simple-model` |
@@ -387,71 +491,11 @@ hw-ai-agent help run
 | `AGENT_ROUTE_COMPLEX_MODEL` | `--route-complex-model` |
 
 Булевы значения в `.env` — `true`/`false`. `setup` записывает общие значения
-12 запросов и 2048 выходных токенов; они действуют и для демо. Только при отсутствии
-этих переменных используются отдельные встроенные значения: `workflow-demo`,
-`plan-demo`, `rollback-demo` — 20/2048, `tasks-demo` — 30/3072.
+12 запросов и 2048 выходных токенов. Эти же значения используются
+по умолчанию при отсутствии настроек.
 
-`plan` всегда планирует, `tasks-demo` всегда использует задачи, `rollback-demo`
-всегда включает журнал. Флаги `--offline`, `--crash-after-write`,
-`--stop-after-tools N` и `--stop-after-tasks N` задаются только на запуск;
-смотрите доступность через `help КОМАНДА`. Для демо `--workspace` должен указывать
-новую папку; без него создаётся `workspace/<название>-<время>`, `AGENT_WORKSPACE`
-для демо не используется.
-
-## Демонстрации
-
-| Команда | Сценарий | Источник ответов |
-| --- | --- | --- |
-| `demo` | Исправление скидки, шесть защищённых тестов, независимая проверка | Настоящая модель |
-| `policy-demo` | Разрешения, отказы, защита тестов/секретов и путей | Без модели |
-| `session-demo` | Пауза после записи и продолжение без её повтора | Подставная модель |
-| `workflow-demo` | Исправление нескольких модулей и удаление лишних | Настоящая модель; `--offline` — меньший сценарий восстановления |
-| `plan-demo` | Утверждение плана и исправление скидки | Настоящая модель; есть `--offline` |
-| `budget-demo` | Исчерпание бюджетов, резервирование, сохранение после сбоя | Подставные ответы |
-| `tasks-demo` | Налог, чек и тесты как задачи с зависимостями | Настоящая модель; есть `--offline` |
-| `rollback-demo` | План, исправление, просмотр изменений и ручной откат | Настоящая модель; есть `--offline` |
-| `cost-demo` | Оценка/расход, продолжение, неизвестная цена и роутинг | Тестовые тарифы и ответы, без сети |
-
-Все демо без API:
-
-```bash
-hw-ai-agent policy-demo
-hw-ai-agent session-demo
-hw-ai-agent budget-demo
-hw-ai-agent cost-demo
-hw-ai-agent workflow-demo --offline --mode auto
-hw-ai-agent plan-demo --offline --mode auto
-hw-ai-agent tasks-demo --offline --mode auto
-hw-ai-agent rollback-demo --offline --mode auto
-hw-ai-agent changes
-hw-ai-agent rollback
-```
-
-План подтвердите в терминале; `auto` не утверждает его автоматически.
-`rollback-demo` сначала выводит `DEMO PASS`, но сам не откатывает: используйте
-`changes`/`rollback` с его ID или выбором в меню.
-
-Варианты с настоящими моделями:
-
-```bash
-hw-ai-agent demo --provider openrouter --model deepseek/deepseek-v3.2 --mode safe
-hw-ai-agent workflow-demo --provider openrouter --mode auto --max-rounds 30
-hw-ai-agent plan-demo --provider openai --env-file .env.openai --model gpt-4.1-mini --max-rounds 30
-hw-ai-agent tasks-demo --provider ollama --env-file .env.ollama --model qwen3:4b --mode auto --max-rounds 30 --max-tokens 4096
-hw-ai-agent rollback-demo --provider openrouter --mode auto --max-rounds 30
-```
-
-У пяти демо с настоящей моделью можно заменить провайдера и ID через
-`--provider`/`--model`; без `--model` используется настройка выбранного провайдера.
-Подставной ответ проверяет механизм, но не качество настоящей модели.
-Полный `WORKFLOW DEMO PASS` требует прохождения четырёх тестов и удаления
-минимум двух лишних модулей; исправление без очистки является частичным успехом.
-
-Результаты сохраняются в workspace демо в JSON с моделью, событиями, diff,
-проверками и расходом. Итог определяет проверяющий код, а не фраза модели.
-Исторические примеры: [базовое демо](docs/DEMO_RESULTS.md),
-[policy](docs/POLICY_RESULTS.md), [сессии](docs/SESSION_RESULTS.md),
-[workflow](docs/WORKFLOW_RESULTS.md). Они относятся к сохранённым версиям.
+`plan` всегда включает планирование. Флаги `--stop-after-tools N`
+и `--stop-after-tasks N` действуют только на текущий запуск.
 
 ## Команды управления
 
@@ -459,7 +503,8 @@ hw-ai-agent rollback-demo --provider openrouter --mode auto --max-rounds 30
 | --- | --- |
 | `help [COMMAND]`, `COMMAND --help` | Инструкция и флаги; нет обращений к модели |
 | `setup`, `set`, `doctor` | Создание настроек, изменение параметров, проверка подключения |
-| `run REQUEST`, `plan REQUEST` | Работа со своей папкой |
+| `run REQUEST`, `plan REQUEST` | Отдельный запрос к агенту |
+| `chat`, `chat --resume ID` | Новый или сохранённый интерактивный диалог |
 | `models` | Тарифы, характеристики и цена одинакового сценария |
 | `sessions`, `session ID` | Список сессий и подробности одной |
 | `resume [ID]` | Продолжение, утверждение плана и решения конфликтов в терминале |
@@ -483,9 +528,8 @@ API не вызывается, качество модели так не изм�
 
 GitHub Actions настроен на `macos-latest`, Python 3.11/3.13/3.14 и обязательные
 системные проверки. Результат конкретного запуска CI проверяется отдельно.
-Отчёты демо, workspace, `.env` и `.agent` исключены из Git. Произвольный текст
-модели и файлов в журнале/отчётах может содержать чувствительные данные;
-перед публикацией просмотрите выбранный JSON.
+`.env` и `.agent` исключены из Git. История сессии может содержать
+рабочие файлы и ответы модели.
 
 ## Устройство проекта
 
@@ -498,7 +542,7 @@ GitHub Actions настроен на `macos-latest`, Python 3.11/3.13/3.14 и о
 | `journal.py` | Снимки, diff, конфликты и откат |
 | `pricing.py`, `model_catalog.py`, `routing.py` | Расход, каталоги и выбор модели |
 | `cli.py`, `config.py`, `usage.py` | Команды, настройки и справка |
-| `*_demo.py`, `reporting.py`, `tests/` | Сценарии, отчёты и автоматические проверки |
+| `tests/` | Автоматические проверки |
 
 Проект рассчитан на небольшие локальные задачи. Bash ограничен macOS и
 разрешёнными командами; защищённые тесты нельзя создавать или исправлять

@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 dependencies = ["certifi>=2025.1.31"]
 
 [project.scripts]
+agi = "hw_ai_agent.cli:main"
 hw-ai-agent = "hw_ai_agent.cli:main"
 
 [tool.setuptools.packages.find]

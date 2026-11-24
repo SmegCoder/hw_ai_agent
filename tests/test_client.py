@@ -1,6 +1,8 @@
 import io
 import json
 import os
+import socket
+import ssl
 import tempfile
 import unittest
 from pathlib import Path
@@ -40,6 +42,37 @@ class ClientTests(unittest.TestCase):
                 with self.assertRaises(ModelClientError) as caught:
                     client.complete([], [])
                 self.assertNotIn("secret-example", str(caught.exception))
+
+    def test_model_history_escapes_surrogates_for_the_provider(self):
+        client = self.client()
+        messages = [{"role": "assistant", "content": "Целый текст ✓",
+                     "reasoning_details": [{"text": "Данные\udcd0"}]}]
+        with self.response(client, {"choices": [{"message": {"content": "OK"}}]}) as transport:
+            client.complete(messages, [])
+        sent = json.loads(transport.call_args.args[0].data)["messages"][0]
+        self.assertEqual(sent["reasoning_details"][0]["text"], r"Данные\udcd0")
+        self.assertEqual(sent["content"], "Целый текст ✓")
+        self.assertEqual(messages[0]["reasoning_details"][0]["text"], "Данные\udcd0")
+
+    def test_openrouter_distinguishes_retryable_errors_and_redacts_provider_messages(self):
+        client = self.client()
+        cases = [
+            (HTTPError("http://example", 429, "secret", {"Retry-After": "12"}, None), "HTTP 429", 12),
+            (HTTPError("http://example", 402, "secret", {}, None), "HTTP 402", None),
+            (URLError(TimeoutError("secret")), "время ожидания", 0),
+            (URLError(socket.gaierror(socket.EAI_AGAIN, "secret")), "DNS", 0),
+            (URLError(ssl.SSLCertVerificationError("secret")), "TLS", None),
+        ]
+        for error, message, wait in cases:
+            with self.subTest(message=message), patch.object(client.opener, "open", side_effect=error):
+                with self.assertRaisesRegex(ModelClientError, message) as caught:
+                    client.complete([], [])
+                self.assertNotIn("secret", str(caught.exception))
+                self.assertEqual(caught.exception.retry_after, wait)
+        body = {"choices": [{"finish_reason": "error", "message": {"content": "partial"},
+                             "error": {"code": 502, "message": "secret"}}]}
+        with self.response(client, body), self.assertRaisesRegex(ModelClientError, "код 502"):
+            client.complete([], [])
 
     def test_malformed_and_truncated_responses(self):
         for body in ({}, {"choices": []}, {"choices": [{"message": {}, "finish_reason": "length"}]}, []):

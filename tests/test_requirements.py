@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import tempfile
 import unittest
@@ -11,7 +10,7 @@ from hw_ai_agent.agent import AgentError, CodingAgent
 from hw_ai_agent.policy import ApprovalDeferred, Policy, PolicyError
 from hw_ai_agent.session import SessionStore
 from hw_ai_agent.tools import ToolError, ToolRuntime
-from hw_ai_agent.workflow_demo import call
+from agent_fixtures import tool_call as call
 
 
 class Client:
@@ -143,7 +142,7 @@ class ApprovalContractTests(WorkspaceCase):
         (self.workspace / "a.py").write_text("original")
         runtime = self.runtime(mode="auto")
         agent = CodingAgent(Client(), runtime, store=self.store)
-        metadata = agent._binding()
+        metadata = agent.binding()
         metadata.pop("approval_contract")
         metadata["policy"].pop("directories")
         identifier = self.store.create(metadata, [{"role": "user", "content": "Task"}], 12, 120000)
@@ -158,13 +157,21 @@ class ApprovalContractTests(WorkspaceCase):
     def test_deferred_confirmation_is_saved_and_can_be_declined(self):
         for mode in ("safe", "auto"):
             with self.subTest(mode=mode):
-                runtime = self.runtime(mode=mode, approve=Mock(side_effect=ApprovalDeferred("waiting")))
+                def defer(request):
+                    saved_status = self.store.db.execute("SELECT status FROM sessions WHERE id=?",
+                                                         (first.session_id,)).fetchone()[0]
+                    self.assertEqual(saved_status, "waiting_approval")
+                    raise ApprovalDeferred("waiting")
+
+                runtime = self.runtime(mode=mode, approve=defer)
                 first = CodingAgent(Client({"tool_calls": [call("remove", "delete_file", {"path": "a.py"})]}), runtime, store=self.store)
                 with self.assertRaises(ApprovalDeferred):
                     first.run("Task")
                 self.assertEqual(self.store.get(first.session_id).status, "waiting_approval")
                 self.assertEqual(self.store.calls(first.session_id, True)[0]["state"], "awaiting_approval")
                 self.assertFalse((self.workspace / "a.py").exists())
+                self.store.set_status(first.session_id, "running")  # Older checkpoints had this value.
+                self.assertEqual(self.store.get(first.session_id).status, "waiting_approval")
                 client = Client({"content": "declined"})
                 CodingAgent(client, self.runtime(mode=mode, approve=lambda request: False), store=self.store).resume(first.session_id)
                 self.assertIn("APPROVAL_REQUIRED", client.requests[0][-1]["content"])
@@ -328,7 +335,7 @@ class DirectoryPolicyTests(DirectoryCase):
 @unittest.skipUnless(os.getenv("REQUIRE_SANDBOX_TESTS") == "1", "Requires native macOS sandbox")
 class BashRequirementsTests(DirectoryCase):
     def test_sample_policy_has_allowed_and_denied_commands_and_directories(self):
-        policy = Policy.load(Path(__file__).resolve().parents[1] / "policies/demo.json")
+        policy = Policy.load(Path(__file__).resolve().parents[1] / "policies/review.json")
         (self.root / "allowed/test_example.py").write_text("import unittest\nclass Test(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n")
         runtime = ToolRuntime(self.root, policy=policy, approve=lambda request: True)
         result = runtime.execute("Bash", {"command": "python -m unittest discover -v", "cwd": "allowed"})

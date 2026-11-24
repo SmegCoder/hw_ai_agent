@@ -1,39 +1,16 @@
 # Работа с несколькими файлами, восстановление и откат
 
-## Демо с настоящей моделью
+## Запуск в своей папке
 
 ```bash
-hw-ai-agent workflow-demo --provider openrouter --mode safe --max-rounds 30
-hw-ai-agent workflow-demo --provider openrouter --mode auto --max-rounds 30
-hw-ai-agent workflow-demo --provider ollama --model qwen3:4b --mode auto --max-rounds 30
+agi plan --workspace /path/to/my-project --tasks --journal \
+  "Разберись в проекте, исправь ошибки и запусти существующие unittest-тесты"
 ```
 
-Каждый запуск создаёт новую папку и сессию. Модель и подключение берутся
-из `.env` или явных флагов; ключи настраиваются по [README](../README.md).
-OpenRouter/OpenAI могут тарифицировать генерацию, Ollama использует локальный сервер.
-
-Расширенный сценарий содержит восемь файлов: два модуля с ошибками,
-два нужных модуля зависимостей, защищённый файл с четырьмя тестами и три лишних
-модуля. Запрос просит разобраться в проекте, исправить ошибки и оптимизировать
-код, но не раскрывает перечень лишних файлов. Действия выбирает модель.
-
-В Safe подтверждается каждая запись и Bash; в Auto они исполняются сразу после
-проверок. **Каждое удаление подтверждается в обоих режимах**, в том числе при
-продолжении. Явные запреты policy, защита тестов/секретов и границ workspace
-действуют всегда. `--approvals deny` отказывает в требуемом подтверждении.
-
-`workflow-report.json` показывает:
-
-- `functional_success`: четыре теста прошли и контрольный файл неизменён;
-- `cleanup_complete`: удалены минимум два из трёх неиспользуемых модулей;
-- `removed_optional_files`: список удалённых модулей;
-- запросы подтверждений, события, модель, ID сессии, usage и расход.
-
-`WORKFLOW DEMO PASS` требует обоих критериев. Модель может исправить ошибки,
-но не выбрать удаление: это частичный результат. Критерий очистки задаёт
-независимый проверяющий код, а не промпт. Встроенный лимит — 20 запросов только
-при отсутствии `AGENT_MAX_ROUNDS`; настройка `.env` может его переопределить.
-Сохранённые примеры — в [WORKFLOW_RESULTS.md](WORKFLOW_RESULTS.md).
+После утверждения плана агент может работать с несколькими файлами. В Safe
+запись и Bash требуют подтверждения. В обоих режимах каждое удаление
+подтверждается отдельно. `--approvals deny` автоматически отклоняет действия,
+для которых требуется такое подтверждение.
 
 ## Восстановимое удаление
 
@@ -52,21 +29,10 @@ OpenRouter/OpenAI могут тарифицировать генерацию, Ol
 Без включённого журнала автоматической команды восстановления сессии нет.
 Сохранённые данные не зашифрованы и могут содержать рабочие файлы.
 
-## Авария и продолжение без API
+## Авария и продолжение
 
-```bash
-hw-ai-agent workflow-demo --offline --mode auto --crash-after-write
-hw-ai-agent resume
-```
-
-Offline-сценарий содержит три файла, две записи и два Bash. Ответы модели
-фиксированные, файловые операции и процессы настоящие. Он проверяет
-восстановление, а не способность модели обнаружить лишний код.
-Для вопросов каждого действия используйте `--mode safe`.
-
-`--crash-after-write` выполняет настоящий аварийный выход с кодом 86 после
-первой записи до сохранения результата. `resume` показывает неопределённый
-вызов и текущее состояние файла. Решения:
+Если процесс прервался после действия и до сохранения результата, `resume`
+покажет неопределённый вызов и доступное состояние файла.
 
 | Выбор | Результат |
 | --- | --- |
@@ -81,34 +47,23 @@ Offline-сценарий содержит три файла, две записи
 остаётся заблокированным; для автоматизации используйте явные команды:
 
 ```bash
-hw-ai-agent session SESSION_ID
-hw-ai-agent resolve SESSION_ID --call CALL_KEY --resolution applied
-hw-ai-agent resume SESSION_ID
+agi session SESSION_ID
+agi resolve SESSION_ID --call CALL_KEY --resolution applied
+agi resume SESSION_ID
 ```
 
 Берите ID и ключ из текущего `session`, а не из примера другого запуска.
-Другие решения: `retry`, `skip`, `abort`. Для проверки каждой ветки создавайте
-новую аварийную сессию. Подробности — в [SESSION_RESULTS.md](SESSION_RESULTS.md).
+Другие решения доступны в `--resolution`. Подробности — в [SESSION_RESULTS.md](SESSION_RESULTS.md).
 
 ## Журнал и откат
 
-```bash
-hw-ai-agent rollback-demo --offline --mode auto
-hw-ai-agent changes
-hw-ai-agent rollback
-```
-
-Подтвердите план. Демо исправляет `order.py` и выводит `DEMO PASS`; после него
-отдельно выберите сессию в `changes` и `rollback`. Если подходящих сессий несколько,
-меню позволяет выбрать нужную; можно явно указать напечатанный ID.
-
-В обычной работе включайте журнал при старте:
+Включите журнал при старте, чтобы затем просмотреть правки и при необходимости откатить сессию.
 
 ```bash
-hw-ai-agent plan --workspace /path/to/my-project --journal --tasks \
+agi plan --workspace /path/to/my-project --journal --tasks \
   "Исправь ошибки и проверь unittest-тестами"
-hw-ai-agent changes SESSION_ID
-hw-ai-agent rollback SESSION_ID
+agi changes SESSION_ID
+agi rollback SESSION_ID
 ```
 
 Снимок сохраняет исходные байты и обычные права файлов. Перед каждым
@@ -128,16 +83,11 @@ hw-ai-agent rollback SESSION_ID
 сессия получает `rolled_back`; запуск агента из неё не продолжается.
 
 Ограничения: 2000 путей, 10 MiB на файл, 20 MiB на дерево. Policy чтения
-не обходится. Защищённые служебные файлы и собственный отчёт демо исключены,
+не обходится. Защищённые служебные файлы исключены,
 обычные JSON отслеживаются. ACL, xattr, владелец не восстанавливаются;
 пустые созданные каталоги могут остаться.
 
 ## Авария с журналом
-
-```bash
-hw-ai-agent rollback-demo --offline --mode auto --crash-after-write
-hw-ai-agent resume
-```
 
 После проверки записи выбор `4` признаёт её выполненной только при совпадении
 байтов. Затем терминал показывает фактические изменения и требует указать
@@ -146,10 +96,10 @@ hw-ai-agent resume
 Для явного решения без меню:
 
 ```bash
-hw-ai-agent resolve SESSION_ID --call CALL_KEY --resolution applied --changes own
-hw-ai-agent resume SESSION_ID
-hw-ai-agent changes SESSION_ID
-hw-ai-agent rollback SESSION_ID
+agi resolve SESSION_ID --call CALL_KEY --resolution applied --changes own
+agi resume SESSION_ID
+agi changes SESSION_ID
+agi rollback SESSION_ID
 ```
 
 `external` исключает показанные изменения из отката этого вызова, но не
@@ -159,8 +109,6 @@ hw-ai-agent rollback SESSION_ID
 ## Проверки
 
 ```bash
-hw-ai-agent policy-demo
-hw-ai-agent session-demo
 REQUIRE_SANDBOX_TESTS=1 python -m unittest discover -s tests -v
 ```
 

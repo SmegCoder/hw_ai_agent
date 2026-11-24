@@ -15,6 +15,7 @@ from .planning import validate_plan, PlanError
 from .tasks import validate_task_plan, validate_proof, TaskError
 from .budget import BudgetLimits, BudgetExceeded, DIMENSIONS, snapshot, debit, batch_cost, truncate_result
 from .pricing import cost_summary, PricingError
+from .text import escape_surrogates, json_text as encoded
 
 
 class SessionError(RuntimeError):
@@ -53,10 +54,6 @@ class SessionState:
 
 def stamp() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def encoded(value) -> str:
-    return json.dumps(value, ensure_ascii=False, allow_nan=False)
 
 
 class SessionStore:
@@ -121,6 +118,14 @@ class SessionStore:
                     PRIMARY KEY(session_id,batch,position),
                     FOREIGN KEY(session_id,batch,position) REFERENCES calls(session_id,batch,position),
                     FOREIGN KEY(session_id,task_id) REFERENCES tasks(session_id,task_id)
+                );
+                CREATE TABLE IF NOT EXISTS conversations (
+                    id TEXT PRIMARY KEY, configuration TEXT NOT NULL, ended INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS conversation_turns (
+                    session_id TEXT PRIMARY KEY REFERENCES sessions(id),
+                    conversation_id TEXT NOT NULL REFERENCES conversations(id),
+                    number INTEGER NOT NULL, prompt TEXT NOT NULL, UNIQUE(conversation_id, number)
                 );
                 CREATE TABLE IF NOT EXISTS journal_blobs (sha256 TEXT PRIMARY KEY, data BLOB NOT NULL);
                 CREATE TABLE IF NOT EXISTS journal_images (
@@ -267,7 +272,7 @@ class SessionStore:
                                     (session_id, item["batch"], item["position"]))
 
     def create(self, metadata: dict, messages: list, max_rounds: int, max_context_chars: int,
-               budgets: BudgetLimits | None = None) -> str:
+               budgets: BudgetLimits | None = None, *, conversation_id: str | None = None) -> str:
         workspace = Path(metadata["workspace"]).resolve()
         if self.path.is_relative_to(workspace):
             raise SessionError("Session database must be outside the model workspace")
@@ -284,6 +289,18 @@ class SessionStore:
                 (session_id, encoded(metadata), encoded(messages), "[]", "ready", 0,
                  max_rounds, max_context_chars, None, None, now, now))
             self.db.execute("INSERT INTO budgets VALUES (?,?,?)", (session_id, encoded(budgets.as_dict()), encoded(dict.fromkeys(DIMENSIONS, 0))))
+            if conversation_id is not None:
+                row = self.db.execute("SELECT ended FROM conversations WHERE id=?", (conversation_id,)).fetchone()
+                if row is None or row["ended"]:
+                    raise SessionError("Диалог завершён или не найден")
+                if metadata.get("kind") != "chat-turn" or metadata.get("journal_mode") is not True:
+                    raise SessionError("Для запроса в диалоге требуется журнал")
+                self.db.execute(
+                    """INSERT INTO conversation_turns
+                       SELECT ?, ?, COALESCE(MAX(number), 0) + 1, ?
+                       FROM conversation_turns WHERE conversation_id=?""",
+                    (session_id, conversation_id, escape_surrogates(messages[-1]["content"]), conversation_id),
+                )
             if metadata.get("plan_mode"):
                 self.db.execute("INSERT INTO plans VALUES (?, 'planning', NULL, ?)", (session_id, now))
         return session_id
@@ -302,13 +319,25 @@ class SessionStore:
             if not messages or any(not isinstance(m, dict) or m.get("role") not in
                 {"system", "user", "assistant", "tool"} for m in messages):
                 raise SessionError("Invalid saved messages")
-            if row["status"] not in {"ready", "running", "interrupted", "waiting_approval", "waiting_plan_approval", "failed", "blocked", "completed", "aborted", "budget_exhausted", "journal_conflict", "rolled_back"}:
+            if row["status"] not in {"ready", "running", "interrupted", "waiting_approval", "waiting_plan_approval", "failed", "blocked", "completed", "aborted", "budget_exhausted", "journal_conflict", "rolled_back", "context_limit"}:
                 raise SessionError("Invalid session status")
             if row["status"] == "completed" and not isinstance(row["final_answer"], str):
                 raise SessionError("Completed session has no final answer")
             if not 0 <= row["rounds"] <= row["max_rounds"] or row["max_rounds"] < 1 or row["max_context_chars"] < 1:
                 raise SessionError("Invalid saved session limits")
-            return SessionState(session_id, metadata, messages, events, row["status"], row["rounds"],
+            status = row["status"]
+            if status == "running":
+                # Older checkpoints saved the pending approval on the call or plan only.
+                status = self.db.execute(
+                    """SELECT CASE
+                        WHEN EXISTS (SELECT 1 FROM calls WHERE session_id=? AND state='awaiting_approval')
+                            THEN 'waiting_approval'
+                        WHEN EXISTS (SELECT 1 FROM plans WHERE session_id=? AND state='awaiting_approval')
+                            THEN 'waiting_plan_approval'
+                        ELSE 'running'
+                    END""", (session_id, session_id)
+                ).fetchone()[0]
+            return SessionState(session_id, metadata, messages, events, status, row["rounds"],
                 row["max_rounds"], row["max_context_chars"], row["final_answer"], row["error"])
         except (sqlite3.Error, ValueError, TypeError, KeyError):
             raise SessionError("Cannot read valid session state") from None
@@ -320,6 +349,8 @@ class SessionStore:
                 for row in ids for s in [self.get(row["id"])]]
 
     def set_status(self, session_id: str, status: str, error: str | None = None):
+        if error is not None:
+            error = escape_surrogates(error)
         with self.transaction():
             self.db.execute("UPDATE sessions SET status=?,error=?,updated_at=? WHERE id=?",
                             (status, error, stamp(), session_id))
@@ -454,7 +485,8 @@ class SessionStore:
             raise SessionError("Plan decision must be explicitly true or false")
         with self.transaction():
             saved = self.plan(session_id)
-            if self.get(session_id).status == "aborted" or not saved or saved["state"] != "awaiting_approval":
+            status = self.get(session_id).status
+            if status in {"aborted", "rolled_back", "context_limit", "budget_exhausted"} or not saved or saved["state"] != "awaiting_approval":
                 raise SessionError("This plan is not waiting for a decision")
             if self.calls(session_id, True):
                 raise SessionError("Finish or resolve pending planning calls before deciding the plan")
@@ -494,13 +526,14 @@ class SessionStore:
         except PricingError:
             raise SessionError("Invalid saved session costs") from None
 
-    def start_model(self, session_id: str) -> int:
+    def start_model(self, session_id: str, *, input_tokens_estimate=None) -> int:
         with self.transaction():
             state = self.get(session_id)
             self._charge(session_id, model_requests=1)
             number = state.rounds + 1
             self.db.execute("UPDATE sessions SET rounds=?,updated_at=? WHERE id=?", (number, stamp(), session_id))
-            self._event(session_id, {"event": "model_request", "round": number})
+            self._event(session_id, {"event": "model_request", "round": number,
+                                     "input_tokens_estimate": input_tokens_estimate})
         return number
 
     def assistant(self, session_id: str, message: dict, batch: int):
@@ -601,13 +634,23 @@ class SessionStore:
 
     def wait_for_approval(self, session_id: str, item: dict):
         with self.transaction():
-            self.db.execute("UPDATE calls SET state='awaiting_approval' WHERE session_id=? AND batch=? AND position=? AND state='running'",
-                            (session_id, item["batch"], item["position"]))
+            updated = self.db.execute(
+                "UPDATE calls SET state='awaiting_approval' WHERE session_id=? AND batch=? AND position=? AND state='running'",
+                (session_id, item["batch"], item["position"]),
+            )
+            if updated.rowcount:
+                self.db.execute("UPDATE sessions SET status='waiting_approval',updated_at=? WHERE id=?",
+                                (stamp(), session_id))
 
     def end_approval(self, session_id: str, item: dict):
         with self.transaction():
-            self.db.execute("UPDATE calls SET state='running' WHERE session_id=? AND batch=? AND position=? AND state='awaiting_approval'",
-                            (session_id, item["batch"], item["position"]))
+            updated = self.db.execute(
+                "UPDATE calls SET state='running' WHERE session_id=? AND batch=? AND position=? AND state='awaiting_approval'",
+                (session_id, item["batch"], item["position"]),
+            )
+            if updated.rowcount:
+                self.db.execute("UPDATE sessions SET status='running',updated_at=? WHERE id=?",
+                                (stamp(), session_id))
 
     def finish_call(self, session_id: str, item: dict, result: dict, failed: bool | None = None, *, task_outcome: dict | None = None):
         with self.transaction():
@@ -622,7 +665,7 @@ class SessionStore:
                 raise SessionError("Tool result status must be a boolean")
             if quota is None:
                 # Legacy uncertain calls have no reservation from the old runtime.
-                quota = max(1, len(result["content"].encode("utf-8")))
+                quota = max(1, len(escape_surrogates(result["content"]).encode("utf-8")))
                 self._charge(session_id, result_bytes=quota)
             result = {**result, "content": truncate_result(result["content"], quota)}
             if not allocation["forfeited"] and allocation["output_quota"] is not None:
@@ -662,6 +705,7 @@ class SessionStore:
         return result
 
     def complete(self, session_id: str, answer: str):
+        answer = escape_surrogates(answer)
         with self.transaction():
             if self.get(session_id).metadata.get("task_mode"):
                 tasks = self.tasks(session_id)
