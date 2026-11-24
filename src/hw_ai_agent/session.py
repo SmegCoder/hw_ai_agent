@@ -528,14 +528,17 @@ class SessionStore:
         row = self.db.execute("SELECT events FROM sessions WHERE id=?", (session_id,)).fetchone()
         events = json.loads(row[0])
         now = stamp()
-        payload = {**event, "_time": now}
+        events.append({**self.redacted_event(event), "_time": now})
+        self.db.execute("UPDATE sessions SET events=?,updated_at=? WHERE id=?", (encoded(events), now, session_id))
+
+    def redacted_event(self, event: dict) -> dict:
+        payload = dict(event)
         if self.log_credentials:
             for key in ("content", "arguments", "error", "reason", "assistant", "plan", "preview",
                         "prompt", "path", "paths", "proof", "tool_call_id", "tool", "name", "task_id"):
                 if key in payload:
                     payload[key] = self._redact_log_text(payload[key])
-        events.append(payload)
-        self.db.execute("UPDATE sessions SET events=?,updated_at=? WHERE id=?", (encoded(events), now, session_id))
+        return payload
 
     def _redact_log_text(self, value):
         if isinstance(value, str):
@@ -730,7 +733,7 @@ class SessionStore:
                             (session_id, item["batch"], item["position"]))
             self.db.execute("UPDATE sessions SET messages=?,updated_at=? WHERE id=?",
                             (encoded([*state.messages, result]), stamp(), session_id))
-            self._event(session_id, {"event": "tool_result", "task_id": item.get("task_id"),
+            self._event(session_id, {"event": "tool_result", "call": item["key"], "task_id": item.get("task_id"),
                                      "phase": item.get("phase"), "failed": failed, **result})
             self._event(session_id, {"event": "budget_settlement", "call": item["key"], "quota": quota,
                                      "result_bytes": len(result["content"].encode("utf-8")),

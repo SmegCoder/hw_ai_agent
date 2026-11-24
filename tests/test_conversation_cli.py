@@ -103,7 +103,7 @@ class ConversationCLITests(unittest.TestCase):
                           self.write(2), {"content": "Второе изменение."},
                           ({"content": "После отката."}, {})]
         code, out, err = self.start("Первая правка", "Вторая правка", "/changes", "/rollback",
-                                    "Что осталось?", "/tokens", "/stop")
+                                    "Что осталось?", "/tokens", "/exit")
         self.assertEqual(code, 0, err)
         self.assertIn("+value = 2", out)
         self.assertIn("Запрос 2 отменён", out)
@@ -219,6 +219,79 @@ class ConversationCLITests(unittest.TestCase):
                                          "session_id": identifier, "run_id": run_id,
                                          "data": {"content": "старый ответ"}})
 
+    def test_resume_chat_picker_filters_closed_chats_and_opens_selected_history(self):
+        self.responses = [{"content": "Закрытый ответ"}, {"content": "Отчёт сохранён"},
+                          {"content": "Список готов"}, {"content": "Продолжаю отчёт"}]
+        self.assertEqual(self.start("Архивный запрос", "/end")[0], 0)
+        self.assertEqual(self.start("Первый отчёт", "/exit")[0], 0)
+        self.assertEqual(self.start("Другой список", "/exit")[0], 0)
+        self.assertEqual(self.invoke("resume", "chat", inputs=("",))[0], 0)
+        code, out, err = self.invoke("resume", "chat", inputs=("5", "2", "Уточнение", "/exit"))
+        self.assertEqual(code, 0, err)
+        self.assertIn("Введите номер из списка", out)
+        self.assertLess(out.index("Другой список"), out.index("Первый отчёт"))
+        self.assertNotIn("Архивный запрос", out)
+        self.assertIn(("assistant", "Отчёт сохранён"), self.requests[-1])
+        self.assertNotIn(("assistant", "Список готов"), self.requests[-1])
+
+    def test_empty_picker_and_removed_stop_command(self):
+        code, out, err = self.invoke("resume", "chat")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Нет открытых диалогов", out)
+        code, out, err = self.start("/help", "/stop", "/exit")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Команда не распознана", out)
+        self.assertNotIn("/stop", out)
+        self.assertIn("/exit", out)
+        self.assertEqual(self.requests, [])
+
+    def test_progress_controls_only_display_and_journal_keeps_tool_details(self):
+        self.file.write_text("payload-line test-key\n")
+        call = {"tool_calls": [tool_call("r1", "read_file", {"path": "value.py"})]}
+        for flags, full in [((), False), (("--progress", "full"), True), (("--no-progress",), False),
+                            (("--verbose",), False)]:
+            with self.subTest(flags=flags):
+                self.responses = [(call, {"prompt_tokens": 20, "completion_tokens": 4}),
+                                  ({"content": "Готово"}, {})]
+                code, out, err = self.invoke("chat", "--model", "test/model", "--workspace", self.workspace,
+                                             *flags, inputs=("Прочитай файл", "/exit"))
+                self.assertEqual(code, 0, err)
+                self.assertEqual("payload-line" in out, full)
+                self.assertEqual('"path": "value.py"' in out, full)
+                self.assertNotIn("test-key", out)
+                if not flags:
+                    self.assertRegex(out, r"\d{2}:\d{2}  Чтение · value.py")
+                    self.assertNotIn("Инструмент · read_file", out)
+                if full:
+                    self.assertIn("Токены запроса 1 · вход 20 · выход 4", out)
+                with SessionStore(self.db) as store:
+                    identifier = store.db.execute("SELECT id FROM conversations ORDER BY rowid DESC LIMIT 1").fetchone()[0]
+                    records = list(store.event_records(identifier))
+                self.assertEqual({r["session_id"] for r in records}, {identifier})
+                self.assertEqual(len({r["run_id"] for r in records}), 1)
+                self.assertTrue(all(r["time"] and r["id"] for r in records))
+                tools = [r["data"] for r in records if r["type"] in {"tool_call", "tool_result", "policy_decision"}]
+                self.assertEqual({item["tool_call_id"] for item in tools}, {"r1"})
+                self.assertEqual({item["call"] for item in tools}, {"1:0"})
+                self.assertEqual(json.loads(tools[0]["arguments"]), {"path": "value.py"})
+                self.assertIn("payload-line [REDACTED]", tools[-1]["content"])
+                self.assertEqual([r["data"]["usage_status"] for r in records if r["type"] == "model_usage"],
+                                 ["complete", "unknown"])
+
+    def test_full_progress_saved_and_pending_request_resumed_via_picker(self):
+        self.responses = [KeyboardInterrupt()]
+        self.assertEqual(self.start("/set progress full", "Первый запрос")[0], 130)
+        identifier = self.conversation_id()
+        with SessionStore(self.db) as store:
+            run_id = Conversation(store, identifier).turns()[0].state.id
+        self.responses = [self.write(1), {"content": "Завершено"}]
+        code, out, err = self.invoke("resume", "chat", inputs=("1", "/resume", "/exit"))
+        self.assertEqual(code, 0, err)
+        self.assertIn("Вызов write_file", out)
+        self.assertIn("Результат write_file", out)
+        with SessionStore(self.db) as store:
+            self.assertEqual([t.state.id for t in Conversation(store, identifier).turns()], [run_id])
+
     def test_chat_settings_persist_and_resumed_turn_uses_its_checkpoint(self):
         self.responses = [self.write(1), KeyboardInterrupt()]
         self.assertEqual(self.start("Первая правка")[0], 130)
@@ -227,7 +300,7 @@ class ConversationCLITests(unittest.TestCase):
         code, out, err = self.invoke("chat", "--resume", identifier,
             inputs=("/set", "/set approvals invalid", "/set mode safe", "/set approvals deny",
                     "/set max-rounds 4", "/set max-tool-calls 1", "/set max-side-effects 1",
-                    "/set max-tokens 50", "/settings", "/resume", "Вторая правка", "/stop"))
+                    "/set max-tokens 50", "/settings", "/resume", "Вторая правка", "/exit"))
         self.assertEqual(code, 0, err)
         self.assertIn("Формат · /set", out)
         self.assertIn("допустимы ask, deny", out)
@@ -258,20 +331,20 @@ class ConversationCLITests(unittest.TestCase):
         self.assertIn("Файл записан · value.py", out)
         identifier = self.conversation_id()
         self.responses = [{"content": "Продолжено."}]
-        code, out, err = self.invoke("chat", "--resume", identifier, inputs=("/settings", "/resume", "/stop"))
+        code, out, err = self.invoke("chat", "--resume", identifier, inputs=("/settings", "/resume", "/exit"))
         self.assertEqual(code, 0, err)
-        self.assertIn("progress · true", out)
+        self.assertIn("progress · compact", out)
         self.assertRegex(out, r"\d{2}:\d{2}  Запрос к модели · 3")
 
         self.responses = [{"content": "Готово."}]
         code, out, err = self.invoke("chat", "--resume", identifier, "--no-progress",
-                                     inputs=("/settings", "Ещё запрос", "/stop"))
+                                     inputs=("/settings", "Ещё запрос", "/exit"))
         self.assertEqual(code, 0, err)
-        self.assertIn("progress · false", out)
+        self.assertIn("progress · off", out)
         self.assertIn("Агент работает…", out)
         self.assertNotIn("Запрос к модели", out)
         with SessionStore(self.db) as store:
-            self.assertTrue(Conversation(store, identifier).configuration()["progress"])
+            self.assertEqual(Conversation(store, identifier).configuration()["progress"], "compact")
 
     def test_chat_handles_surrogate_text_without_rewriting_invalid_tool_arguments(self):
         call = tool_call("broken-write", "write_file", {"path": "value.py", "content": "value = 1"})
@@ -296,7 +369,7 @@ class ConversationCLITests(unittest.TestCase):
             self.assertIn("valid UTF-8 text", rejected["result"]["content"])
 
     def test_old_chat_without_progress_uses_the_env_default(self):
-        self.assertEqual(self.start("/stop")[0], 0)
+        self.assertEqual(self.start("/exit")[0], 0)
         identifier = self.conversation_id()
         with SessionStore(self.db) as store:
             configuration = Conversation(store, identifier).configuration()
@@ -306,7 +379,7 @@ class ConversationCLITests(unittest.TestCase):
         self.responses = [{"content": "Готово."}]
         code, out, err = self.invoke("chat", "--resume", identifier, inputs=("/settings", "Запрос", "/end"))
         self.assertEqual(code, 0, err)
-        self.assertIn("progress · true", out)
+        self.assertIn("progress · compact", out)
         self.assertIn("Запрос к модели", out)
 
     def test_interrupted_rollback_must_finish_before_next_prompt(self):
@@ -382,7 +455,7 @@ class ConversationCLITests(unittest.TestCase):
         (self.workspace / "wok").mkdir()
         with chdir(self.root):
             code, out, err = self.invoke("chat", "--model", "test/model",
-                                         inputs=("n", "../outside", "n", "wok", "n", "Новый проект", "/stop"))
+                                         inputs=("n", "../outside", "n", "wok", "n", "Новый проект", "/exit"))
             self.assertEqual(code, 0, err)
             self.assertIn("одно имя папки без пути", out)
             self.assertIn("Это имя уже занято", out)
@@ -406,14 +479,15 @@ class ConversationCLITests(unittest.TestCase):
         options = ("--provider", "openrouter", "--model", "test/model", "--mode", "auto",
                    "--workspace", self.workspace, "--max-tokens", 20)
         self.responses = [self.write(1), {"content": "Готово."}, self.write(2), {"content": "Ещё готово."}]
-        code, out, err = self.invoke("run", *options, "Исправь")
+        code, out, err = self.invoke("run", *options, "--progress", "Исправь")
         self.assertEqual(code, 0, err)
+        self.assertIn(("user", "Исправь"), self.requests[0])
         self.assertIn("✓  value.py записан", out)
         self.assertIn("Тесты не запускались", out)
         self.assertNotIn("Вызов write_file", out)
         self.assertNotIn("Бюджет:", out)
-        self.assertNotIn("Запрос к модели", out)
-        code, out, err = self.invoke("run", *options, "--verbose", "Ещё исправь")
+        self.assertRegex(out, r"\d{2}:\d{2}  Запрос к модели")
+        code, out, err = self.invoke("run", *options, "--verbose", "--progress", "full", "Ещё исправь")
         self.assertEqual(code, 0, err)
         self.assertIn("Вызов write_file", out)
         self.assertIn("Оценка запроса:", out)

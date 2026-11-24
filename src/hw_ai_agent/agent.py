@@ -359,12 +359,17 @@ class CodingAgent:
                 cost = actual_cost(provider, price, latest, failed=failed)
                 self._emit({"event": "model_cost", "round": rounds, **cost})
                 usage = clean_usage(latest)
-                if usage or not failed:
-                    estimated_output = None
-                    if not failed and not {"total_tokens", "completion_tokens"}.intersection(usage):
-                        estimated_output = max(1, (len(str(response).encode("utf-8", errors="replace")) + 2) // 3)
-                    self._emit({"event": "model_usage", "round": rounds, "usage": usage,
-                                "output_tokens_estimate": estimated_output})
+                estimated_output = None
+                if not failed and not {"total_tokens", "completion_tokens"}.intersection(usage):
+                    estimated_output = max(1, (len(str(response).encode("utf-8", errors="replace")) + 2) // 3)
+                if {"prompt_tokens", "completion_tokens"} <= usage.keys():
+                    usage_status = "complete"
+                elif {"prompt_tokens", "completion_tokens", "total_tokens"}.intersection(usage):
+                    usage_status = "partial"
+                else:
+                    usage_status = "unknown"
+                self._emit({"event": "model_usage", "round": rounds, "usage": usage,
+                            "usage_status": usage_status, "output_tokens_estimate": estimated_output})
                 self._emit({"event": "session_cost", "cost": cost_summary(self.events, rounds)}, persist=False)
             if failure is not None:
                 wait = failure.retry_after
@@ -582,9 +587,12 @@ class CodingAgent:
         if persist and self.store and self.session_id:
             self.store.event(self.session_id, event)
         if self.on_event:
-            self.on_event(event)
+            self.on_event(self.store.redacted_event(event) if self.store else event)
 
     def _policy_event(self, event: dict[str, Any]):
+        active = getattr(self, "_active_call", None)
+        if active is not None:
+            event = {**event, "call": active["key"], "tool_call_id": active["call"]["id"]}
         if (event.get("outcome") == "waiting" and self.store and self.session_id
                 and getattr(self, "_active_call", None) is not None):
             self.store.wait_for_approval(self.session_id, self._active_call)

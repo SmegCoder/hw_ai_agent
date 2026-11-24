@@ -12,7 +12,7 @@ from .config import option_value
 from .journal import ChangeJournal, JournalError
 from .policy import ApprovalDeferred, PolicyError
 from .session import SessionError, SessionState, encoded
-from .terminal import color_diff, report_header, visible
+from .terminal import color_diff, report_header, visible, visible_line
 from .tools import ToolError
 
 FINISHED = {"completed", "aborted", "rolled_back", "budget_exhausted", "context_limit"}
@@ -24,7 +24,7 @@ CHAT_OPTIONS = {
     "max-tool-calls": ("budget", "tool_calls", "N"),
     "max-side-effects": ("budget", "side_effects", "N"),
     "max-tokens": ("binding", "max_tokens", "N"),
-    "progress": (None, "progress", "true|false"),
+    "progress": (None, "progress", "compact|full|off"),
 }
 
 COMMANDS = """Введите запрос или команду.
@@ -36,7 +36,6 @@ COMMANDS = """Введите запрос или команду.
   /settings      Показать настройки диалога
   /set ИМЯ ЗНАЧЕНИЕ   Сохранить настройку диалога
   /resume        Продолжить приостановленный запрос
-  /stop          Поставить диалог на паузу
   /exit          Выйти с возможностью продолжить диалог
   /end           Окончательно завершить диалог
   /help          Показать команды"""
@@ -102,6 +101,39 @@ class Conversation:
         self.store = store
         self.id = identifier
         store.validate_id(identifier)
+
+    @staticmethod
+    def choose_open(store):
+        rows = store.db.execute("""
+            SELECT c.id, json_extract(c.configuration, '$.binding.workspace') AS workspace,
+                   t.prompt, s.updated_at
+            FROM conversations AS c
+            LEFT JOIN conversation_turns AS t ON t.session_id=(
+                SELECT session_id FROM conversation_turns
+                WHERE conversation_id=c.id ORDER BY number DESC LIMIT 1)
+            LEFT JOIN sessions AS s ON s.id=t.session_id
+            WHERE c.ended=0 ORDER BY s.updated_at DESC, c.rowid DESC
+        """).fetchall()
+        if not rows:
+            print("Нет открытых диалогов. Начать новый · agi chat")
+            return None
+        print("Выберите диалог · время UTC, рабочая папка и последний запрос")
+        for number, row in enumerate(rows, 1):
+            title = visible_line(row["prompt"] or "Пока без запросов")
+            updated = (row["updated_at"] or "—")[:16].replace("T", " ")
+            print(f"{number}. {updated} · {visible_line(row['workspace'])} · {title[:90]}")
+        while True:
+            try:
+                value = input("Номер диалога (Enter — отмена): ").strip()
+            except (KeyboardInterrupt, EOFError):
+                return None
+            if not value:
+                return None
+            if value.isascii() and value.isdecimal() and len(value) <= len(str(len(rows))):
+                index = int(value)
+                if 1 <= index <= len(rows):
+                    return rows[index - 1]["id"]
+            print("Введите номер из списка.")
 
     @classmethod
     def create(cls, store, configuration: dict) -> Conversation:
@@ -233,7 +265,7 @@ class ConversationShell:
                     continue
                 parts = line.split(maxsplit=1)
                 command, argument = parts[0], parts[1] if len(parts) == 2 else ""
-                if command in {"/pause", "/stop", "/exit"} and not argument:
+                if command in {"/pause", "/exit"} and not argument:
                     self.pause()
                     return 0
                 if command == "/end" and not argument:
@@ -289,8 +321,8 @@ class ConversationShell:
             name, value = parts
             saved = self.conversation.set_option(name, value)
             if name == "progress":
-                self.progress.enabled = saved
-                print(f"Ход работы · {'включён' if saved else 'выключен'}")
+                self.progress.mode = saved
+                print(f"Ход работы · {saved}")
             else:
                 print(f"Для новых запросов · {name} = {visible(value)}")
         elif command == "/help" and not argument:
@@ -302,7 +334,7 @@ class ConversationShell:
         configuration = self.conversation.configuration()
         print("Настройки новых запросов")
         for name, (group, key, allowed) in CHAT_OPTIONS.items():
-            value = str(self.progress.enabled).lower() if name == "progress" else configuration[group][key]
+            value = self.progress.mode if name == "progress" else configuration[group][key]
             print(f"  {name} · {visible(value)}   /set {name} {allowed}")
 
     def apply_turn_binding(self, binding):

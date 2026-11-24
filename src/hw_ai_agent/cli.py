@@ -63,17 +63,6 @@ def show_event(event: dict) -> None:
         show_context_warning(event)
     elif event["event"] == "model_retry":
         show_model_retry(event)
-    elif event["event"] == "tool_result":
-        if event['name'] == 'submit_plan' and not event['content'].startswith('ERROR:'):
-            print("План сохранён.", flush=True)
-        else:
-            print(f"\n[{event['name']}]\n{visible(event['content'])}", flush=True)
-    elif event["event"] == "tool_call":
-        if event['name'] == 'submit_plan':
-            print("Модель подготовила план.", flush=True)
-        else:
-            prefix = f"Задача {event['task_id']}: " if event.get('task_id') else ''
-            print(prefix + f"Вызов {event['name']}: {visible(event['arguments'])}", flush=True)
     elif event["event"] == "policy_decision":
         print(f"Policy: {event['tool']} → {event['action']} / {event['outcome']}", flush=True)
         if event.get("source") == "session_grant":
@@ -129,20 +118,18 @@ def show_compact_event(event: dict, *, chat=False) -> None:
         show_model_retry(event)
     elif kind == "task_completed":
         print(f"[x] {visible(event['task_id'])}", flush=True)
-    elif chat and kind == "tool_call":
-        print(f"Инструмент · {visible_line(event['name'])}", flush=True)
     elif kind == "tool_result":
         if event.get("failed", event["content"].startswith("ERROR:")):
             print(f"{visible_line(event['name'])} · {visible_line(event['content'][:240])}", flush=True)
-        elif chat:
-            print(f"{visible_line(event['name'])} · выполнено", flush=True)
 
 
 def event_listener(stop_after_tools=None, stop_after_tasks=None, *, verbose=False, chat=False, progress=None):
     def render(event):
-        if verbose:
+        if progress and progress.mode != "off" and progress.render(event):
+            return
+        if verbose and event["event"] not in {"tool_call", "tool_result"}:
             show_event(event)
-        elif progress is None or not progress.enabled or not progress.render(event):
+        else:
             show_compact_event(event, chat=chat)
 
     if stop_after_tools is None and stop_after_tasks is None:
@@ -506,10 +493,14 @@ def restore_chat_agent(args, store, listener, configuration):
 def chat_command(args, limits):
     if not sys.stdin.isatty():
         raise ConfigurationError("Для chat нужен интерактивный терминал")
-    progress = ProgressDisplay(args.progress is True)
+    progress = ProgressDisplay(args.progress or "compact")
     listener = event_listener(verbose=args.verbose, chat=True, progress=progress)
     runtime = starting_runtime(args, listener) if args.resume_chat is None else None
     with SessionStore(args.state_db) as store:
+        if args.resume_chat == "":
+            args.resume_chat = Conversation.choose_open(store)
+            if args.resume_chat is None:
+                return 0
         if args.resume_chat is not None:
             conversation = Conversation(store, args.resume_chat)
         else:
@@ -517,7 +508,7 @@ def chat_command(args, limits):
             conversation = Conversation.create(store, {
                 "binding": agent.binding(), "budget": limits.as_dict(), "cost_estimate": args.cost_estimate,
                 "context_window": getattr(agent.client, "context_window", None),
-                "progress": progress.enabled,
+                "progress": progress.mode,
             })
         with store.lock(conversation.id):
             if args.resume_chat is not None:
@@ -525,8 +516,8 @@ def chat_command(args, limits):
                 if args.progress is None:
                     saved = configuration.get("progress")
                     if saved is None:
-                        saved = os.getenv("AGENT_PROGRESS", "false")
-                    progress.enabled = option_value("progress", saved)
+                        saved = os.getenv("AGENT_PROGRESS", "compact")
+                    progress.mode = option_value("progress", saved)
                 agent = restore_chat_agent(args, store, listener, configuration)
             if agent.client.settings.provider == "openrouter" and not getattr(agent.client, "context_window", None):
                 print("Размер окна модели недоступен · проверка по лимиту OpenRouter пропущена.", file=sys.stderr)
@@ -541,7 +532,7 @@ def chat_command(args, limits):
                                       resume_command=resume_command,
                                       approve_action=partial(confirm_action, verbose=args.verbose),
                                       progress=progress)
-            return shell.run(" ".join(args.request))
+            return shell.run(" ".join(getattr(args, "request", ())))
 
 
 def show_models(args):
@@ -590,6 +581,23 @@ def add_budget_arguments(command):
     command.add_argument("--max-result-bytes", type=int, default=None, help="Total UTF-8 bytes of tool results")
 
 
+def add_progress_option(command):
+    command.add_argument("--progress", nargs="?", const="compact", choices=LAUNCH_OPTIONS["progress"].choices)
+    command.add_argument("--no-progress", dest="progress", action="store_const", const="off")
+
+
+def progress_argv(argv):
+    # An existing bare --progress may be followed by a positional prompt or session ID.
+    result = list(argv)
+    for index, token in enumerate(argv):
+        if token == "--":
+            break
+        following = argv[index + 1] if index + 1 < len(argv) else None
+        if token == "--progress" and following not in LAUNCH_OPTIONS["progress"].choices:
+            result[index] = "--progress=compact"
+    return result
+
+
 def main() -> int:
     parser = HelpParser(prog="agi", usage="agi КОМАНДА [ПАРАМЕТРЫ]", description="Агент для работы с кодом",
                         epilog=project_guide())
@@ -601,6 +609,9 @@ def main() -> int:
     set_command.add_argument("--model")
     set_command.add_argument("--env-file", type=Path, default=Path(".env"))
     for name, option in LAUNCH_OPTIONS.items():
+        if name == "progress":
+            add_progress_option(set_command)
+            continue
         flags = {"default": None}
         if option.kind is bool:
             flags["action"] = argparse.BooleanOptionalAction
@@ -617,7 +628,7 @@ def main() -> int:
         command.add_argument("--env-file", type=Path, default=Path(".env"))
         if action == "resume":
             command.add_argument("--verbose", action="store_true")
-            command.add_argument("--progress", action=argparse.BooleanOptionalAction, default=None)
+            add_progress_option(command)
             command.add_argument("--cost-estimate", action=argparse.BooleanOptionalAction, default=None)
             command.add_argument("--approvals", choices=["ask", "deny"], default=None)
             command.add_argument("--stop-after-tools", type=int, default=None)
@@ -636,9 +647,9 @@ def main() -> int:
         command.add_argument("--env-file", type=Path, default=Path(".env"))
         if action in START_COMMANDS:
             command.add_argument("--verbose", action="store_true")
-            command.add_argument("--progress", action=argparse.BooleanOptionalAction, default=None)
+            add_progress_option(command)
             if action == "chat":
-                command.add_argument("--resume", dest="resume_chat", metavar="ID")
+                command.add_argument("--resume", dest="resume_chat", metavar="ID", nargs="?", const="")
             else:
                 command.add_argument("--journal", action=argparse.BooleanOptionalAction, default=None)
             add_budget_arguments(command)
@@ -680,7 +691,7 @@ def main() -> int:
     if len(sys.argv) == 1:
         parser.print_help()
         return 0
-    args = parser.parse_args()
+    args = parser.parse_args(progress_argv(sys.argv[1:]))
     if args.action == "help":
         target = subparsers.choices[args.command] if args.command else parser
         target.print_help()
@@ -692,9 +703,13 @@ def main() -> int:
             print(f"Настройки сохранены в {args.env_file}: " + ", ".join(updates))
             print("Применяются к новым запускам; начатые сессии сохраняют прежние параметры.")
             return 0
-        if args.action == "chat" and args.resume_chat is not None:
+        if args.action == "resume" and args.session_id == "chat":
+            if args.stop_after_tools is not None or args.stop_after_tasks is not None:
+                raise ConfigurationError("Флаги --stop-after-tools и --stop-after-tasks относятся к отдельному запуску")
+            args.resume_chat = ""
+        if getattr(args, "resume_chat", None) is not None:
             options = set(LAUNCH_OPTIONS) - {"state_db", "cost_estimate", "progress"}
-            if args.provider or args.model or any(getattr(args, name, None) is not None for name in options):
+            if any(getattr(args, name, None) is not None for name in options | {"provider", "model"}):
                 raise ConfigurationError("Для продолжения диалога используются сохранённые настройки запуска")
             load_env(args.env_file)
             if args.state_db is None:
@@ -712,7 +727,7 @@ def main() -> int:
             if args.cost_estimate is None:
                 args.cost_estimate = option_value("cost_estimate", os.getenv("AGENT_COST_ESTIMATE", "true"))
             if args.progress is None:
-                args.progress = option_value("progress", os.getenv("AGENT_PROGRESS", "false"))
+                args.progress = option_value("progress", os.getenv("AGENT_PROGRESS", "compact"))
         if args.action == "models":
             return show_models(args)
         budget_limits = None

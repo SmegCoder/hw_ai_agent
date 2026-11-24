@@ -54,8 +54,8 @@ def color_diff(diff: str) -> str:
 
 
 class ProgressDisplay:
-    def __init__(self, enabled: bool = False):
-        self.enabled = enabled
+    def __init__(self, mode: str = "compact"):
+        self.mode = mode
         self.started_at = monotonic()
         self.target = ""
         self.is_test = False
@@ -69,10 +69,25 @@ class ProgressDisplay:
         elif kind == "model_request":
             self.line(f"Запрос к модели · {event['round']}")
             return True
+        elif kind == "model_usage" and self.mode == "full":
+            usage = event["usage"]
+            self.line(f"Токены запроса {event['round']} · вход {usage.get('prompt_tokens', 'unknown')}"
+                      f" · выход {usage.get('completion_tokens', 'unknown')}")
+            return True
         elif kind == "tool_call":
-            self.tool_start(event)
+            if self.mode == "full":
+                self.line(f"Вызов {visible_line(event['name'])} · {visible(event['arguments'])}")
+            else:
+                self.tool_start(event)
+            return True
         elif kind == "tool_result":
-            self.tool_result(event)
+            if self.mode == "full":
+                self.line(f"Результат {visible_line(event['name'])} · {visible(event['content'])}")
+            elif event.get("failed", event["content"].startswith("ERROR:")):
+                self.line(f"Ошибка {visible_line(event['name'])} · {visible_line(event['content'][:240])}")
+            else:
+                self.tool_result(event)
+            return True
         return False
 
     def tool_start(self, event: dict) -> None:
@@ -99,11 +114,11 @@ class ProgressDisplay:
             self.line(f"{'Проверка' if self.is_test else 'Команда'} · {self.target}")
         elif name in {"read_file", "list_files"}:
             self.line(f"{'Чтение' if name == 'read_file' else 'Список файлов'} · {self.target}")
+        elif name not in {"write_file", "delete_file"}:
+            self.line(f"Инструмент · {visible_line(name)}")
 
     def tool_result(self, event: dict) -> None:
         name, content = event["name"], event["content"]
-        if content.startswith("ERROR:"):
-            return
         if name == "write_file" and content.startswith("wrote "):
             self.line(f"Файл записан · {self.target}")
         elif name == "delete_file" and content.startswith(("removed ", "already absent:")):
