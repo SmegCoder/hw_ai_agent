@@ -292,6 +292,46 @@ class ConversationCLITests(unittest.TestCase):
         with SessionStore(self.db) as store:
             self.assertEqual([t.state.id for t in Conversation(store, identifier).turns()], [run_id])
 
+    def test_brief_groups_actual_file_calls_across_rounds_and_keeps_every_event(self):
+        paths = ["a.py", "b.py", "a.py", "c.py", "d.py"]
+        for path in paths:
+            (self.workspace / path).write_text("original")
+        reads = [tool_call(f"r{i}", "read_file", {"path": p}) for i, p in enumerate(paths)]
+        writes = [tool_call(f"w{i}", "write_file", {"path": p, "content": "changed"}) for i, p in enumerate(paths[:2])]
+        check = tool_call("tests", "Bash", {"command": "python -m unittest"})
+        self.responses = [{"tool_calls": reads[:2]}, {"tool_calls": [*reads[2:], *writes, check]},
+                          {"content": "Готово."}]
+        with patch.object(ToolRuntime, "bash", return_value="exit_code=0\nRan 1 test in 0.001s\n\nOK"):
+            code, out, err = self.invoke("chat", "--model", "test/model", "--workspace", self.workspace,
+                                         "--mode", "auto", "--progress", "brief", inputs=("Проверь", "/exit"))
+        self.assertEqual(code, 0, err)
+        self.assertIn("Читаю a.py, b.py, c.py и ещё 1\n", out)
+        self.assertIn("Изменяю a.py, b.py\n", out)
+        self.assertIn("Запускаю тесты\n", out)
+        self.assertNotIn("Запрос к модели", out)
+        self.assertNotIn("changed", out)
+        identifier = self.conversation_id()
+        with SessionStore(self.db) as store:
+            calls = [r for r in store.event_records(identifier) if r["type"] == "tool_call"]
+            self.assertEqual(len(calls), len(reads) + len(writes) + 1)
+        self.responses = [{"tool_calls": [self.write(2)["tool_calls"][0]]}, {"content": "Отклонено."}]
+        code, out, err = self.invoke("resume", "chat", inputs=("1", "/set mode safe", "Уточнение", "n", "/exit"))
+        self.assertEqual(code, 0, err)
+        self.assertIn("Изменяю value.py\n", out)
+        self.assertIn("Ошибка write_file", out)
+        self.assertEqual(self.file.read_text(), "value = 0\n")
+
+    def test_brief_finishes_partial_line_before_interruption_and_next_prompt(self):
+        read = {"tool_calls": [tool_call("r", "read_file", {"path": "value.py"})]}
+        self.responses = [read, KeyboardInterrupt()]
+        code, out, err = self.start("/set progress brief", "Прочитай")
+        self.assertEqual(code, 130, err)
+        self.assertIn("Читаю value.py\n\nДиалог на паузе", out)
+        self.responses = [{"content": "Готово."}, read, {"content": "Готово."}]
+        code, out, err = self.invoke("resume", "chat", inputs=("1", "/resume", "Прочитай опять", "/exit"))
+        self.assertEqual(code, 0, err)
+        self.assertIn("Читаю value.py\n", out)
+
     def test_chat_settings_persist_and_resumed_turn_uses_its_checkpoint(self):
         self.responses = [self.write(1), KeyboardInterrupt()]
         self.assertEqual(self.start("Первая правка")[0], 130)

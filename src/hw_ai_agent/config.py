@@ -78,7 +78,7 @@ LAUNCH_OPTIONS = {
     "journal": LaunchOption("AGENT_JOURNAL", False, bool),
     "route": LaunchOption("AGENT_ROUTE", False, bool),
     "cost_estimate": LaunchOption("AGENT_COST_ESTIMATE", True, bool),
-    "progress": LaunchOption("AGENT_PROGRESS", "compact", str, choices=("compact", "full", "off")),
+    "progress": LaunchOption("AGENT_PROGRESS", "compact", str, choices=("brief", "compact", "full", "off")),
     "route_simple_model": LaunchOption("AGENT_ROUTE_SIMPLE_MODEL", None, str),
     "route_medium_model": LaunchOption("AGENT_ROUTE_MEDIUM_MODEL", None, str),
     "route_complex_model": LaunchOption("AGENT_ROUTE_COMPLEX_MODEL", None, str),

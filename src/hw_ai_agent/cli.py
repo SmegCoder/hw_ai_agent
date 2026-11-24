@@ -128,6 +128,8 @@ def event_listener(stop_after_tools=None, stop_after_tasks=None, *, verbose=Fals
         if progress and progress.mode != "off" and progress.render(event):
             return
         if verbose and event["event"] not in {"tool_call", "tool_result"}:
+            if progress:
+                progress.finish_line()
             show_event(event)
         else:
             show_compact_event(event, chat=chat)
@@ -142,6 +144,8 @@ def event_listener(stop_after_tools=None, stop_after_tasks=None, *, verbose=Fals
         if event["event"] == "tool_result":
             completed += 1
             if stop_after_tools is not None and completed >= stop_after_tools:
+                if progress:
+                    progress.finish_line()
                 print("Пауза после сохранённого результата инструмента.", flush=True)
                 raise KeyboardInterrupt
         if event["event"] == "task_completed":
@@ -317,9 +321,10 @@ def session_command(args):
             store.decide_plan(args.session_id, args.action == "approve-plan")
             print("Решение по плану сохранено." + (" Продолжение: agi resume" if args.action == "approve-plan" else " Сессия завершена."))
             return 0
+        progress = ProgressDisplay(getattr(args, "progress", "off"))
         listener = event_listener(getattr(args, "stop_after_tools", None), getattr(args, "stop_after_tasks", None),
                                   verbose=getattr(args, "verbose", False),
-                                  progress=ProgressDisplay(args.progress) if args.action == "resume" else None)
+                                  progress=progress)
         if args.action == "resolve":
             verifier = None
             journal = None
@@ -356,7 +361,9 @@ def session_command(args):
                             **interactive_options(runtime, args))
         if not args.verbose:
             report_header("resume", runtime.root, settings)
-        report_answer(agent, agent.resume(args.session_id), verbose=args.verbose)
+        with progress:
+            answer = agent.resume(args.session_id)
+        report_answer(agent, answer, verbose=args.verbose)
         return 0
 
 def catalog_for(args, provider):
@@ -753,15 +760,17 @@ def main() -> int:
                 return 130
         if args.action == "chat":
             return chat_command(args, budget_limits)
-        listener = event_listener(args.stop_after_tools, args.stop_after_tasks, verbose=args.verbose,
-                                  progress=ProgressDisplay(args.progress))
+        progress = ProgressDisplay(args.progress)
+        listener = event_listener(args.stop_after_tools, args.stop_after_tasks, verbose=args.verbose, progress=progress)
         runtime = starting_runtime(args, listener)
         with SessionStore(args.state_db) as store:
             agent = new_agent(args, store, runtime, listener, budget_limits)
             request = " ".join(args.request)
             if not args.verbose:
                 report_header(args.action, runtime.root, getattr(agent.client, "settings", None), request)
-            report_answer(agent, agent.run(request), verbose=args.verbose)
+            with progress:
+                answer = agent.run(request)
+            report_answer(agent, answer, verbose=args.verbose)
         return 0
     except ApprovalDeferred as exc:
         print(f"\nОжидается подтверждение: {exc}", file=sys.stderr)

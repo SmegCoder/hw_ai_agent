@@ -128,15 +128,20 @@ agi plan --workspace /path/to/my-project --mode safe \
 По умолчанию CLI показывает время от начала запроса и короткое действие агента.
 Например, `00:02  Чтение · notes.txt`. Флаг `--progress full` показывает аргументы
 и результат каждого вызова инструмента, а также токены каждого обращения к модели.
+Режим `brief` объединяет последовательные обращения к файлам по действию.
+Например, `00:02  Читаю main.py, config.py` и `00:04  Изменяю main.py`.
+В строке видны первые три разных пути и число остальных. Ошибки и запросы
+подтверждения выводятся сразу. Полный журнал доступен через `agi events ID`.
 
 ```bash
 agi chat
+agi chat --progress brief
 agi chat --progress full
 agi resume chat --progress full
 ```
 
 `agi set --progress full` сохраняет настройку для будущих запусков.
-Поддерживаются `compact`, `full` и `off`. Прежние значения `AGENT_PROGRESS=true`
+Поддерживаются `brief`, `compact`, `full` и `off`. Прежние значения `AGENT_PROGRESS=true`
 и `false` означают `compact` и `off`. Флаг `--no-progress` выключает прогресс
 для текущего запуска. `--verbose` добавляет диагностику бюджетов и решений policy.
 
@@ -178,7 +183,7 @@ agi chat --resume ID
 Настройки сохраняются после `agi chat --resume ID`. Команда `/resume` продолжает
 уже начатый запрос с параметрами его контрольной точки.
 
-`/set progress full`, `/set progress compact` и `/set progress off` меняют
+`/set progress brief`, `/set progress compact`, `/set progress full` и `/set progress off` меняют
 вывод сразу и сохраняют выбор для этого диалога. Флаг командной строки при
 повторном открытии действует до выхода из чата.
 
@@ -516,7 +521,7 @@ agi help run
 | `AGENT_PLAN` | `--plan` / `--no-plan` |
 | `AGENT_TASKS` | `--tasks` / `--no-tasks` |
 | `AGENT_JOURNAL` | `--journal` / `--no-journal` |
-| `AGENT_PROGRESS` | `--progress compact\|full\|off` (по умолчанию `compact`) |
+| `AGENT_PROGRESS` | `--progress brief\|compact\|full\|off` (по умолчанию `compact`) |
 | `AGENT_COST_ESTIMATE` | `--cost-estimate` / `--no-cost-estimate` |
 | `AGENT_ROUTE` | `--route` / `--no-route` |
 | `AGENT_ROUTE_SIMPLE_MODEL` | `--route-simple-model` |

@@ -54,20 +54,59 @@ def color_diff(diff: str) -> str:
 
 
 class ProgressDisplay:
+    FILE_ACTIONS = {"read_file": "Читаю", "write_file": "Изменяю", "delete_file": "Удаляю", "list_files": "Просматриваю"}
+    TASK_ACTIONS = {"submit_plan": "Предлагаю план", "complete_task": "Завершаю задачу", "fail_task": "Отмечаю ошибку задачи"}
+
     def __init__(self, mode: str = "compact"):
         self.mode = mode
         self.started_at = monotonic()
         self.target = ""
         self.is_test = False
+        self.brief_action = ""
+        self.brief_paths: set[str] = set()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.finish_line()
+
+    def finish_line(self):
+        if self.brief_action:
+            extra = len(self.brief_paths) - 3
+            print(f" и ещё {extra}" if extra > 0 else "", flush=True)
+            self.brief_paths.clear()
+            self.brief_action = ""
+
+    def brief_file(self, action: str, path: str):
+        if self.brief_action != action:
+            self.finish_line()
+            self.brief_action = action
+        if path in self.brief_paths:
+            return
+        self.brief_paths.add(path)
+        label = path if len(path) <= 40 else "…" + path[-39:]
+        if len(self.brief_paths) == 1:
+            self.line(f"{action} {label}", end="")
+        elif len(self.brief_paths) <= 3:
+            print(f", {label}", end="", flush=True)
 
     def render(self, event: dict) -> bool:
         """Render a progress line when this event has useful information."""
         kind = event["event"]
+        brief = self.mode == "brief"
+        if brief and (kind in {"final", "context_warning", "model_retry", "task_completed",
+                               "session_created", "session_resumed", "session_cached"}
+                      or (kind == "policy_decision" and event["outcome"] == "waiting")):
+            self.finish_line()
         if kind in {"session_created", "session_resumed"}:
             self.started_at = monotonic()
             self.target, self.is_test = "", False
         elif kind == "model_request":
-            self.line(f"Запрос к модели · {event['round']}")
+            if not brief:
+                self.line(f"Запрос к модели · {event['round']}")
+            elif event["round"] == 1:
+                self.line("Думаю…")
             return True
         elif kind == "model_usage" and self.mode == "full":
             usage = event["usage"]
@@ -84,8 +123,9 @@ class ProgressDisplay:
             if self.mode == "full":
                 self.line(f"Результат {visible_line(event['name'])} · {visible(event['content'])}")
             elif event.get("failed", event["content"].startswith("ERROR:")):
+                self.finish_line()
                 self.line(f"Ошибка {visible_line(event['name'])} · {visible_line(event['content'][:240])}")
-            else:
+            elif not brief or event["name"] in {"Bash", "bash"}:
                 self.tool_result(event)
             return True
         return False
@@ -103,6 +143,12 @@ class ProgressDisplay:
         if not isinstance(target, str):
             return
         self.target = visible_line(target)
+        brief = self.mode == "brief"
+        if brief:
+            if name in self.FILE_ACTIONS:
+                self.brief_file(self.FILE_ACTIONS[name], self.target)
+                return
+            self.finish_line()
         if len(self.target) > 120:
             self.target = self.target[:119] + "…"
         if name in {"Bash", "bash"}:
@@ -111,11 +157,15 @@ class ProgressDisplay:
                 self.is_test = True
             except PlanError:
                 pass
-            self.line(f"{'Проверка' if self.is_test else 'Команда'} · {self.target}")
+            if brief:
+                self.line("Запускаю тесты" if self.is_test else "Выполняю команду")
+            else:
+                self.line(f"{'Проверка' if self.is_test else 'Команда'} · {self.target}")
         elif name in {"read_file", "list_files"}:
             self.line(f"{'Чтение' if name == 'read_file' else 'Список файлов'} · {self.target}")
         elif name not in {"write_file", "delete_file"}:
-            self.line(f"Инструмент · {visible_line(name)}")
+            label = f"Инструмент · {visible_line(name)}"
+            self.line(self.TASK_ACTIONS.get(name, label) if brief else label)
 
     def tool_result(self, event: dict) -> None:
         name, content = event["name"], event["content"]
@@ -135,9 +185,9 @@ class ProgressDisplay:
                     label = "Успех тестов не подтверждён" if self.is_test else "Команда завершена"
                     self.line(f"{label} · код {status[1]}")
 
-    def line(self, text: str) -> None:
+    def line(self, text: str, *, end="\n") -> None:
         minutes, seconds = divmod(int(monotonic() - self.started_at), 60)
-        print(f"{emphasis(f'{minutes:02}:{seconds:02}', '2')}  {text}", flush=True)
+        print(f"{emphasis(f'{minutes:02}:{seconds:02}', '2')}  {text}", end=end, flush=True)
 
 
 def report_header(action, workspace: Path, settings, request: str | None = None) -> None:

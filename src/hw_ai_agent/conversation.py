@@ -24,7 +24,7 @@ CHAT_OPTIONS = {
     "max-tool-calls": ("budget", "tool_calls", "N"),
     "max-side-effects": ("budget", "side_effects", "N"),
     "max-tokens": ("binding", "max_tokens", "N"),
-    "progress": (None, "progress", "compact|full|off"),
+    "progress": (None, "progress", "brief|compact|full|off"),
 }
 
 COMMANDS = """Введите запрос или команду.
@@ -283,7 +283,8 @@ class ConversationShell:
 
     def execute(self, action):
         try:
-            action()
+            with self.progress:
+                action()
         except ApprovalDeferred:
             print("Запрос на паузе · продолжить через /resume")
         except ModelClientError as exc:
