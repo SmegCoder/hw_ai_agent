@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import sys
 import tempfile
 import unittest
 from contextlib import chdir, redirect_stderr, redirect_stdout
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -146,6 +147,77 @@ class ConversationCLITests(unittest.TestCase):
         self.assertNotIn("расход известен частично", out)
         self.assertEqual(self.file.read_text(), "value = 0\n")
         self.assertNotIn(("user", "Новый запрос слишком рано"), self.requests[-1])
+
+    def test_stats_and_jsonl_cover_approved_and_refused_followup(self):
+        self.responses = [
+            (self.write(1), {"prompt_tokens": 12, "completion_tokens": 4,
+                             "prompt_tokens_details": {"cached_tokens": 8}}),
+            ({"content": "Сохранено в value.py."}, {"prompt_tokens": 3}),
+            (self.write(2), {}),
+            ({"content": "Изменение отклонено."}, {"total_tokens": 7}),
+        ]
+        code, out, err = self.start("/stats", "/set mode safe", "Запиши результат.", "y",
+                                    "Теперь замени его.", "n", "/stats", "/exit")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Обращения к модели · 0", out)
+        self.assertIn("вход 15 (частично, 2/4) · выход 4 (частично, 1/4) · всего 23 (частично, 2/4)", out)
+        self.assertIn("вход unknown · выход unknown · всего 7 (частично, 1/2)", out)
+        self.assertIn("Вызовы инструментов · 2 · уникальных 1 · write_file × 2", out)
+        self.assertEqual(self.file.read_text(), "value = 1\n")
+        self.assertIn(("assistant", "Сохранено в value.py."), self.requests[2])
+        identifier = self.conversation_id()
+        code, log, err = self.invoke("events", identifier)
+        self.assertEqual(code, 0, err)
+        events = [json.loads(line) for line in log.splitlines()]
+        self.assertEqual({e["session_id"] for e in events}, {identifier})
+        self.assertEqual(len(events), len({e["id"] for e in events}))
+        self.assertTrue(all(datetime.fromisoformat(e["time"]).tzinfo for e in events))
+        self.assertEqual([e["data"]["content"] for e in events if e["type"] == "user_request"],
+                         ["Запиши результат.", "Теперь замени его."])
+        runs = [e["run_id"] for e in events if e["type"] == "user_request"]
+        self.assertNotEqual(*runs)
+        self.assertIn("refused", [e["data"]["outcome"] for e in events if e["type"] == "policy_decision"])
+        self.assertEqual([e["data"]["failed"] for e in events if e["type"] == "tool_result"], [False, True])
+        self.assertEqual([json.loads(e["data"]["arguments"])["path"] for e in events if e["type"] == "tool_call"],
+                         ["value.py", "value.py"])
+        code, single, err = self.invoke("events", runs[0])
+        self.assertEqual(code, 0, err)
+        self.assertEqual([json.loads(line) for line in single.splitlines()],
+                         [e for e in events if e["run_id"] == runs[0]])
+        self.assertEqual(self.invoke("chat", "--resume", identifier, inputs=("/end",))[0], 0)
+        self.assertEqual(self.invoke("events", identifier)[1], log)
+
+    def test_failed_model_request_can_resume_with_same_run_and_missing_usage(self):
+        self.responses = [KeyboardInterrupt()]
+        self.assertEqual(self.start("Запрос с test-key")[0], 130)
+        identifier = self.conversation_id()
+        _, before, _ = self.invoke("events", identifier)
+        first = [json.loads(line) for line in before.splitlines()]
+        run_id = first[0]["run_id"]
+        self.assertNotIn("test-key", before)
+        self.assertIn("run_error", [e["type"] for e in first])
+        self.responses = [({"content": "Готово."}, {})]
+        code, out, err = self.invoke("chat", "--resume", identifier, inputs=("/resume", "/stats", "/exit"))
+        self.assertEqual(code, 0, err)
+        self.assertIn("Обращения к модели · 2", out)
+        self.assertIn("вход unknown · выход unknown · всего unknown", out)
+        _, after, _ = self.invoke("events", identifier)
+        self.assertTrue(after.startswith(before))
+        self.assertEqual({json.loads(line)["run_id"] for line in after.splitlines()}, {run_id})
+
+    def test_export_old_event_without_timestamp(self):
+        self.responses = [{"content": "Готово."}]
+        self.assertEqual(self.start("Запрос", "/exit")[0], 0)
+        identifier = self.conversation_id()
+        with SessionStore(self.db) as store:
+            run_id = Conversation(store, identifier).turns()[0].state.id
+            store.db.execute("UPDATE sessions SET events=? WHERE id=?",
+                             (encoded([{"event": "final", "content": "старый ответ"}]), run_id))
+        code, out, err = self.invoke("events", identifier)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out), {"id": run_id + ":1", "time": None, "type": "final",
+                                         "session_id": identifier, "run_id": run_id,
+                                         "data": {"content": "старый ответ"}})
 
     def test_chat_settings_persist_and_resumed_turn_uses_its_checkpoint(self):
         self.responses = [self.write(1), KeyboardInterrupt()]

@@ -129,8 +129,13 @@ def show_compact_event(event: dict, *, chat=False) -> None:
         show_model_retry(event)
     elif kind == "task_completed":
         print(f"[x] {visible(event['task_id'])}", flush=True)
-    elif kind == "tool_result" and event["content"].startswith("ERROR:"):
-        print(f"{visible(event['name'])} · {visible(event['content'].splitlines()[0][:240])}", flush=True)
+    elif chat and kind == "tool_call":
+        print(f"Инструмент · {visible_line(event['name'])}", flush=True)
+    elif kind == "tool_result":
+        if event.get("failed", event["content"].startswith("ERROR:")):
+            print(f"{visible_line(event['name'])} · {visible_line(event['content'][:240])}", flush=True)
+        elif chat:
+            print(f"{visible_line(event['name'])} · выполнено", flush=True)
 
 
 def event_listener(stop_after_tools=None, stop_after_tasks=None, *, verbose=False, chat=False, progress=None):
@@ -259,6 +264,10 @@ def can_resume(metadata: dict) -> bool:
 
 def session_command(args):
     with SessionStore(args.state_db) as store:
+        if args.action == "events":
+            for record in store.event_records(args.session_id):
+                print(json_text(record))
+            return 0
         if args.action == "sessions":
             print(json_text(store.list_sessions(), indent=2))
             return 0
@@ -600,7 +609,7 @@ def main() -> int:
             if option.choices:
                 flags["choices"] = option.choices
         set_command.add_argument("--" + name.replace("_", "-"), **flags)
-    for action in ("sessions", "session", "resume", "resolve", "approve-plan", "reject-plan", "changes", "rollback", "cost"):
+    for action in ("sessions", "session", "events", "resume", "resolve", "approve-plan", "reject-plan", "changes", "rollback", "cost"):
         command = subparsers.add_parser(action, help=COMMAND_HELP[action], description=COMMAND_HELP[action])
         command.add_argument("--state-db", type=Path, default=None)
         if action != "sessions":
@@ -714,7 +723,7 @@ def main() -> int:
             raise ConfigurationError("--stop-after-tools must be positive")
         if getattr(args, "stop_after_tasks", None) is not None and args.stop_after_tasks < 1:
             raise ConfigurationError("--stop-after-tasks must be positive")
-        if args.action in {"sessions", "session", "resume", "resolve", "approve-plan", "reject-plan", "changes", "rollback", "cost"}:
+        if args.action in {"sessions", "session", "events", "resume", "resolve", "approve-plan", "reject-plan", "changes", "rollback", "cost"}:
             return session_command(args)
         if args.action == "setup":
             setup(args.provider or "openrouter", args.model, args.env_file)

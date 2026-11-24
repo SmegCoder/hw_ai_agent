@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections import Counter
 from dataclasses import dataclass
 
 from .agent import AgentError
@@ -31,10 +32,12 @@ COMMANDS = """Введите запрос или команду.
   /changes       Показать правки последнего запроса с изменениями
   /rollback      Отменить правки последнего запроса и остаться в диалоге
   /tokens        Токены всех обращений к модели в диалоге
+  /stats         Статистика каждого запроса и всего диалога
   /settings      Показать настройки диалога
   /set ИМЯ ЗНАЧЕНИЕ   Сохранить настройку диалога
   /resume        Продолжить приостановленный запрос
   /stop          Поставить диалог на паузу
+  /exit          Выйти с возможностью продолжить диалог
   /end           Окончательно завершить диалог
   /help          Показать команды"""
 
@@ -45,6 +48,53 @@ class Turn:
     prompt: str
     state: SessionState
     journal_status: str | None
+
+
+class RunStats:
+    def __init__(self):
+        self.requests = 0
+        self.tools = Counter()
+        self.known = Counter()
+        self.tokens = Counter()
+
+    def include(self, state: SessionState):
+        self.requests += state.rounds
+        usage_by_round = {}
+        legacy_usage = []
+        for event in state.events:
+            if event["event"] == "tool_call":
+                self.tools[event["name"]] += 1
+            elif event["event"] in {"model_cost", "model_usage"} and event.get("usage"):
+                if "round" in event:
+                    # Both events contain the API counters. A crash can leave only model_cost.
+                    usage_by_round[event["round"]] = event["usage"]
+                elif event["event"] == "model_usage":
+                    legacy_usage.append(event["usage"])
+        for usage in [*usage_by_round.values(), *legacy_usage]:
+            values = {key: usage[key] for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+                      if type(usage.get(key)) is int and usage[key] >= 0}
+            if "total_tokens" not in values and {"prompt_tokens", "completion_tokens"} <= values.keys():
+                values["total_tokens"] = values["prompt_tokens"] + values["completion_tokens"]
+            self.known.update(values.keys())
+            self.tokens.update(values)
+
+    def token_count(self, key):
+        if self.requests == 0:
+            return "0"
+        count = self.known[key]
+        if count == 0:
+            return "unknown"
+        if count < self.requests:
+            return f"{self.tokens[key]} (частично, {count}/{self.requests})"
+        return str(self.tokens[key])
+
+    def display(self):
+        print(f"  Обращения к модели · {self.requests}")
+        print(f"  Токены API · вход {self.token_count('prompt_tokens')} · выход {self.token_count('completion_tokens')}"
+              f" · всего {self.token_count('total_tokens')}")
+        tools = ", ".join(f"{visible(name)} × {count}" for name, count in sorted(self.tools.items()))
+        print(f"  Вызовы инструментов · {self.tools.total()} · уникальных {len(self.tools)}"
+              + (f" · {tools}" if tools else ""))
 
 
 class Conversation:
@@ -183,7 +233,7 @@ class ConversationShell:
                     continue
                 parts = line.split(maxsplit=1)
                 command, argument = parts[0], parts[1] if len(parts) == 2 else ""
-                if command in {"/pause", "/stop"} and not argument:
+                if command in {"/pause", "/stop", "/exit"} and not argument:
                     self.pause()
                     return 0
                 if command == "/end" and not argument:
@@ -227,6 +277,8 @@ class ConversationShell:
             self.changes(rollback=command == "/rollback")
         elif command == "/tokens" and not argument:
             self.show_tokens()
+        elif command == "/stats" and not argument:
+            self.show_stats()
         elif command == "/settings" and not argument:
             self.show_settings()
         elif command == "/set":
@@ -294,6 +346,17 @@ class ConversationShell:
         reported, estimated, incomplete = self.conversation.tokens(turns)
         prefix = "≈" if estimated or incomplete else ""
         print(f"Токены за диалог · {prefix}{reported + estimated:,}".replace(",", " "))
+
+    def show_stats(self):
+        total = RunStats()
+        for turn in self.conversation.turns():
+            run = RunStats()
+            run.include(turn.state)
+            total.include(turn.state)
+            print(f"Запрос {turn.number} · {turn.state.id} · {turn.state.status}")
+            run.display()
+        print(f"Итого за диалог · {self.conversation.id}")
+        total.display()
 
     def pause(self):
         print(f"\nДиалог на паузе · {self.resume_command}")

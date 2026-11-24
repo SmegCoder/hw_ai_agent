@@ -111,6 +111,10 @@ class CodingAgent:
         self.events: list[dict[str, Any]] = []
         self.messages: list[dict[str, Any]] = []
         self.store = store
+        settings = getattr(client, "settings", None)
+        credential = getattr(settings, "api_key", None)
+        if store and getattr(settings, "provider", None) in {"openrouter", "openai"} and isinstance(credential, str) and credential:
+            store.log_credentials.add(credential)
         self.session_metadata = dict(session_metadata or {})
         self.plan_mode = plan_mode or task_mode
         self.task_mode = task_mode
@@ -516,7 +520,8 @@ class CodingAgent:
             result = self.store.finish_call(self.session_id, item, result, call["id"] in self._failed_call_ids)
         self._remember_call(call, result)
         self.messages.append(result)
-        self._emit({"event": "tool_result", "task_id": item.get("task_id"), "phase": item.get("phase"), **result}, persist=False)
+        self._emit({"event": "tool_result", "task_id": item.get("task_id"), "phase": item.get("phase"),
+                    "failed": call["id"] in self._failed_call_ids, **result}, persist=False)
         self._emit_budget()
         if self._journal_failure:
             raise self._journal_failure
