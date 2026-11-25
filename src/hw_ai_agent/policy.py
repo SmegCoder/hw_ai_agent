@@ -8,6 +8,8 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Mapping
 
+from .mcp import mcp_fields
+
 
 class PolicyError(ValueError):
     pass
@@ -97,9 +99,12 @@ class Policy:
 
     def decide(self, tool: str, *, path: str | None = None,
                command: str | None = None) -> Decision:
-        if tool not in TOOLS:
+        external = bool(mcp_fields(tool))
+        if tool not in TOOLS and not external:
             return Decision(Action.DENY, "Unknown tool")
         matches = [r for r in self.rules if r.matches(tool, path, command)]
+        if external and not any(r.tool == tool for r in matches):
+            return Decision(Action.DENY, "MCP requires a policy rule for this exact tool")
         if matches:
             # Explicit denials always outrank ask/allow, irrespective of rule order.
             priority = {Action.ALLOW: 0, Action.ASK: 1, Action.DENY: 2}
@@ -178,7 +183,7 @@ class Policy:
             if not isinstance(item, dict) or set(item) - {"tool", "action", "path", "command", "reason"}:
                 raise PolicyError("Invalid rule fields")
             tool = item.get("tool")
-            if not isinstance(tool, str) or tool not in TOOLS | {"*"}:
+            if not isinstance(tool, str) or (tool not in TOOLS | {"*"} and not mcp_fields(tool)):
                 raise PolicyError("Invalid rule tool")
             try:
                 action = Action(item["action"])

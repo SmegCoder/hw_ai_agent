@@ -1,0 +1,8 @@
+{
+  "tasks": [
+    {"id": "T1", "title": "Решить задачи по RISC-V", "subject": "АКОС", "status": "open", "due_date": "2026-11-24"},
+    {"id": "T2", "title": "Проверить схему БД", "subject": "Базы данных", "status": "closed", "due_date": "2026-11-23"},
+    {"id": "T3", "title": "Подготовить лабораторную", "subject": "АКОС", "status": "in_progress", "due_date": "2026-11-27"},
+    {"id": "T4", "title": "Прочитать главу про транзакции", "subject": "Базы данных", "status": "open", "due_date": null}
+  ]
+}

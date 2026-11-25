@@ -139,7 +139,8 @@ class ProgressDisplay:
             return
         if not isinstance(arguments, dict):
             return
-        target = arguments.get("command" if name in {"Bash", "bash"} else "path", ".")
+        target_key = {"Bash": "command", "bash": "command", "load_skill": "name"}.get(name, "path")
+        target = arguments.get(target_key, ".")
         if not isinstance(target, str):
             return
         self.target = visible_line(target)
@@ -163,6 +164,8 @@ class ProgressDisplay:
                 self.line(f"{'Проверка' if self.is_test else 'Команда'} · {self.target}")
         elif name in {"read_file", "list_files"}:
             self.line(f"{'Чтение' if name == 'read_file' else 'Список файлов'} · {self.target}")
+        elif name == "load_skill":
+            self.line(f"Загрузка скилла · {self.target}")
         elif name not in {"write_file", "delete_file"}:
             label = f"Инструмент · {visible_line(name)}"
             self.line(self.TASK_ACTIONS.get(name, label) if brief else label)

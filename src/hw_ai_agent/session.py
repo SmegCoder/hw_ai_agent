@@ -15,6 +15,8 @@ from .planning import validate_plan, PlanError
 from .tasks import validate_task_plan, validate_proof, TaskError
 from .budget import BudgetLimits, BudgetExceeded, DIMENSIONS, snapshot, debit, batch_cost, truncate_result
 from .pricing import cost_summary, PricingError
+from .skills import skill_loaded_event
+from .mcp import mcp_event, mcp_fields
 from .text import escape_surrogates, json_text as encoded
 
 
@@ -316,6 +318,8 @@ class SessionStore:
                 self.db.execute("INSERT INTO plans VALUES (?, 'planning', NULL, ?)", (session_id, now))
             if messages and messages[-1].get("role") == "user":
                 self._event(session_id, {"event": "user_request", "content": messages[-1]["content"]})
+            if "skill_manifest" in metadata:
+                self._event(session_id, {"event": "skills_discovered", "names": list(metadata["skill_manifest"])})
         return session_id
 
     def get(self, session_id: str) -> SessionState:
@@ -532,10 +536,11 @@ class SessionStore:
         self.db.execute("UPDATE sessions SET events=?,updated_at=? WHERE id=?", (encoded(events), now, session_id))
 
     def redacted_event(self, event: dict) -> dict:
-        payload = dict(event)
+        payload = dict(mcp_event(event))
         if self.log_credentials:
             for key in ("content", "arguments", "error", "reason", "assistant", "plan", "preview",
-                        "prompt", "path", "paths", "proof", "tool_call_id", "tool", "name", "task_id"):
+                        "prompt", "path", "paths", "proof", "tool_call_id", "tool", "name", "names", "task_id",
+                        "server", "mcp_tool"):
                 if key in payload:
                     payload[key] = self._redact_log_text(payload[key])
         return payload
@@ -735,6 +740,8 @@ class SessionStore:
                             (encoded([*state.messages, result]), stamp(), session_id))
             self._event(session_id, {"event": "tool_result", "call": item["key"], "task_id": item.get("task_id"),
                                      "phase": item.get("phase"), "failed": failed, **result})
+            if item["call"]["function"]["name"] == "load_skill" and not failed:
+                self._event(session_id, {**skill_loaded_event(item["call"]), "call": item["key"]})
             self._event(session_id, {"event": "budget_settlement", "call": item["key"], "quota": quota,
                                      "result_bytes": len(result["content"].encode("utf-8")),
                                      "forfeited": bool(allocation["forfeited"])})
@@ -804,7 +811,9 @@ class SessionStore:
                 raise SessionError("Journal recovery requires the session runtime and explicit change attribution")
             journal.resolve_changes(item, changes)
         if resolution == "retry":
-            if item["call"]["function"]["name"] not in {"write_file", "delete_file", "read_file", "list_files", "Bash", "bash", "submit_plan", "complete_task", "fail_task"}:
+            name = item["call"]["function"]["name"]
+            if name not in {"write_file", "delete_file", "read_file", "list_files", "load_skill", "Bash", "bash",
+                            "submit_plan", "complete_task", "fail_task"} and not mcp_fields(name):
                 raise SessionError("This instrument has no supported safe retry contract")
             with self.transaction():
                 self.db.execute("UPDATE calls SET state='pending' WHERE session_id=? AND batch=? AND position=?",

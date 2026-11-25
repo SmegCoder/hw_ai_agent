@@ -34,6 +34,9 @@ from .terminal import (visible, visible_line, emphasis, confirm_plan, choose_ses
 from .journal import ChangeJournal, JournalError
 from .tasks import checklist
 from .text import json_text
+from .skills import SkillCatalog
+from .mcp import MCPRegistry
+from .eval_runner import Options as EvalOptions, run_evaluation
 
 def show_context_warning(event):
     projected, window = event["projected"], event["window"]
@@ -63,6 +66,8 @@ def show_event(event: dict) -> None:
         show_context_warning(event)
     elif event["event"] == "model_retry":
         show_model_retry(event)
+    elif event["event"] == "mcp_error":
+        print(f"MCP · {visible_line(event['server'])} · {visible_line(event['error'])}", file=sys.stderr, flush=True)
     elif event["event"] == "policy_decision":
         print(f"Policy: {event['tool']} → {event['action']} / {event['outcome']}", flush=True)
         if event.get("source") == "session_grant":
@@ -116,6 +121,8 @@ def show_compact_event(event: dict, *, chat=False) -> None:
         show_context_warning(event)
     elif kind == "model_retry":
         show_model_retry(event)
+    elif kind == "mcp_error":
+        print(f"MCP · {visible_line(event['server'])} · {visible_line(event['error'])}", file=sys.stderr, flush=True)
     elif kind == "task_completed":
         print(f"[x] {visible(event['task_id'])}", flush=True)
     elif kind == "tool_result":
@@ -211,8 +218,15 @@ def doctor(settings: Settings) -> bool:
         print("API key: configured (network request not made)")
     return success
 
+def open_skills(workspace: Path, directory: Path | None) -> SkillCatalog:
+    catalog = SkillCatalog(workspace.expanduser(), directory)
+    for name, reason in catalog.errors:
+        print(f"Скилл пропущен · {visible_line(name)} · {visible_line(reason)}", file=sys.stderr)
+    return catalog
+
+
 def saved_runtime(state, db_path: Path, approvals=None, on_event=show_event, *,
-                  allow_policy_change=False, verbose=False):
+                  allow_policy_change=False, verbose=False, load_extensions=False):
     metadata = state.metadata
     workspace = Path(metadata["workspace"])
     if db_path.resolve().is_relative_to(workspace.resolve()):
@@ -231,7 +245,24 @@ def saved_runtime(state, db_path: Path, approvals=None, on_event=show_event, *,
         any(type(limits[k]) is not int for k in ("max_output_chars", "max_file_chars"))):
         raise SessionError("Invalid saved runtime limits")
     mode = approvals or metadata.get("approvals", "ask")
+    options = metadata.get("skill_config")
+    skills = None
+    if load_extensions and options is not None:
+        if not isinstance(options, dict) or set(options) != {"directory"}:
+            raise SessionError("Не удалось прочитать настройки каталога скиллов")
+        directory = options["directory"]
+        if directory is not None and (not isinstance(directory, str) or not Path(directory).is_absolute()):
+            raise SessionError("Некорректный путь сохранённого каталога скиллов")
+        skills = open_skills(workspace, Path(directory) if directory is not None else None)
+    mcp = None
+    mcp_config = metadata.get("mcp_config")
+    if load_extensions and mcp_config is not None:
+        if (not isinstance(mcp_config, dict) or not isinstance(mcp_config.get("path"), str)
+                or not Path(mcp_config["path"]).is_absolute() or not isinstance(mcp_config.get("digest"), str)):
+            raise SessionError("Не удалось прочитать настройки MCP")
+        mcp = MCPRegistry(Path(mcp_config["path"]), workspace, expected_digest=mcp_config["digest"])
     return ToolRuntime(workspace, policy=policy, mode=metadata.get("execution_mode", "safe"),
+                       skills=skills, mcp=mcp,
                        trash_dir=metadata.get("trash_dir", str(db_path.resolve().parent / "trash")),
                        approve=partial(confirm_action, verbose=verbose) if mode == "ask" else None,
                        on_policy_event=on_event, **limits)
@@ -352,7 +383,8 @@ def session_command(args):
         metadata = state.metadata
         if not can_resume(metadata):
             raise SessionError("Эту сессию можно просмотреть, но её запуск больше не поддерживается")
-        runtime = saved_runtime(state, store.path, getattr(args, "approvals", None), listener, verbose=args.verbose)
+        runtime = saved_runtime(state, store.path, getattr(args, "approvals", None), listener,
+                                verbose=args.verbose, load_extensions=True)
         load_env(args.env_file)
         settings = Settings.from_env(metadata["provider"], metadata["model"])
         client = new_client(settings, metadata["max_tokens"], args)
@@ -457,6 +489,8 @@ def starting_runtime(args, listener):
     if args.state_db.expanduser().resolve().is_relative_to(workspace.expanduser().resolve()):
         raise SessionError("База сессий должна находиться вне рабочей папки")
     return ToolRuntime(workspace, policy=load_policy(args.policy, workspace), mode=args.mode,
+                       skills=open_skills(workspace, args.skills_dir) if args.skills is not False else None,
+                       mcp=MCPRegistry(args.mcp_config, workspace) if args.mcp_config is not None else None,
                        trash_dir=args.state_db.expanduser().resolve().parent / "trash",
                        approve=partial(confirm_action, verbose=args.verbose) if args.approvals == "ask" else None,
                        on_policy_event=listener)
@@ -484,7 +518,8 @@ def restore_chat_agent(args, store, listener, configuration):
         raise ConfigurationError("Адрес модели изменился. Откройте диалог с прежним файлом настроек")
     if args.cost_estimate is None:
         args.cost_estimate = configuration["cost_estimate"]
-    runtime = saved_runtime(SimpleNamespace(metadata=binding), store.path, on_event=listener, verbose=args.verbose)
+    runtime = saved_runtime(SimpleNamespace(metadata={"skill_config": {"directory": None}, **binding}),
+                            store.path, on_event=listener, verbose=args.verbose, load_extensions=True)
     client = new_client(settings, binding["max_tokens"], args)
     if getattr(client, "context_window", None) is None:
         client.context_window = configuration["context_window"]
@@ -611,6 +646,17 @@ def main() -> int:
     subparsers = parser.add_subparsers(dest="action", required=True)
     help_command = subparsers.add_parser("help", help=COMMAND_HELP["help"], description=COMMAND_HELP["help"])
     help_command.add_argument("command", nargs="?", choices=list(COMMAND_HELP))
+    eval_command = subparsers.add_parser("eval", help=COMMAND_HELP["eval"], description=COMMAND_HELP["eval"])
+    eval_actions = eval_command.add_subparsers(dest="eval_action", required=True, parser_class=argparse.ArgumentParser)
+    eval_run = eval_actions.add_parser("run", help="Запустить или продолжить A/B-серию")
+    eval_run.add_argument("--provider", choices=list(PROVIDERS), help="Провайдер модели, по умолчанию из настроек")
+    eval_run.add_argument("--model", help="Фиксированный ID модели, по умолчанию из настроек")
+    eval_run.add_argument("--env-file", type=Path, default=Path(".env"), help="Файл настроек и ключей (по умолчанию .env)")
+    eval_run.add_argument("--output", type=Path, default=Path(".agent/evals/hw2"), help="Папка всей серии")
+    eval_run.add_argument("--trials", type=int, default=3, help="Попыток на сценарий и версию (по умолчанию 3)")
+    eval_run.add_argument("--timeout", type=float, default=180, help="Лимит всей попытки в секундах (по умолчанию 180)")
+    eval_run.add_argument("--max-rounds", type=int, default=8, help="Лимит обращений к модели на попытку (по умолчанию 8)")
+    eval_run.add_argument("--max-tokens", type=int, default=2048, help="Лимит выходных токенов на ответ (по умолчанию 2048)")
     set_command = subparsers.add_parser("set", help=COMMAND_HELP["set"], description=COMMAND_HELP["set"])
     set_command.add_argument("--provider", choices=list(PROVIDERS))
     set_command.add_argument("--model")
@@ -655,6 +701,10 @@ def main() -> int:
         if action in START_COMMANDS:
             command.add_argument("--verbose", action="store_true")
             add_progress_option(command)
+            command.add_argument("--skills", action=argparse.BooleanOptionalAction, default=None,
+                                 help="Включить каталог скиллов (по умолчанию включён)")
+            command.add_argument("--skills-dir", type=Path, help="Папка дополнительных SKILL.md вне рабочей папки")
+            command.add_argument("--mcp-config", type=Path, help="JSON-конфигурация локальных MCP-серверов вне рабочей папки")
             if action == "chat":
                 command.add_argument("--resume", dest="resume_chat", metavar="ID", nargs="?", const="")
             else:
@@ -705,6 +755,13 @@ def main() -> int:
         return 0
     try:
         validate_explicit_options(args)
+        if args.action == "eval":
+            load_env(args.env_file)
+            settings = Settings.from_env(args.provider, args.model)
+            status = run_evaluation(args.output, settings, EvalOptions(args.trials, args.timeout, args.max_rounds, args.max_tokens))
+            if status == 130:
+                print("Серия приостановлена. Повторите ту же команду eval run.", file=sys.stderr)
+            return status
         if args.action == "set":
             updates = set_options(args)
             print(f"Настройки сохранены в {args.env_file}: " + ", ".join(updates))
@@ -716,7 +773,8 @@ def main() -> int:
             args.resume_chat = ""
         if getattr(args, "resume_chat", None) is not None:
             options = set(LAUNCH_OPTIONS) - {"state_db", "cost_estimate", "progress"}
-            if any(getattr(args, name, None) is not None for name in options | {"provider", "model"}):
+            if any(getattr(args, name, None) is not None
+                   for name in options | {"provider", "model", "skills", "skills_dir", "mcp_config"}):
                 raise ConfigurationError("Для продолжения диалога используются сохранённые настройки запуска")
             load_env(args.env_file)
             if args.state_db is None:
@@ -776,7 +834,9 @@ def main() -> int:
         print(f"\nОжидается подтверждение: {exc}", file=sys.stderr)
         return 130
     except KeyboardInterrupt:
-        print("\nРабота остановлена. Продолжите через agi resume и выберите сессию в терминале.", file=sys.stderr)
+        message = ("Серия приостановлена. Повторите ту же команду eval run." if args.action == "eval"
+                   else "Работа остановлена. Продолжите через agi resume и выберите сессию в терминале.")
+        print("\n" + message, file=sys.stderr)
         return 130
     except (ConfigurationError, PricingError, ModelClientError, AgentError, JournalError, BudgetExceeded, ToolError, PolicyError, SessionError, OSError, ValueError) as exc:
         print(f"Ошибка: {visible(exc)}", file=sys.stderr)
