@@ -71,11 +71,16 @@ def render_summary(rows: list[dict], manifest: dict, summary: dict) -> str:
         for variant, data in variants.items():
             results.append((case, variant, f"{data['outcome_pass']}/{data['attempts']}",
                             f"{data['tools_pass']}/{data['attempts']}",
-                            data["routing_errors"] if variant == "B" else "—", sum(data["tool_calls"].values()),
+                            data["routing_errors"] if variant == "B" or "comparison" in manifest else "—",
+                            sum(data["tool_calls"].values()),
                             sum(data["mcp_calls"].values()), sum(data["errors"].values())))
             tokens.append((case, variant, *token_columns(data["input_tokens"]), *token_columns(data["output_tokens"])))
     lines = ["# Evals", "", f"Модель {md_text(manifest['provider'])}/{md_text(manifest['model'])}. "
              f"Сохранено попыток {len(rows)} из {planned}.", "", manifest["hypothesis"], "", "## Результаты", ""]
+    if "comparison" in manifest:
+        revisions = manifest["comparison"]["revisions"]
+        lines[6:6] = [f"Скилл `{md_text(manifest['comparison']['name'])}`. "
+                      f"A · `{md_text(revisions['A']['version'])}`. B · `{md_text(revisions['B']['version'])}`.", ""]
     lines += markdown_table(("Сценарий", "A/B", "Результат", "Вызовы", "Ошибки выбора", "Инстр.", "MCP", "Сбои"),
                             results, right=range(2, 8))
     lines += ["", "В столбце «Вызовы» указано число попыток, прошедших проверку инструментов. "
@@ -96,7 +101,7 @@ def render_summary(rows: list[dict], manifest: dict, summary: dict) -> str:
                             attempts, right=(6,))
     if errors:
         lines += ["", "## Ошибки", "", *(f"- {label} · {md_text(error)}" for error, label in errors.items())]
-    if len(rows) == planned:
+    if len(rows) == planned and "comparison" not in manifest:
         selected = ["open-tasks", "deadlines", "missing-deadlines"]
         scores = {variant: sum(by_case[case][variant]["outcome_pass"] for case in selected) for variant in ("A", "B")}
         verdict = "подтвердилась" if scores["B"] > scores["A"] else "не подтвердилась"

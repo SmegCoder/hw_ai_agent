@@ -36,6 +36,8 @@ from .tasks import checklist
 from .text import json_text
 from .skills import SkillCatalog
 from .skill_market import SkillMarket
+from .skill_updates import evaluate_candidate
+from .eval_cases import CASES
 from .mcp import MCPRegistry
 from .eval_runner import Options as EvalOptions, rebuild_summary, run_evaluation
 from .session_doctor import show_session_report
@@ -143,7 +145,8 @@ def show_market_event(event):
         print(f"Маркет · новый скилл {name} {version}", flush=True)
     elif kind == "market_update":
         old = visible_line(event["old_version"])
-        status = {"updated": "установлено", "available": "доступно", "error": "ошибка"}[event["status"]]
+        status = {"updated": "установлено", "available": "доступно", "error": "ошибка",
+                  "pending": "ожидает eval"}[event["status"]]
         detail = f" · {visible_line(event['error'])}" if event.get("error") else ""
         print(f"Маркет · {name} {old} → {version} · {status}{detail}", flush=True)
 
@@ -155,6 +158,25 @@ def market_command(args) -> int:
             print(line)
     elif args.market_action == "status":
         print(json_text(market.installed(), indent=2))
+    elif args.market_action == "candidates":
+        print(json_text(market.candidates(), indent=2))
+    elif args.market_action == "evaluate":
+        if not args.skill:
+            raise ConfigurationError("Укажите имя скилла после market evaluate")
+        load_env(args.env_file)
+        settings = Settings.from_env(args.provider, args.model)
+        _, events = market.check()
+        for event in events:
+            show_market_event(event)
+        options = EvalOptions(timeout=args.timeout, max_rounds=args.max_rounds, max_tokens=args.max_tokens)
+        status, decision = evaluate_candidate(market, args.skill, settings, options,
+                                              focus=tuple(args.focus), output=args.output)
+        if decision:
+            print("Маркет · " + ("обновление принято" if decision["status"] == "accepted" else "обновление отклонено"))
+            for reason in decision["reasons"]:
+                print("  " + visible_line(reason))
+            print(f"Решение · {Path(decision['output']) / 'decision.json'}")
+        return status
     else:
         _, events = market.check()
         for event in events:
@@ -710,11 +732,20 @@ def main() -> int:
     eval_report = eval_actions.add_parser("report", help="Обновить summary.md по сохранённым результатам")
     eval_report.add_argument("--output", type=Path, default=Path(".agent/evals/study-tracker"), help="Папка сохранённой серии")
     market = subparsers.add_parser("market", help=COMMAND_HELP["market"])
-    market.add_argument("market_action", choices=("check", "status", "events"))
+    market.add_argument("market_action", choices=("check", "status", "events", "candidates", "evaluate"))
+    market.add_argument("skill", nargs="?", help="Имя скилла для evaluate")
     market.add_argument("--market-config", type=Path, required=True, help="Путь к JSON-конфигурации маркета")
     market.add_argument("--workspace", type=Path, default=Path("workspace"))
     market.add_argument("--state-db", type=Path)
     market.add_argument("--env-file", type=Path, default=Path(".env"))
+    market.add_argument("--provider", choices=list(PROVIDERS))
+    market.add_argument("--model")
+    market.add_argument("--output", type=Path, help="Папка сравнения версий")
+    market.add_argument("--focus", action="append", default=[], choices=[case.id for case in CASES],
+                        help="Сценарий, где обе версии проверяются с явной загрузкой скилла")
+    market.add_argument("--timeout", type=float, default=180)
+    market.add_argument("--max-rounds", type=int, default=8)
+    market.add_argument("--max-tokens", type=int, default=2048)
     set_command = subparsers.add_parser("set", help=COMMAND_HELP["set"], description=COMMAND_HELP["set"])
     set_command.add_argument("--provider", choices=list(PROVIDERS))
     set_command.add_argument("--model")

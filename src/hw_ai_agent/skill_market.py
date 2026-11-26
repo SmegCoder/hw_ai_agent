@@ -72,6 +72,7 @@ class MarketConfig:
     source: Path
     check_on_start: bool
     auto_update: bool
+    require_eval: bool
 
 
 class SkillMarket:
@@ -89,15 +90,16 @@ class SkillMarket:
 
     def config(self) -> MarketConfig:
         raw = read_json(self.path, 8192)
-        if (set(raw) - {"catalog", "check_on_start", "auto_update"} or not isinstance(raw.get("catalog"), str)
+        if (set(raw) - {"catalog", "check_on_start", "auto_update", "require_eval"} or not isinstance(raw.get("catalog"), str)
                 or not raw["catalog"] or "\x00" in raw["catalog"]):
             raise MarketError("В конфигурации маркета требуется путь catalog")
         check, update = raw.get("check_on_start", True), raw.get("auto_update", False)
-        if type(check) is not bool or type(update) is not bool:
-            raise MarketError("check_on_start и auto_update должны быть true или false")
+        gate = raw.get("require_eval", True)
+        if any(type(value) is not bool for value in (check, update, gate)):
+            raise MarketError("check_on_start, auto_update и require_eval должны быть true или false")
         source = (self.path.parent / raw["catalog"]).resolve()
         self.outside_workspace(source)
-        return MarketConfig(source, check, update)
+        return MarketConfig(source, check, update, gate)
 
     @contextmanager
     def database(self):
@@ -120,6 +122,9 @@ class SkillMarket:
                         body BLOB NOT NULL, PRIMARY KEY(name, sha256));
                     CREATE TABLE IF NOT EXISTS installs (run_id TEXT NOT NULL, name TEXT NOT NULL,
                         sha256 TEXT NOT NULL, PRIMARY KEY(run_id, name));
+                    CREATE TABLE IF NOT EXISTS candidates (id TEXT PRIMARY KEY, name TEXT NOT NULL,
+                        source TEXT NOT NULL, old_version TEXT NOT NULL, old_sha256 TEXT NOT NULL,
+                        new_version TEXT NOT NULL, new_sha256 TEXT NOT NULL, status TEXT NOT NULL, decision TEXT);
                     CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY, data TEXT NOT NULL);
                 """)
                 with db:
@@ -158,6 +163,19 @@ class SkillMarket:
         db.execute("INSERT OR IGNORE INTO versions VALUES (?,?,?)", (offer.name, offer.sha256, content))
         db.execute("INSERT OR REPLACE INTO active VALUES (?,?,?,?)",
                    (offer.name, str(source), offer.version, offer.sha256))
+
+    def stage(self, db, source: Path, change: dict, content: bytes) -> dict | None:
+        identifier = hashlib.sha256(json_text([str(source), change], sort_keys=True).encode()).hexdigest()[:32]
+        if db.execute("SELECT 1 FROM candidates WHERE id=?", (identifier,)).fetchone():
+            return None
+        db.execute("INSERT OR IGNORE INTO versions VALUES (?,?,?)",
+                   (change["name"], change["new_sha256"], content))
+        db.execute("""UPDATE candidates SET status='superseded'
+                      WHERE name=? AND source=? AND status='pending'""", (change["name"], str(source)))
+        db.execute("""INSERT INTO candidates VALUES (?,?,?,?,?,?,?,'pending',NULL)""",
+                   (identifier, change["name"], str(source), change["old_version"], change["old_sha256"],
+                    change["new_version"], change["new_sha256"]))
+        return self.record(db, "market_update", source=source, status="pending", candidate_id=identifier, **change)
 
     def check(self, *, startup: bool = False) -> tuple[Path | None, list[dict]]:
         with self.database() as db:
@@ -206,8 +224,13 @@ class SkillMarket:
                     events.append(self.record(db, "market_update", source=source, status="error",
                                               error=str(exc), **change))
                 else:
-                    self.activate(db, source, offer, content)
-                    events.append(self.record(db, "market_update", source=source, status="updated", **change))
+                    if config.require_eval:
+                        event = self.stage(db, source, change, content)
+                        if event is not None:
+                            events.append(event)
+                    else:
+                        self.activate(db, source, offer, content)
+                        events.append(self.record(db, "market_update", source=source, status="updated", **change))
             return source, events
 
     @staticmethod
@@ -272,6 +295,68 @@ class SkillMarket:
     def installed(self) -> list[dict]:
         with self.database() as db:
             return [dict(row) for row in db.execute("SELECT * FROM active ORDER BY name")]
+
+    def candidates(self) -> list[dict]:
+        with self.database() as db:
+            return [{**row, "decision": json.loads(row["decision"]) if row["decision"] else None}
+                    for row in db.execute("SELECT * FROM candidates ORDER BY rowid")]
+
+    def candidate(self, name: str) -> tuple[dict, Skill, Skill]:
+        with self.database() as db:
+            db.execute("BEGIN")
+            row = db.execute("""SELECT * FROM candidates WHERE name=? AND status='pending'
+                                ORDER BY rowid DESC LIMIT 1""", (name,)).fetchone()
+            if row is None:
+                raise MarketError(f"Нет кандидата на проверку · {name}")
+            return dict(row), self.revision(db, name, row["old_sha256"]), self.revision(db, name, row["new_sha256"])
+
+    def finish_candidate(self, identifier: str, decision: dict) -> dict:
+        with self.database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM candidates WHERE id=?", (identifier,)).fetchone()
+            if row is None:
+                raise MarketError("Кандидат не найден")
+            if row["decision"]:
+                return json.loads(row["decision"])
+            if row["status"] != "pending":
+                raise MarketError("Кандидат заменён новой версией. Проверьте актуальный каталог")
+            config = self.config()
+            source, name = Path(row["source"]), row["name"]
+            current = db.execute("SELECT * FROM active WHERE name=?", (name,)).fetchone()
+            if (config.source != source or not config.auto_update or not config.require_eval or current is None
+                    or (current["source"], current["version"], current["sha256"]) !=
+                    (str(source), row["old_version"], row["old_sha256"])):
+                raise MarketError("Настройки или активная версия изменились во время сравнения")
+            status = decision["status"]
+            if status not in {"accepted", "rejected"}:
+                raise MarketError("Неверное решение по кандидату")
+            if status == "accepted":
+                db.execute("UPDATE active SET version=?, sha256=? WHERE name=?",
+                           (row["new_version"], row["new_sha256"], name))
+            db.execute("UPDATE candidates SET status=?, decision=? WHERE id=?",
+                       (status, json_text(decision), identifier))
+            self.record(db, "market_decision", source=source, name=name, status=status, candidate_id=identifier,
+                        old_version=row["old_version"], old_sha256=row["old_sha256"], new_version=row["new_version"],
+                        new_sha256=row["new_sha256"], reasons=decision["reasons"], report=decision["report"])
+            return decision
+
+    def rollback(self, name: str) -> str:
+        with self.database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("""SELECT c.* FROM candidates c JOIN active a ON c.name=a.name
+                                AND c.source=a.source AND c.new_version=a.version AND c.new_sha256=a.sha256
+                                WHERE c.name=? AND c.status='accepted' ORDER BY c.rowid DESC LIMIT 1""",
+                             (name,)).fetchone()
+            if row is None:
+                raise MarketError(f"Нет принятого обновления для отката · {name}")
+            self.revision(db, name, row["old_sha256"])
+            db.execute("UPDATE active SET version=?, sha256=? WHERE name=?",
+                       (row["old_version"], row["old_sha256"], name))
+            db.execute("UPDATE candidates SET status='rolled_back' WHERE id=?", (row["id"],))
+            self.record(db, "market_rollback", source=Path(row["source"]), name=name, candidate_id=row["id"],
+                        status="rolled_back", old_version=row["new_version"], old_sha256=row["new_sha256"],
+                        new_version=row["old_version"], new_sha256=row["old_sha256"])
+            return row["old_version"]
 
     def events(self):
         with self.database() as db:

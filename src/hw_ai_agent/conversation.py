@@ -31,6 +31,7 @@ COMMANDS = """Введите запрос или команду.
   /plan ТЕКСТ    Запрос с утверждением плана перед правками
   /changes       Показать правки последнего запроса с изменениями
   /rollback      Отменить правки последнего запроса и остаться в диалоге
+  /market-rollback ИМЯ   Вернуть предыдущую проверенную версию скилла
   /tokens        Токены всех обращений к модели в диалоге
   /stats         Статистика каждого запроса и всего диалога
   /settings      Показать настройки диалога
@@ -328,6 +329,12 @@ class ConversationShell:
             self.resume_turn()
         elif command in {"/changes", "/rollback"} and not argument:
             self.changes(rollback=command == "/rollback")
+        elif command == "/market-rollback" and argument:
+            market = self.agent.runtime.market
+            if market is None:
+                raise SessionError("Для этого диалога маркет скиллов отключён")
+            version = market.rollback(argument)
+            print(f"Маркет · {visible_line(argument)} · восстановлена версия {visible_line(version)}")
         elif command == "/tokens" and not argument:
             self.show_tokens()
         elif command == "/stats" and not argument:

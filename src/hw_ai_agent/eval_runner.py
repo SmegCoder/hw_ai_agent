@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import certifi
@@ -25,7 +25,7 @@ from .eval_report import render_summary, summarize, write_reports
 from .mcp import MCPRegistry
 from .policy import Policy
 from .session import SessionError, SessionStore
-from .skills import BUILTIN_SKILLS, SkillCatalog
+from .skills import BUILTIN_SKILLS, SKILL_NAME, Skill, SkillCatalog
 from .text import json_text
 from .tools import ToolError, ToolRuntime
 
@@ -91,18 +91,45 @@ def run_lock(output: Path):
         os.close(descriptor)
 
 
-def manifest_for(settings: Settings, options: Options) -> dict:
+def evaluation_cases(comparison: dict | None):
+    if comparison is None:
+        return CASES
+    name, focus = comparison["name"], comparison["focus"]
+    if not SKILL_NAME.fullmatch(name) or set(focus) - {case.id for case in CASES}:
+        raise EvalError("Некорректные параметры сравнения скилла")
+    return tuple(replace(case, prompt=f"Сначала загрузи установленный скилл {name}. " + case.prompt,
+                         skills=(name,)) if case.id in focus else case for case in CASES)
+
+
+def version_directory(output: Path, variant: str) -> Path:
+    return output / "versions" / variant
+
+
+def verify_skill_versions(output: Path, comparison: dict) -> None:
+    name = comparison["name"]
+    for variant, version in comparison["revisions"].items():
+        directory = version_directory(output, variant)
+        if (set(path.name for path in directory.iterdir()) != {name}
+                or Skill.read(directory, name).digest != version["sha256"]):
+            raise EvalError("Снимок версии скилла не совпадает с манифестом")
+
+
+def manifest_for(settings: Settings, options: Options, comparison: dict | None = None) -> dict:
     paths = sorted(PACKAGE.glob("*.py")) + sorted(BUILTIN_SKILLS.glob("*/SKILL.md"))
     versions = {str(path.relative_to(PACKAGE)): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
-    return {"format": 1, "hypothesis": HYPOTHESIS, "provider": settings.provider, "model": settings.model,
+    manifest = {"format": 1, "hypothesis": HYPOTHESIS, "provider": settings.provider, "model": settings.model,
             "endpoint": settings.base_url, "parameters": asdict(options), "budget": options.limits().as_dict(),
             "mode": "auto", "approvals": "deny", "variants": {"A": "skills-off", "B": "skills-on"},
             "mcp": {"server": "tracker", "allow_tools": ["list_tasks"], "timeout": 5},
             "cases": [{"id": case.id, "prompt": case.prompt, "skills": list(case.skills), "mcp": case.mcp,
                        "snapshot": hashlib.sha256(json_text(case.snapshot, sort_keys=True).encode()).hexdigest()}
-                      for case in CASES],
+                      for case in evaluation_cases(comparison)],
             "python": sys.version.split()[0], "dependencies": {"certifi": certifi.__version__, "PyYAML": yaml.__version__},
             "versions": versions}
+    if comparison is not None:
+        manifest.update(comparison=comparison, variants={"A": "active-skill", "B": "candidate-skill"},
+                        hypothesis="Новая версия сохраняет качество по всем сценариям и укладывается в лимит токенов.")
+    return manifest
 
 
 def prepare_trial(directory: Path, case: Case) -> None:
@@ -127,12 +154,13 @@ def prepare_trial(directory: Path, case: Case) -> None:
                                               {"tool": "write_file", "path": case.output, "action": "allow"}]})
 
 
-def execute_trial(directory: Path, case: Case, variant: str, settings: Settings, options: Options) -> None:
+def execute_trial(directory: Path, case: Case, variant: str, settings: Settings, options: Options,
+                  *, skill_dir: Path | None = None) -> None:
     workspace, source = directory / "workspace", directory / "source"
     client = OpenAICompatibleClient(settings, timeout=options.timeout, max_tokens=options.max_tokens)
     with SessionStore(directory / "session.sqlite3") as store:
         runtime = ToolRuntime(workspace, mode="auto", policy=Policy.load(source / "policy.json"),
-                              skills=SkillCatalog(workspace) if variant == "B" else None,
+                              skills=SkillCatalog(workspace, skill_dir) if variant == "B" or skill_dir else None,
                               mcp=MCPRegistry(source / "mcp.json", workspace),
                               trash_dir=directory / "trash")
         agent = CodingAgent(client, runtime, store=store, max_rounds=options.max_rounds, cost_estimate=False,
@@ -168,7 +196,7 @@ def has_run(directory: Path) -> bool:
 
 
 def collect_trial(output: Path, directory: Path, case: Case, variant: str, number: int,
-                  stop: str | None, settings: Settings) -> dict:
+                  stop: str | None, settings: Settings, *, compare_revisions=False) -> dict:
     database = directory / "session.sqlite3"
     with SessionStore(database) as store:
         if settings.provider != "ollama" and settings.api_key:
@@ -191,7 +219,7 @@ def collect_trial(output: Path, directory: Path, case: Case, variant: str, numbe
                                     if r["type"] == "tool_result" and r["data"].get("failed")), None)
         error = store.redacted_event({"event": "eval_error", "error": error})["error"]
     success, detail = outcome(case, directory / "workspace", state)
-    routing, tools = actions(case, variant, records)
+    routing, tools = actions(case, variant, records, compare_revisions=compare_revisions)
     stats = RunStats()
     stats.include(state)
     journal = directory / "events.jsonl"
@@ -233,16 +261,18 @@ def rebuild_summary(output: Path) -> None:
     print(f"Сводка · {output / 'summary.md'}")
 
 
-def run_evaluation(output: Path, settings: Settings, options: Options) -> int:
+def run_evaluation(output: Path, settings: Settings, options: Options, *, comparison: dict | None = None) -> int:
     if settings.model in {"auto", "?"}:
         raise EvalError("Для eval укажите фиксированный ID модели")
     output = output.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
-    attempts = [(case, variant, number) for case in CASES
+    attempts = [(case, variant, number) for case in evaluation_cases(comparison)
                 for number in range(1, options.trials + 1) for variant in ("A", "B")]
-    manifest = manifest_for(settings, options)
+    manifest = manifest_for(settings, options, comparison)
     manifest_path = output / "manifest.json"
     with run_lock(output) as lock_fd:
+        if comparison is not None:
+            verify_skill_versions(output, comparison)
         if manifest_path.exists():
             if read_json(manifest_path) != manifest:
                 raise EvalError("У сохранённой серии другие модель, параметры или версия кода. Выберите новый --output")
@@ -266,7 +296,8 @@ def run_evaluation(output: Path, settings: Settings, options: Options) -> int:
                     if stop == "interrupted":
                         return 130
                     raise EvalError(f"Сессия не была создана для {case.id}/{variant}{number} ({stop or 'worker_exit'})")
-            row = collect_trial(output, directory, case, variant, number, stop, settings)
+            row = collect_trial(output, directory, case, variant, number, stop, settings,
+                                compare_revisions=comparison is not None)
             save_json(directory / "result.json", row)
             rows = completed_rows(output, attempts)
             write_reports(output, rows, len(attempts), manifest, atomic_write)
@@ -283,10 +314,17 @@ def worker(argv: list[str]) -> None:
     manifest = read_json(Path(manifest_path))
     settings = Settings.from_env(manifest["provider"], manifest["model"])
     options = Options(**manifest["parameters"])
-    if manifest_for(settings, options) != manifest:
+    comparison = manifest.get("comparison")
+    if manifest_for(settings, options, comparison) != manifest:
         raise EvalError("Изменилась конфигурация eval")
-    case = next(case for case in CASES if case.id == case_id)
-    execute_trial(Path(directory), case, variant, settings, options)
+    case = next(case for case in evaluation_cases(comparison) if case.id == case_id)
+    if comparison is None:
+        execute_trial(Path(directory), case, variant, settings, options)
+    else:
+        output = Path(manifest_path).parent
+        verify_skill_versions(output, comparison)
+        execute_trial(Path(directory), case, variant, settings, options,
+                      skill_dir=version_directory(output, variant))
 
 
 if __name__ == "__main__":

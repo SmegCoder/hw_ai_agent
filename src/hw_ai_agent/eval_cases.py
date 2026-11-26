@@ -115,11 +115,12 @@ def outcome(case: Case, workspace: Path, state: SessionState) -> tuple[bool, str
     return passed, "Результат совпал с эталоном" if passed else "Содержимое не совпало с эталоном"
 
 
-def actions(case: Case, variant: str, events: list[dict]) -> tuple[bool | str, bool]:
+def actions(case: Case, variant: str, events: list[dict], *, compare_revisions=False) -> tuple[bool | str, bool]:
     tool_calls = {e["data"]["name"] for e in events if e["type"] == "tool_call"}
     results = [e["data"] for e in events if e["type"] == "tool_result"]
     allowed = {"list_files", "read_file"}
-    if variant == "B":
+    skills_enabled = variant == "B" or compare_revisions
+    if skills_enabled:
         allowed.add("load_skill")
     if case.mcp != "error":
         allowed.add("write_file")
@@ -134,4 +135,4 @@ def actions(case: Case, variant: str, events: list[dict]) -> tuple[bool | str, b
     tools_pass = tool_calls <= allowed and needed <= successful and (case.mcp != "error" or tracker_error)
     skills = {e["data"]["name"] for e in events if e["type"] == "skill_loaded"}
     routing = skills == set(case.skills)
-    return routing if variant == "B" else "n/a", tools_pass
+    return routing if skills_enabled else "n/a", tools_pass

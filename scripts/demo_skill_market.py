@@ -62,7 +62,7 @@ def main():
         publish("v1")
         run()
         publish("v2")
-        config.write_text(json.dumps({"catalog": "catalog.json", "check_on_start": True, "auto_update": False}))
+        config.write_text(json.dumps({"catalog": "catalog.json", "check_on_start": True, "auto_update": False, "require_eval": False}))
         run()
         if market.installed()[0]["version"] != "1.0.0":
             raise RuntimeError("Disabled auto-update replaced the active version")
