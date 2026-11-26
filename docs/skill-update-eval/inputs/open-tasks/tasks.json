@@ -1,0 +1,40 @@
+{
+  "tasks": [
+    {
+      "due_date": "2026-11-24",
+      "id": "T1",
+      "status": "open",
+      "title": "Решить задачи по RISC-V"
+    },
+    {
+      "due_date": "2026-11-20",
+      "id": "T2",
+      "status": "closed",
+      "title": "Сдать схему базы"
+    },
+    {
+      "due_date": "2026-11-27",
+      "id": "T3",
+      "status": "in_progress",
+      "title": "Подготовить лабораторную"
+    },
+    {
+      "due_date": "2026-11-25",
+      "id": "T4",
+      "status": "open",
+      "title": "Прочитать главу о транзакциях"
+    },
+    {
+      "due_date": "2026-11-19",
+      "id": "T5",
+      "status": "blocked",
+      "title": "Проверить разбор задачи"
+    },
+    {
+      "due_date": "2026-11-24",
+      "id": "T1",
+      "status": "open",
+      "title": "Решить задачи по RISC-V"
+    }
+  ]
+}

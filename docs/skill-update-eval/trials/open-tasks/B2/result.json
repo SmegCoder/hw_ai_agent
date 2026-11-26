@@ -1,0 +1,27 @@
+{
+  "artifact": "trials/open-tasks/B2/workspace/open-tasks.json",
+  "case_id": "open-tasks",
+  "check": "Содержимое не совпало с эталоном",
+  "error": null,
+  "events": "trials/open-tasks/B2/events.jsonl",
+  "input_tokens": 5541,
+  "input_usage_requests": 3,
+  "mcp_calls": {
+    "tracker/list_tasks": 1
+  },
+  "model_requests": 3,
+  "outcome_pass": false,
+  "output_tokens": 152,
+  "output_usage_requests": 3,
+  "routing_pass_or_na": false,
+  "run_id": "ba4b3c0367cb439189389f2e9e72042f",
+  "skill_activations": {},
+  "status": "completed",
+  "tool_calls": {
+    "mcp__tracker__list_tasks": 1,
+    "write_file": 1
+  },
+  "tools_pass": true,
+  "trial": 2,
+  "variant": "B"
+}

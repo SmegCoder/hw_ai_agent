@@ -12,7 +12,7 @@ from hw_ai_agent.config import Settings
 from hw_ai_agent.conversation import ConversationShell
 from hw_ai_agent.eval_cases import CASES
 from hw_ai_agent.eval_report import summarize
-from hw_ai_agent.eval_runner import Options, save_json
+from hw_ai_agent.eval_runner import EvalError, Options, run_lock, save_json
 from hw_ai_agent.skill_market import MarketError, SkillMarket
 from hw_ai_agent.skill_updates import decision_for, evaluate_candidate
 
@@ -135,3 +135,11 @@ class SkillUpdateTests(unittest.TestCase):
             self.evaluate(evaluation_rows(), while_running=lambda: self.publish("1.0.0"))
         self.assertEqual(self.market.installed()[0]["version"], "1.0.0")
         self.assertFalse((self.output / "decision.json").exists())
+
+    def test_concurrent_comparison_cannot_start_in_a_second_output_directory(self):
+        self.market.check()
+        with run_lock(self.market.db_path.parent, f".{self.market.db_path.stem}-{NAME}.lock"):
+            with patch("hw_ai_agent.skill_updates.run_evaluation") as evaluator:
+                with self.assertRaisesRegex(EvalError, "уже выполняется"):
+                    evaluate_candidate(self.market, NAME, self.settings, Options(), output=self.output)
+                evaluator.assert_not_called()
