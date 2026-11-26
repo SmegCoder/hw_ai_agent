@@ -15,6 +15,7 @@ from agent_fixtures import tool_call
 from hw_ai_agent import cli, eval_runner
 from hw_ai_agent.eval_cases import NOTE, OVERDUE, REFERENCE_DATE, TRACKER_TOOL, UNAVAILABLE
 from hw_ai_agent.session import SessionStore
+from hw_ai_agent.skills import Skill
 
 
 class EvalRunnerTests(unittest.TestCase):
@@ -46,6 +47,7 @@ class EvalRunnerTests(unittest.TestCase):
         self.started.append((case.id, variant))
         config = json.loads(manifest.read_text())
         settings = eval_runner.Settings.from_env(config["provider"], config["model"])
+        comparison = config.get("comparison")
         test = self
         if len(self.started) == 1 and self.fail_first == "timeout":
             # Simulate termination after the real runtime created its session.
@@ -64,7 +66,7 @@ class EvalRunnerTests(unittest.TestCase):
             return "timeout"
 
         replies = []
-        if variant == "B" and case.skills:
+        if (variant == "B" or comparison) and case.skills:
             replies.append({"tool_calls": [tool_call("skill", "load_skill", {"name": case.skills[0]})]})
         if case.mcp != "unused":
             replies.append({"tool_calls": [tool_call("tracker", TRACKER_TOOL, {})]})
@@ -92,19 +94,46 @@ class EvalRunnerTests(unittest.TestCase):
             def complete(self, messages, tools):
                 names = {schema["function"]["name"] for schema in tools}
                 test.assertIn(TRACKER_TOOL, names)
-                test.assertEqual("load_skill" in names, variant == "B")
+                test.assertEqual("load_skill" in names, bool(variant == "B" or comparison))
                 self.usage.append({"prompt_tokens": 10} if len(replies) == 1 else
                                   {"prompt_tokens": 10, "completion_tokens": 5})
                 return replies.pop(0)
 
         with patch.object(eval_runner, "OpenAICompatibleClient", Model):
-            eval_runner.execute_trial(directory, case, variant, settings, options)
+            if comparison:
+                eval_runner.execute_trial(directory, case, variant, settings, options,
+                                          skill_dir=eval_runner.version_directory(manifest.parent, variant))
+            else:
+                eval_runner.execute_trial(directory, case, variant, settings, options)
         if len(self.started) == 1 and self.fail_first == "interrupt":
             return "interrupted"
         return None
 
     def rows(self):
         return [json.loads(line) for line in (self.output / "results.jsonl").read_text().splitlines()]
+
+    def test_comparison_uses_same_tools_and_different_versions_in_both_arms(self):
+        name = "tracker-test"
+        versions = {side: Skill.parse(name, f"---\nname: {name}\ndescription: Export tasks\n---\n{side}\n".encode())
+                    for side in ("A", "B")}
+        comparison = {"name": name, "focus": ["deadlines"], "revisions": {
+            side: {"version": side, "sha256": skill.digest} for side, skill in versions.items()}}
+        settings = eval_runner.Settings("ollama", "test-model", "http://localhost:11434/v1", "ollama")
+        stdout = io.StringIO()
+        with (redirect_stdout(stdout), patch.dict(os.environ, self.environment, clear=True),
+              patch.object(eval_runner, "launch_trial", self.local_launch)):
+            self.assertEqual(eval_runner.run_evaluation(self.output, settings, eval_runner.Options(),
+                             comparison=comparison, skill_versions=versions), 0)
+        rows = self.rows()
+        self.assertEqual(len(rows), 30)
+        self.assertTrue(all(row["outcome_pass"] and row["tools_pass"] and row["routing_pass_or_na"] is True
+                            for row in rows))
+        for row in (row for row in rows if row["case_id"] == "deadlines"):
+            journal = self.output / row["events"]
+            events = [json.loads(line) for line in journal.read_text().splitlines()]
+            [loaded] = [event for event in events if event["type"] == "tool_result"
+                        and event["data"]["name"] == "load_skill"]
+            self.assertEqual(loaded["data"]["content"], versions[row["variant"]].document)
 
     def test_thirty_attempts_resume_without_duplicate_and_include_evidence(self):
         self.fail_first = "interrupt"

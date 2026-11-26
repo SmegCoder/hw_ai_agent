@@ -4,8 +4,9 @@ from pathlib import Path
 
 from .config import Settings
 from .eval_cases import CASES
-from .eval_runner import Options, atomic_write, read_json, run_evaluation, save_json, version_directory
+from .eval_runner import Options, read_json, run_evaluation, run_lock, save_json
 from .skill_market import MarketError, SkillMarket
+from .skills import SKILL_NAME
 
 
 TOKEN_GROWTH_PERCENT = 20
@@ -58,6 +59,16 @@ def evaluate_candidate(market: SkillMarket, name: str, settings: Settings, optio
                        *, focus: tuple[str, ...] = (), output: Path | None = None) -> tuple[int, dict | None]:
     if options.trials != 3:
         raise MarketError("Для проверки обновления требуется по три попытки каждого сценария")
+    if not SKILL_NAME.fullmatch(name) or len(name) > 64:
+        raise MarketError("Некорректное имя скилла")
+    parent = market.db_path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    with run_lock(parent, f".{market.db_path.stem}-{name}.lock"):
+        return evaluate_locked(market, name, settings, options, focus, output)
+
+
+def evaluate_locked(market: SkillMarket, name: str, settings: Settings, options: Options,
+                    focus: tuple[str, ...], output: Path | None) -> tuple[int, dict | None]:
     candidate, old, new = market.candidate(name)
     output = (output or market.db_path.parent / "skill-update-evals" / candidate["id"]).expanduser().resolve()
     market.outside_workspace(output)
@@ -68,19 +79,7 @@ def evaluate_candidate(market: SkillMarket, name: str, settings: Settings, optio
             "B": {"version": candidate["new_version"], "sha256": new.digest},
         },
     }
-    manifest = output / "manifest.json"
-    if manifest.is_file() and read_json(manifest).get("comparison") != comparison:
-        raise MarketError("Папка результатов уже относится к другому сравнению")
-    for variant, skill in (("A", old), ("B", new)):
-        directory = version_directory(output, variant) / name
-        directory.mkdir(parents=True, exist_ok=True)
-        target = directory / "SKILL.md"
-        if target.is_symlink():
-            raise MarketError("Снимок скилла не должен быть символической ссылкой")
-        if not target.exists():
-            atomic_write(target, skill.document)
-
-    status = run_evaluation(output, settings, options, comparison=comparison)
+    status = run_evaluation(output, settings, options, comparison=comparison, skill_versions={"A": old, "B": new})
     if status:
         return status, None
     decision = decision_for(read_json(output / "summary.json"), comparison)

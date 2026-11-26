@@ -79,8 +79,8 @@ def read_json(path: Path):
 
 
 @contextmanager
-def run_lock(output: Path):
-    descriptor = os.open(output / ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+def run_lock(output: Path, name: str = ".lock"):
+    descriptor = os.open(output / name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -109,9 +109,21 @@ def verify_skill_versions(output: Path, comparison: dict) -> None:
     name = comparison["name"]
     for variant, version in comparison["revisions"].items():
         directory = version_directory(output, variant)
-        if (set(path.name for path in directory.iterdir()) != {name}
+        if (directory.resolve() != directory or set(path.name for path in directory.iterdir()) != {name}
                 or Skill.read(directory, name).digest != version["sha256"]):
             raise EvalError("Снимок версии скилла не совпадает с манифестом")
+
+
+def snapshot_skill_versions(output: Path, comparison: dict, skill_versions: dict[str, Skill]) -> None:
+    name = comparison["name"]
+    for variant, skill in skill_versions.items():
+        directory = version_directory(output, variant) / name
+        target = directory / "SKILL.md"
+        if target.resolve() != target:
+            raise EvalError("Снимок скилла должен находиться в папке сравнения")
+        directory.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            atomic_write(target, skill.document)
 
 
 def manifest_for(settings: Settings, options: Options, comparison: dict | None = None) -> dict:
@@ -261,7 +273,8 @@ def rebuild_summary(output: Path) -> None:
     print(f"Сводка · {output / 'summary.md'}")
 
 
-def run_evaluation(output: Path, settings: Settings, options: Options, *, comparison: dict | None = None) -> int:
+def run_evaluation(output: Path, settings: Settings, options: Options, *, comparison: dict | None = None,
+                   skill_versions: dict[str, Skill] | None = None) -> int:
     if settings.model in {"auto", "?"}:
         raise EvalError("Для eval укажите фиксированный ID модели")
     output = output.expanduser().resolve()
@@ -271,14 +284,16 @@ def run_evaluation(output: Path, settings: Settings, options: Options, *, compar
     manifest = manifest_for(settings, options, comparison)
     manifest_path = output / "manifest.json"
     with run_lock(output) as lock_fd:
-        if comparison is not None:
-            verify_skill_versions(output, comparison)
         if manifest_path.exists():
             if read_json(manifest_path) != manifest:
                 raise EvalError("У сохранённой серии другие модель, параметры или версия кода. Выберите новый --output")
         else:
             if any((output / name).exists() for name in ("trials", "results.jsonl", "summary.json", "summary.md")):
                 raise EvalError("В папке есть данные без manifest.json. Выберите новый --output")
+        if comparison is not None:
+            snapshot_skill_versions(output, comparison, skill_versions or {})
+            verify_skill_versions(output, comparison)
+        if not manifest_path.exists():
             save_json(manifest_path, manifest)
         rows = completed_rows(output, attempts)
         completed = {(row["case_id"], row["variant"], row["trial"]) for row in rows}

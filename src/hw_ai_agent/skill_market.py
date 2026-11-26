@@ -146,6 +146,20 @@ class SkillMarket:
             return {}
         return {offer.name: offer for offer in map(Offer.parse, json.loads(saved["entries"]))}
 
+    @staticmethod
+    def read_catalog(source: Path) -> dict[str, Offer]:
+        data = read_json(source, MAX_CATALOG_BYTES)
+        entries = data.get("skills")
+        if set(data) != {"skills"} or not isinstance(entries, list) or len(entries) > 100:
+            raise MarketError("Каталог должен содержать список skills из максимум 100 записей")
+        offers = {}
+        for item in entries:
+            offer = Offer.parse(item)
+            if offer.name in offers:
+                raise MarketError(f"Дубликат в каталоге · {offer.name}")
+            offers[offer.name] = offer
+        return offers
+
     def read_package(self, source: Path, offer: Offer) -> bytes:
         target = source.parent / offer.path
         self.outside_workspace(target.resolve())
@@ -186,16 +200,7 @@ class SkillMarket:
                 source = config.source
                 if startup and not config.check_on_start:
                     return source, []
-                data = read_json(source, MAX_CATALOG_BYTES)
-                entries = data.get("skills")
-                if set(data) != {"skills"} or not isinstance(entries, list) or len(entries) > 100:
-                    raise MarketError("Каталог должен содержать список skills из максимум 100 записей")
-                offers = {}
-                for item in entries:
-                    offer = Offer.parse(item)
-                    if offer.name in offers:
-                        raise MarketError(f"Дубликат в каталоге · {offer.name}")
-                    offers[offer.name] = offer
+                offers = self.read_catalog(source)
             except MarketError as exc:
                 return source, [self.record(db, "market_check", source=source, status="error", error=str(exc))]
             previous = self.catalog(db, source)
@@ -302,12 +307,20 @@ class SkillMarket:
                     for row in db.execute("SELECT * FROM candidates ORDER BY rowid")]
 
     def candidate(self, name: str) -> tuple[dict, Skill, Skill]:
+        config = self.config()
+        if not config.auto_update or not config.require_eval:
+            raise MarketError("Для eval кандидата включите auto_update и require_eval")
         with self.database() as db:
             db.execute("BEGIN")
-            row = db.execute("""SELECT * FROM candidates WHERE name=? AND status='pending'
-                                ORDER BY rowid DESC LIMIT 1""", (name,)).fetchone()
+            row = db.execute("""SELECT c.* FROM candidates c JOIN active a ON c.name=a.name
+                                AND c.source=a.source AND c.old_version=a.version AND c.old_sha256=a.sha256
+                                WHERE c.name=? AND c.source=? AND c.status='pending'
+                                ORDER BY c.rowid DESC LIMIT 1""", (name, str(config.source))).fetchone()
             if row is None:
                 raise MarketError(f"Нет кандидата на проверку · {name}")
+            published = self.read_catalog(config.source).get(name)
+            if published is None or (published.version, published.sha256) != (row["new_version"], row["new_sha256"]):
+                raise MarketError("Кандидат больше не опубликован в текущем каталоге")
             return dict(row), self.revision(db, name, row["old_sha256"]), self.revision(db, name, row["new_sha256"])
 
     def finish_candidate(self, identifier: str, decision: dict) -> dict:
@@ -327,6 +340,9 @@ class SkillMarket:
                     or (current["source"], current["version"], current["sha256"]) !=
                     (str(source), row["old_version"], row["old_sha256"])):
                 raise MarketError("Настройки или активная версия изменились во время сравнения")
+            published = self.read_catalog(source).get(name)
+            if published is None or (published.version, published.sha256) != (row["new_version"], row["new_sha256"]):
+                raise MarketError("Опубликованный кандидат изменился во время сравнения")
             status = decision["status"]
             if status not in {"accepted", "rejected"}:
                 raise MarketError("Неверное решение по кандидату")
