@@ -1,0 +1,5 @@
+{
+  "catalog": "catalog.json",
+  "check_on_start": true,
+  "auto_update": true
+}

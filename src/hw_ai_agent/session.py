@@ -822,7 +822,7 @@ class SessionStore:
             journal.resolve_changes(item, changes)
         if resolution == "retry":
             name = item["call"]["function"]["name"]
-            if name not in {"write_file", "delete_file", "read_file", "list_files", "load_skill", "Bash", "bash",
+            if name not in {"write_file", "delete_file", "read_file", "list_files", "load_skill", "install_skill", "Bash", "bash",
                             "submit_plan", "complete_task", "fail_task"} and not mcp_fields(name):
                 raise SessionError("This instrument has no supported safe retry contract")
             with self.transaction():

@@ -25,9 +25,10 @@ class Action(str, Enum):
     DENY = "deny"
 
 
-TOOLS = frozenset({"load_skill", "list_files", "read_file", "write_file", "delete_file", "Bash"})
+TOOLS = frozenset({"install_skill", "load_skill", "list_files", "read_file", "write_file", "delete_file", "Bash"})
 FILE_TOOLS = frozenset({"list_files", "read_file", "write_file", "delete_file"})
 DEFAULTS = {
+    "install_skill": Action.ASK,
     "load_skill": Action.ALLOW,
     "list_files": Action.ALLOW,
     "read_file": Action.ALLOW,
@@ -98,6 +99,9 @@ class Policy:
             data = {**data, "defaults": {**data.get("defaults", {}), "delete_file": "deny"}}
         if "load_skill" not in data.get("defaults", {}):
             data = {**data, "defaults": {**data.get("defaults", {}), "load_skill": "allow" if builtin else "deny"}}
+        if "install_skill" not in data.get("defaults", {}):
+            action = "ask" if builtin else "deny"
+            data = {**data, "defaults": {**data.get("defaults", {}), "install_skill": action}}
         return cls.from_dict(data)
 
     def decide(self, tool: str, *, path: str | None = None,

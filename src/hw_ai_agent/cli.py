@@ -35,6 +35,7 @@ from .journal import ChangeJournal, JournalError
 from .tasks import checklist
 from .text import json_text
 from .skills import SkillCatalog
+from .skill_market import SkillMarket
 from .mcp import MCPRegistry
 from .eval_runner import Options as EvalOptions, rebuild_summary, run_evaluation
 from .session_doctor import show_session_report
@@ -131,8 +132,45 @@ def show_compact_event(event: dict, *, chat=False) -> None:
             print(f"{visible_line(event['name'])} · {visible_line(event['content'][:240])}", flush=True)
 
 
+def show_market_event(event):
+    kind = event["event"]
+    if kind == "market_check":
+        if event["status"] == "error":
+            print(f"Маркет · {visible_line(event['error'])}", file=sys.stderr, flush=True)
+        return
+    name, version = visible_line(event["name"]), visible_line(event["new_version"])
+    if kind == "market_new":
+        print(f"Маркет · новый скилл {name} {version}", flush=True)
+    elif kind == "market_update":
+        old = visible_line(event["old_version"])
+        status = {"updated": "установлено", "available": "доступно", "error": "ошибка"}[event["status"]]
+        detail = f" · {visible_line(event['error'])}" if event.get("error") else ""
+        print(f"Маркет · {name} {old} → {version} · {status}{detail}", flush=True)
+
+
+def market_command(args) -> int:
+    market = SkillMarket(args.market_config, args.state_db, args.workspace)
+    if args.market_action == "events":
+        for line in market.events():
+            print(line)
+    elif args.market_action == "status":
+        print(json_text(market.installed(), indent=2))
+    else:
+        _, events = market.check()
+        for event in events:
+            show_market_event(event)
+        if events[0]["status"] == "unchanged":
+            print("Маркет · каталог без изменений")
+        if any(event.get("status") == "error" for event in events):
+            return 1
+    return 0
+
+
 def event_listener(stop_after_tools=None, stop_after_tasks=None, *, verbose=False, chat=False, progress=None):
     def render(event):
+        if event["event"].startswith("market_"):
+            show_market_event(event)
+            return
         if progress and progress.mode != "off" and progress.render(event):
             return
         if verbose and event["event"] not in {"tool_call", "tool_result"}:
@@ -256,6 +294,12 @@ def saved_runtime(state, db_path: Path, approvals=None, on_event=show_event, *,
         if directory is not None and (not isinstance(directory, str) or not Path(directory).is_absolute()):
             raise SessionError("Некорректный путь сохранённого каталога скиллов")
         skills = open_skills(workspace, Path(directory) if directory is not None else None)
+    market = None
+    market_config = metadata.get("market_config")
+    if load_extensions and market_config is not None:
+        if skills is None or not isinstance(market_config, str) or not Path(market_config).is_absolute():
+            raise SessionError("Не удалось прочитать настройки маркета скиллов")
+        market = SkillMarket(Path(market_config), db_path, workspace)
     mcp = None
     mcp_config = metadata.get("mcp_config")
     if load_extensions and mcp_config is not None:
@@ -264,7 +308,7 @@ def saved_runtime(state, db_path: Path, approvals=None, on_event=show_event, *,
             raise SessionError("Не удалось прочитать настройки MCP")
         mcp = MCPRegistry(Path(mcp_config["path"]), workspace, expected_digest=mcp_config["digest"])
     return ToolRuntime(workspace, policy=policy, mode=metadata.get("execution_mode", "safe"),
-                       skills=skills, mcp=mcp,
+                       skills=skills, market=market, mcp=mcp,
                        trash_dir=metadata.get("trash_dir", str(db_path.resolve().parent / "trash")),
                        approve=partial(confirm_action, verbose=verbose) if mode == "ask" else None,
                        on_policy_event=on_event, **limits)
@@ -490,8 +534,12 @@ def starting_runtime(args, listener):
     workspace = args.workspace or Path("workspace")
     if args.state_db.expanduser().resolve().is_relative_to(workspace.expanduser().resolve()):
         raise SessionError("База сессий должна находиться вне рабочей папки")
+    market_config = getattr(args, "market_config", None)
+    if market_config is not None and args.skills is False:
+        raise ConfigurationError("Для --market-config нужен включённый каталог скиллов")
     return ToolRuntime(workspace, policy=load_policy(args.policy, workspace), mode=args.mode,
                        skills=open_skills(workspace, args.skills_dir) if args.skills is not False else None,
+                       market=SkillMarket(market_config, args.state_db, workspace) if market_config else None,
                        mcp=MCPRegistry(args.mcp_config, workspace) if args.mcp_config is not None else None,
                        trash_dir=args.state_db.expanduser().resolve().parent / "trash",
                        approve=partial(confirm_action, verbose=args.verbose) if args.approvals == "ask" else None,
@@ -661,6 +709,12 @@ def main() -> int:
     eval_run.add_argument("--max-tokens", type=int, default=2048, help="Лимит выходных токенов на ответ (по умолчанию 2048)")
     eval_report = eval_actions.add_parser("report", help="Обновить summary.md по сохранённым результатам")
     eval_report.add_argument("--output", type=Path, default=Path(".agent/evals/study-tracker"), help="Папка сохранённой серии")
+    market = subparsers.add_parser("market", help=COMMAND_HELP["market"])
+    market.add_argument("market_action", choices=("check", "status", "events"))
+    market.add_argument("--market-config", type=Path, required=True, help="Путь к JSON-конфигурации маркета")
+    market.add_argument("--workspace", type=Path, default=Path("workspace"))
+    market.add_argument("--state-db", type=Path)
+    market.add_argument("--env-file", type=Path, default=Path(".env"))
     set_command = subparsers.add_parser("set", help=COMMAND_HELP["set"], description=COMMAND_HELP["set"])
     set_command.add_argument("--provider", choices=list(PROVIDERS))
     set_command.add_argument("--model")
@@ -715,6 +769,7 @@ def main() -> int:
             command.add_argument("--skills", action=argparse.BooleanOptionalAction, default=None,
                                  help="Включить каталог скиллов (по умолчанию включён)")
             command.add_argument("--skills-dir", type=Path, help="Папка дополнительных SKILL.md вне рабочей папки")
+            command.add_argument("--market-config", type=Path, help="JSON-конфигурация маркета вне рабочей папки")
             command.add_argument("--mcp-config", type=Path, help="JSON-конфигурация локальных MCP-серверов вне рабочей папки")
             if action == "chat":
                 command.add_argument("--resume", dest="resume_chat", metavar="ID", nargs="?", const="")
@@ -772,6 +827,11 @@ def main() -> int:
                 args.state_db = option_value("state_db", os.getenv("AGENT_STATE_DB", ".agent/sessions.sqlite3"))
             show_session_report(args.state_db, args.session_id, as_json=args.json)
             return 0
+        if args.action == "market":
+            if args.state_db is None:
+                load_launch_env(args.env_file)
+                args.state_db = option_value("state_db", os.getenv("AGENT_STATE_DB", ".agent/sessions.sqlite3"))
+            return market_command(args)
         if args.action == "eval":
             if args.eval_action == "report":
                 rebuild_summary(args.output)
@@ -794,7 +854,7 @@ def main() -> int:
         if getattr(args, "resume_chat", None) is not None:
             options = set(LAUNCH_OPTIONS) - {"state_db", "cost_estimate", "progress"}
             if any(getattr(args, name, None) is not None
-                   for name in options | {"provider", "model", "skills", "skills_dir", "mcp_config"}):
+                   for name in options | {"provider", "model", "skills", "skills_dir", "mcp_config", "market_config"}):
                 raise ConfigurationError("Для продолжения диалога используются сохранённые настройки запуска")
             load_env(args.env_file)
             if args.state_db is None:

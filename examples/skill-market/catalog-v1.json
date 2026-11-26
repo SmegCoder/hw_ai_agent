@@ -1,0 +1,11 @@
+{
+  "skills": [
+    {
+      "name": "study-week-overview",
+      "version": "1.0.0",
+      "description": "Составить учебный план на неделю и распределить учебную нагрузку по дням.",
+      "path": "packages/study-week-overview/1.0.0/SKILL.md",
+      "sha256": "1b17d6741d8ab5dde221809890c26d6a4aa5387767d70848be5acf429e7cac6b"
+    }
+  ]
+}

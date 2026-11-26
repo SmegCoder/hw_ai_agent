@@ -7,7 +7,7 @@ from .text import escape_surrogates
 
 
 DIMENSIONS = ("model_requests", "tool_calls", "side_effects", "result_bytes")
-SIDE_EFFECT_TOOLS = frozenset({"write_file", "delete_file", "Bash", "bash"})
+SIDE_EFFECT_TOOLS = frozenset({"install_skill", "write_file", "delete_file", "Bash", "bash"})
 TRUNCATED = "\n[TRUNCATED: result budget]"
 
 

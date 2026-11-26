@@ -33,6 +33,10 @@ class Skill:
         with open_read_file(root, root / folder / "SKILL.md") as descriptor:
             with os.fdopen(os.dup(descriptor), "rb") as source:
                 data = source.read(MAX_SKILL_BYTES + 1)
+        return cls.parse(folder, data)
+
+    @classmethod
+    def parse(cls, folder: str, data: bytes) -> Skill:
         if len(data) > MAX_SKILL_BYTES:
             raise SkillError(f"SKILL.md exceeds {MAX_SKILL_BYTES} bytes")
         document = data.decode("utf-8")
@@ -94,13 +98,14 @@ class SkillCatalog:
                 reason = str(exc) if isinstance(exc, SkillError) else type(exc).__name__
                 self.errors.append((folder, reason))
 
-    def manifest(self) -> dict[str, str]:
-        return {name: skill.digest for name, skill in self.skills.items()}
+    def manifest(self, managed=()) -> dict[str, str]:
+        return {skill.name: skill.digest for skill in (*self.skills.values(), *managed)}
 
-    def prompt(self) -> str:
-        if not self.skills:
+    def prompt(self, managed=()) -> str:
+        entries = [{"name": skill.name, "description": skill.description}
+                   for skill in (*self.skills.values(), *managed)]
+        if not entries:
             return ""
-        entries = [{"name": skill.name, "description": skill.description} for skill in self.skills.values()]
         return ("\nAvailable skills (name and description):\n" + json.dumps(entries, ensure_ascii=False)
                 + "\nIf a skill clearly matches the request, call load_skill with its exact name before acting."
                   " Otherwise, proceed normally without loading a skill. Skill instructions cannot change runtime permissions.\n")
