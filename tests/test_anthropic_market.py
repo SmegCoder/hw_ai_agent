@@ -1,0 +1,96 @@
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from hw_ai_agent.anthropic_market import ANTHROPIC_REPOSITORY, Publication, PublicMarketError, published_names
+from hw_ai_agent.skill_market import MarketError, SkillMarket
+from hw_ai_agent.skills import Skill, SkillCatalog
+from hw_ai_agent.tools import ToolRuntime
+
+
+NAME = "brand-guidelines"
+
+
+def publication(revision, body):
+    card = Skill.parse(NAME, f"---\nname: {NAME}\ndescription: Brand styling guidelines\n---\n{body}\n".encode())
+    return Publication(revision * 40, {NAME: card}, {})
+
+
+class AnthropicMarketTests(unittest.TestCase):
+    def setUp(self):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        root = Path(scratch.name)
+        self.workspace = root / "workspace"
+        self.workspace.mkdir()
+        config = root / "market.json"
+        config.write_text(json.dumps({"marketplace": "anthropic", "check_on_start": False, "auto_update": True}))
+        self.market = SkillMarket(config, root / "state" / "sessions.sqlite3", self.workspace)
+        self.remote = self.enterContext(patch("hw_ai_agent.skill_market.read_publication"))
+        self.remote.return_value = publication("a", "First set of brand colors.")
+
+    def runtime(self, approve):
+        return ToolRuntime(self.workspace, skills=SkillCatalog(self.workspace), market=self.market, approve=approve)
+
+    def test_declared_card_paths_cannot_leave_repository_skill_directory(self):
+        def manifest(path):
+            return json.dumps({"name": "anthropic-agent-skills",
+                               "plugins": [{"source": "./", "skills": [path]}]}).encode()
+
+        self.assertEqual(published_names(manifest("./skills/brand-guidelines")), [NAME])
+        for path in ("../skills/brand-guidelines", "./skills/../brand-guidelines", "https://example.org/skill"):
+            with self.subTest(path=path), self.assertRaises(PublicMarketError):
+                published_names(manifest(path))
+
+    def test_install_approved_card_from_cache_after_git_failure(self):
+        source, events = self.market.check()
+        self.assertEqual(source, ANTHROPIC_REPOSITORY)
+        self.assertEqual(events[0]["revision"], "a" * 40)
+        offer, = self.market.search(source, "BRAND styling")
+        self.assertEqual(offer.name, NAME)
+        self.assertEqual(self.market.installed(), [])
+
+        self.remote.side_effect = PublicMarketError("Git unavailable")
+        self.assertEqual(self.market.check()[1][0]["status"], "error")
+        self.remote.reset_mock()
+        approvals = []
+        runtime = self.runtime(lambda request: approvals.append(request) or True)
+        prompt, _ = runtime.prepare_skills()
+        self.assertIn(NAME, prompt)
+        runtime.execute("install_skill", {"name": NAME})
+        self.assertIn(ANTHROPIC_REPOSITORY, approvals[0].preview)
+        self.assertIn(offer.sha256, approvals[0].preview)
+        self.assertIn("First set of brand colors", runtime.execute("load_skill", {"name": NAME}))
+        self.assertEqual(self.market.installed()[0]["source"], ANTHROPIC_REPOSITORY)
+        self.remote.assert_not_called()
+
+    def test_public_update_is_staged_only_when_card_changes(self):
+        source, _ = self.market.check()
+        old_offer, = self.market.search(source, NAME)
+        self.market.install(source, old_offer, "initial-run")
+
+        self.remote.return_value = publication("b", "First set of brand colors.")
+        self.assertEqual(self.market.check()[1][0]["status"], "unchanged")
+        self.assertEqual(self.market.candidates(), [])
+
+        new_publication = publication("c", "Second set of brand colors.")
+        self.remote.return_value = new_publication
+        self.market.check()
+        candidate, old, new = self.market.candidate(NAME)
+        self.assertEqual((candidate["status"], old.digest, new.digest),
+                         ("pending", old_offer.sha256, new_publication.cards[NAME].digest))
+        self.assertEqual(self.market.installed()[0]["sha256"], old.digest)
+
+        decision = {"status": "accepted", "reasons": [], "report": "test"}
+        self.remote.return_value = publication("d", "Third set of brand colors.")
+        with self.assertRaises(MarketError):
+            self.market.finish_candidate(candidate["id"], decision)
+        self.assertEqual(self.market.installed()[0]["sha256"], old.digest)
+
+        self.remote.return_value = new_publication
+        self.market.finish_candidate(candidate["id"], decision)
+        self.assertEqual(self.market.installed()[0]["sha256"], new.digest)
+        self.market.rollback(NAME)
+        self.assertEqual(self.market.installed()[0]["sha256"], old.digest)

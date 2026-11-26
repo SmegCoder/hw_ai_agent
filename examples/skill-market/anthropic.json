@@ -1,0 +1,6 @@
+{
+  "marketplace": "anthropic",
+  "check_on_start": false,
+  "auto_update": true,
+  "require_eval": true
+}

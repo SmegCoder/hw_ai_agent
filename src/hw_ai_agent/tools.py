@@ -247,7 +247,8 @@ class ToolRuntime:
             elif name == "Bash":
                 preview = f"Working directory: {arguments.get('cwd', '.')}\nCommand: {command}"
             elif offer is not None:
-                preview = f"Skill: {offer.name} {offer.version}\nSHA-256: {offer.sha256}"
+                preview = (f"Skill: {offer.name} {offer.version}\nSource: {self.market_run['source']}"
+                           f"\nSHA-256: {offer.sha256}")
             elif name == "load_skill" or mcp_fields(name):
                 preview = json.dumps(arguments, ensure_ascii=True, sort_keys=True)[:4000]
             working_directory = checked_cwd[0].relative_to(self.root).as_posix() if checked_cwd else None
@@ -293,7 +294,7 @@ class ToolRuntime:
         if name == "install_skill":
             offer = self.market_offers[arguments["name"]]
             try:
-                return self.market.install(Path(self.market_run["source"]), offer, self.market_run_id)
+                return self.market.install(self.market_run["source"], offer, self.market_run_id)
             except MarketError as exc:
                 raise ToolError(f"MARKET_INSTALL_ERROR: {exc}") from None
         if name == "load_skill":

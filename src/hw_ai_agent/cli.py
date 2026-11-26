@@ -160,6 +160,15 @@ def market_command(args) -> int:
         print(json_text(market.installed(), indent=2))
     elif args.market_action == "candidates":
         print(json_text(market.candidates(), indent=2))
+    elif args.market_action == "search":
+        source, events = market.check()
+        if events[0]["status"] == "error":
+            show_market_event(events[0])
+            return 1
+        offers = market.search(source, args.skill or "")
+        print(f"Маркет · найдено {len(offers)}")
+        for offer in offers:
+            print(f"{offer.name} {offer.version} · {visible_line(offer.description)}")
     elif args.market_action == "evaluate":
         if not args.skill:
             raise ConfigurationError("Укажите имя скилла после market evaluate")
@@ -181,6 +190,10 @@ def market_command(args) -> int:
         _, events = market.check()
         for event in events:
             show_market_event(event)
+        if "revision" in events[0]:
+            check = events[0]
+            print(f"Anthropic · Git {check['revision'][:12]} · карточек {check['count']}"
+                  f" · пропущено {len(check['skipped'])}")
         if events[0]["status"] == "unchanged":
             print("Маркет · каталог без изменений")
         if any(event.get("status") == "error" for event in events):
@@ -732,8 +745,8 @@ def main() -> int:
     eval_report = eval_actions.add_parser("report", help="Обновить summary.md по сохранённым результатам")
     eval_report.add_argument("--output", type=Path, default=Path(".agent/evals/study-tracker"), help="Папка сохранённой серии")
     market = subparsers.add_parser("market", help=COMMAND_HELP["market"])
-    market.add_argument("market_action", choices=("check", "status", "events", "candidates", "evaluate"))
-    market.add_argument("skill", nargs="?", help="Имя скилла для evaluate")
+    market.add_argument("market_action", choices=("check", "search", "status", "events", "candidates", "evaluate"))
+    market.add_argument("skill", nargs="?", help="Запрос для search или имя скилла для evaluate")
     market.add_argument("--market-config", type=Path, required=True, help="Путь к JSON-конфигурации маркета")
     market.add_argument("--workspace", type=Path, default=Path("workspace"))
     market.add_argument("--state-db", type=Path)
