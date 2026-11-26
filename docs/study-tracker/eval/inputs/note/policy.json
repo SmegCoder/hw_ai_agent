@@ -1,0 +1,22 @@
+{
+  "defaults": {
+    "list_files": "allow",
+    "read_file": "allow"
+  },
+  "directories": {
+    "allow": [
+      "."
+    ]
+  },
+  "rules": [
+    {
+      "action": "allow",
+      "tool": "mcp__tracker__list_tasks"
+    },
+    {
+      "action": "allow",
+      "path": "note.txt",
+      "tool": "write_file"
+    }
+  ]
+}

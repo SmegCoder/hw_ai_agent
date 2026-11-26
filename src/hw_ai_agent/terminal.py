@@ -7,6 +7,7 @@ import re
 import shlex
 import shutil
 import sys
+import unicodedata
 from time import monotonic
 from datetime import date
 from itertools import count
@@ -31,6 +32,24 @@ def emphasis(text: str, style: str = "1") -> str:
 
 def visible_line(value: str) -> str:
     return visible(value).replace("\n", "\\n").replace("\t", "\\t")
+
+
+def read_confirmation(prompt: str) -> bool | None:
+    while True:
+        raw = input(prompt)
+        if not raw.strip():
+            return None
+        # Strip bracketed paste markers and invisible Unicode formatting from terminal input.
+        text = raw.replace("\x1b[200~", "").replace("\x1b[201~", "")
+        answer = "".join(char for char in text if unicodedata.category(char) != "Cf").strip().casefold()
+        if answer in {"y", "yes", "д", "да"}:
+            return True
+        if answer in {"n", "no", "нет"}:
+            return False
+        if answer == "н":
+            print("В русской раскладке клавиша Y вводит «н». Введите «да» или «нет».", flush=True)
+        else:
+            print("Введите y или «да» для подтверждения, n или «нет» для отказа.", flush=True)
 
 
 DIFF_HUNK = re.compile(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
@@ -139,7 +158,8 @@ class ProgressDisplay:
             return
         if not isinstance(arguments, dict):
             return
-        target = arguments.get("command" if name in {"Bash", "bash"} else "path", ".")
+        target_key = {"Bash": "command", "bash": "command", "load_skill": "name"}.get(name, "path")
+        target = arguments.get(target_key, ".")
         if not isinstance(target, str):
             return
         self.target = visible_line(target)
@@ -163,6 +183,8 @@ class ProgressDisplay:
                 self.line(f"{'Проверка' if self.is_test else 'Команда'} · {self.target}")
         elif name in {"read_file", "list_files"}:
             self.line(f"{'Чтение' if name == 'read_file' else 'Список файлов'} · {self.target}")
+        elif name == "load_skill":
+            self.line(f"Загрузка скилла · {self.target}")
         elif name not in {"write_file", "delete_file"}:
             label = f"Инструмент · {visible_line(name)}"
             self.line(self.TASK_ACTIONS.get(name, label) if brief else label)
@@ -244,7 +266,36 @@ def result_details(agent):
     return files, tests
 
 
+def ollama_answer(answer: str) -> str:
+    opening = re.match(r"\s*<think>", answer, re.IGNORECASE)
+    if opening:
+        tail = answer[opening.end():]
+        closing = re.search(r"</think>", tail, re.IGNORECASE)
+        return tail[closing.end():].lstrip("\r\n") if closing else ""
+
+    # An Ollama response can contain the closing marker alone. Ignore markers in Markdown examples.
+    fence = ""
+    offset = 0
+    for line in answer.splitlines(keepends=True):
+        offset += len(line)
+        marker = re.match(r"^[ \t]*(`{3,}|~{3,})(.*)$", line)
+        if marker:
+            delimiter, info = marker.groups()
+            if not fence:
+                fence = delimiter
+            elif delimiter.startswith(fence) and not info.strip():
+                fence = ""
+        elif not fence and line.strip().casefold() == "</think>":
+            return answer[offset:].lstrip("\r\n")
+    return answer
+
+
 def report_answer(agent, answer: str, *, verbose: bool, chat: bool = False) -> None:
+    settings = getattr(getattr(agent, "client", None), "settings", None)
+    if getattr(settings, "provider", None) == "ollama":
+        answer = ollama_answer(answer)
+        if not answer.strip():
+            answer = "Модель не вернула итоговый текст."
     if verbose:
         print("\n" + visible(answer))
         return
@@ -324,17 +375,12 @@ def confirm_plan(plan: dict, *, verbose=False) -> bool:
     if not sys.stdin.isatty():
         raise PlanApprovalDeferred('План сохранён; запустите resume в терминале для утверждения')
     try:
-        while True:
-            answer = input('Утвердить план и перейти к исполнению? [y/n; Enter — пауза]: ').strip().lower()
-            if answer in {'y', 'yes', 'да', 'д'}:
-                return True
-            if answer in {'n', 'no', 'нет', 'н'}:
-                return False
-            if not answer:
-                raise PlanApprovalDeferred('План ожидает решения; продолжение через resume')
-            print('Введите y для утверждения или n для отклонения.')
+        decision = read_confirmation('Утвердить план и перейти к исполнению? [y/n; Enter — пауза]: ')
     except EOFError:
         raise PlanApprovalDeferred('Ответ не получен; план сохранён без утверждения') from None
+    if decision is None:
+        raise PlanApprovalDeferred('План ожидает решения; продолжение через resume')
+    return decision
 
 
 def choose_workspace(root: Path) -> Path | None:

@@ -1,0 +1,19 @@
+{
+  "as_of": "2026-11-25",
+  "overdue": [
+    {
+      "id": "T5",
+      "title": "Проверить разбор задачи",
+      "due_date": "2026-11-19",
+      "days_overdue": 6
+    },
+    {
+      "id": "T1",
+      "title": "Решить задачи по RISC-V",
+      "due_date": "2026-11-24",
+      "days_overdue": 1
+    }
+  ],
+  "missing_due_date": 0,
+  "skipped_records": 0
+}

@@ -1,6 +1,7 @@
 from __future__ import annotations
-import fnmatch
+import copy
 import difflib
+import fnmatch
 import hashlib
 import json
 import math
@@ -19,7 +20,12 @@ from typing import Any
 from .policy import Action, ApprovalDeferred, ApprovalRequest, Decision, Policy, PolicyError
 from .budget import truncate_result
 from .filesystem import TargetChangedError, capture_target, write_target, remove_target, open_read_file, open_directory
+from .skills import SkillCatalog, SkillError
+from .mcp import MCPError, MCPRegistry, mcp_event, mcp_fields
 from .text import has_surrogates
+
+
+READ_TOOLS = frozenset({"list_files", "read_file", "load_skill"})
 
 class ToolError(RuntimeError):
     pass
@@ -36,6 +42,8 @@ class ToolRuntime:
                  max_output_chars: int = 20_000, max_file_chars: int = 100_000,
                  policy: Policy | None = None,
                  mode: str = "safe",
+                 skills: SkillCatalog | None = None,
+                 mcp: MCPRegistry | None = None,
                  trash_dir: str | Path | None = None,
                  approve: Callable[[ApprovalRequest], bool] | None = None,
                  on_policy_event: Callable[[dict[str, Any]], None] | None = None) -> None:
@@ -58,6 +66,11 @@ class ToolRuntime:
         if mode not in {"safe", "auto"}:
             raise ValueError("Execution mode must be safe or auto")
         self.mode = mode
+        self.skills = skills
+        if mcp is not None and mcp.workspace != self.root:
+            raise ValueError("MCP registry was configured for a different workspace")
+        self.mcp = mcp
+        self.skill_manifest = skills.manifest() if skills is not None else {}
         self.phase = "execution"
         self.trash_dir = Path(trash_dir or self.root.parent / ".agent" / "trash").expanduser().resolve()
         if self.trash_dir.is_relative_to(self.root):
@@ -96,15 +109,22 @@ class ToolRuntime:
             ("Bash", "Run python -m unittest, pwd, ls, cat or sleep inside the sandbox. No pipes/redirects.",
              {"command": string, "cwd": string}, ["command"]),
         ]
-        return [{"type": "function", "function": {
+        if self.skills is not None and self.skill_manifest:
+            definitions.append(("load_skill", "Load the instructions of a skill from the catalog by exact name.",
+                                {"name": string}, ["name"]))
+        schemas = [{"type": "function", "function": {
             "name": name, "description": description,
             "parameters": {"type": "object", "properties": props,
                            "required": required, "additionalProperties": False},
         }} for name, description, props, required in definitions
-            if self.phase != "planning" or name in {"list_files", "read_file"}]
+            if self.phase != "planning" or name in READ_TOOLS]
+        if self.phase == "execution" and self.mcp is not None:
+            schemas.extend(tool.definition() for tool in self.mcp.tools.values()
+                           if self.policy.decide(tool.alias).action != Action.DENY)
+        return schemas
 
     def _check_phase(self, name: str):
-        if self.phase == "planning" and name not in {"list_files", "read_file"}:
+        if self.phase == "planning" and name not in READ_TOOLS:
             self._policy_event(name, "deny", "blocked", "Plan is not approved", "planning_boundary")
             raise ToolError("PLAN_MODE: only reading is allowed before explicit plan approval")
 
@@ -115,6 +135,8 @@ class ToolRuntime:
         # Own an immutable-value snapshot: an approval callback cannot alter the call.
         if isinstance(arguments, Mapping):
             arguments = dict(arguments)
+            if mcp_fields(name):
+                arguments = copy.deepcopy(arguments)
         try:
             path, command = self._validate_call(name, arguments)
         except ToolError as exc:
@@ -166,8 +188,12 @@ class ToolRuntime:
                     preview += f"\nSize: {target.file_signature[2]} bytes."
             elif name == "Bash":
                 preview = f"Working directory: {arguments.get('cwd', '.')}\nCommand: {command}"
+            elif name == "load_skill" or mcp_fields(name):
+                preview = json.dumps(arguments, ensure_ascii=True, sort_keys=True)[:4000]
             working_directory = checked_cwd[0].relative_to(self.root).as_posix() if checked_cwd else None
-            request = ApprovalRequest(name, path or command or ".", decision.reason, preview, fingerprint,
+            subject = arguments["name"] if name == "load_skill" else (path or command or (name if mcp_fields(name) else "."))
+            request = ApprovalRequest(name, subject,
+                                      decision.reason, preview, fingerprint,
                                       working_directory=working_directory)
             approved = False
             source = "policy"
@@ -204,6 +230,23 @@ class ToolRuntime:
         if self.policy.decide(name, path=path, command=command).action == Action.DENY:
             self._policy_event(name, "deny", "blocked", "Policy changed during approval", "runtime_boundary")
             raise ToolError("POLICY_DENIED: policy changed during approval")
+        if name == "load_skill":
+            try:
+                content = self.skills.load(arguments["name"], self.skill_manifest)
+            except SkillError as exc:
+                raise ToolError(str(exc)) from None
+            if self.result_limit_bytes is not None and len(content.encode("utf-8")) > self.result_limit_bytes:
+                raise ToolError("SKILL_RESULT_LIMIT: instructions exceed the remaining tool result budget")
+            return content
+        if mcp_fields(name):
+            try:
+                content = self.mcp.call(self.mcp.tools[name], arguments)
+                limit = self.result_limit_bytes
+                if limit is not None and len(content.encode("utf-8")) > limit:
+                    raise MCPError("MCP_RESULT_LIMIT: server result exceeds the remaining tool result budget")
+                return content
+            except (MCPError, UnicodeError) as exc:
+                raise ToolError(str(exc)) from None
         handler = self.bash if name == "Bash" else getattr(self, name)
         boundary = self.journal.action(name, arguments, path) if self.journal is not None and name in {"write_file", "delete_file", "Bash"} else nullcontext()
         try:
@@ -227,6 +270,16 @@ class ToolRuntime:
             raise ToolError(f"{name} failed: {type(exc).__name__}") from None
 
     def _validate_call(self, name: str, arguments: Mapping[str, Any]) -> tuple[str | None, str | None]:
+        if mcp_fields(name):
+            if self.mcp is None or name not in self.mcp.tools:
+                raise ToolError("MCP_UNAVAILABLE: tool was not discovered or is outside the configured allow-list")
+            if not isinstance(arguments, Mapping):
+                raise ToolError("Arguments must be a JSON object")
+            try:
+                self.mcp.tools[name].validate(arguments)
+            except MCPError as exc:
+                raise ToolError(str(exc)) from None
+            return None, None
         schema = next((s["function"] for s in self.tool_schemas if s["function"]["name"] == name), None)
         if schema is None:
             raise ToolError(f"Unknown tool: {name}")
@@ -246,6 +299,8 @@ class ToolRuntime:
                     value.encode("utf-8")
                 except UnicodeError:
                     raise ToolError(f"{key} must contain valid UTF-8 text") from None
+        if name == "load_skill":
+            return None, None
         if name == "Bash":
             directory = self._safe_path(arguments.get("cwd", "."))
             if not directory.is_dir():
@@ -269,8 +324,8 @@ class ToolRuntime:
 
     def _policy_event(self, tool: str, action: str, outcome: str, reason: str,
                       source: str, fingerprint: str | None = None, scope: str | None = None) -> None:
-        event = {"event": "policy_decision", "tool": tool, "action": action,
-                 "outcome": outcome, "reason": reason, "source": source, "approval_contract": 2}
+        event = mcp_event({"event": "policy_decision", "tool": tool, "action": action,
+                           "outcome": outcome, "reason": reason, "source": source, "approval_contract": 2})
         if fingerprint:
             event["fingerprint"] = fingerprint
         if scope:

@@ -1,0 +1,110 @@
+{
+  "approvals": "deny",
+  "budget": {
+    "model_requests": 8,
+    "result_bytes": 65536,
+    "side_effects": 3,
+    "tool_calls": 20
+  },
+  "cases": [
+    {
+      "id": "open-tasks",
+      "mcp": "ok",
+      "prompt": "Прочитай задачи учебного трекера. Сохрани в open-tasks.json JSON-массив строк с ID всех незавершённых задач без дублей. Учитывай статусы open, todo, in_progress и blocked.",
+      "skills": [
+        "open-task-export"
+      ],
+      "snapshot": "a51335bd1a4c574b8005cca5f50cbba9260750c2dda1b14924642596fe70a5a6"
+    },
+    {
+      "id": "deadlines",
+      "mcp": "ok",
+      "prompt": "Собери отчёт по учебному трекеру на 2026-11-25. Сохрани в deadlines.json JSON-объект с полями as_of (дата отчёта), overdue (массив объектов с id, title, due_date, days_overdue), missing_due_date (число незавершённых задач без корректного срока) и skipped_records (число некорректных записей). В overdue включай только незавершённые задачи со сроком строго раньше даты отчёта. Сортируй по due_date, затем по id.",
+      "skills": [
+        "deadline-report"
+      ],
+      "snapshot": "858016e84a7ef094179a64e79eb323d1795bc9720d0ad5984e5b6d6bcb922b30"
+    },
+    {
+      "id": "note",
+      "mcp": "unused",
+      "prompt": "Запиши в note.txt ровно этот текст, без кавычек и переноса строки: Повторить RISC-V и транзакции.",
+      "skills": [],
+      "snapshot": "858016e84a7ef094179a64e79eb323d1795bc9720d0ad5984e5b6d6bcb922b30"
+    },
+    {
+      "id": "missing-deadlines",
+      "mcp": "ok",
+      "prompt": "Проверь незавершённые задачи учебного трекера на 2026-11-25. Сохрани в deadlines.json JSON-объект с двумя полями: overdue (массив объектов с id и due_date, по возрастанию даты и id) и missing_due_date_ids (массив ID незавершённых задач с отсутствующим или некорректным сроком). Просрочены задачи со сроком строго раньше указанной даты. Не выдумывай даты.",
+      "skills": [
+        "deadline-report"
+      ],
+      "snapshot": "765128940b484ed9008368c93b0a9de5c76bfb7224f12b84e790cca30f5c318c"
+    },
+    {
+      "id": "mcp-failure",
+      "mcp": "error",
+      "prompt": "Выгрузи ID незавершённых задач учебного трекера в open-tasks.json. Если трекер недоступен, не создавай файл и ответь ровно одной фразой: Данные трекера недоступны.",
+      "skills": [
+        "open-task-export"
+      ],
+      "snapshot": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b"
+    }
+  ],
+  "endpoint": "https://openrouter.ai/api/v1",
+  "format": 1,
+  "hypothesis": "Скиллы повысят долю правильных результатов в сценариях отбора задач и дедлайнов. Дополнительные инструкции могут увеличить расход входных токенов.",
+  "mcp": {
+    "allow_tools": [
+      "list_tasks"
+    ],
+    "server": "tracker",
+    "timeout": 5
+  },
+  "mode": "auto",
+  "model": "deepseek/deepseek-v4.1-flash",
+  "parameters": {
+    "max_rounds": 8,
+    "max_tokens": 2048,
+    "timeout": 180,
+    "trials": 3
+  },
+  "provider": "openrouter",
+  "python": "3.14.2",
+  "variants": {
+    "A": "skills-off",
+    "B": "skills-on"
+  },
+  "versions": {
+    "__init__.py": "987fdbfe248c938a97eb18ee6796981ae2029c412840e8e5580f660a9e88a521",
+    "__main__.py": "2cdd23d4f5cd6c3b3e4cb690ad16d560637767b9ca5b2a3cf129fcc0a5ebc82b",
+    "agent.py": "bc667dda1f85dd52840f4ab168eae1c0d85a71f2fb3a8e1668e5d983090ee728",
+    "budget.py": "44da05a6c4039421678e8e7365a543788eb5813a55e5b68b68749d40cf815058",
+    "cli.py": "d84576f00c87d070c7ea594d9c910ad966d0796f7f5c784d807431d83e61a9a0",
+    "client.py": "ab56b6ba012951dba0de47338962661d6cb9fe60a4f88c6c3278b5b1f5ef6219",
+    "config.py": "26a72c4f4a07c3187766fe41d65f4963ef1470aa8ae5e161cda24084c5d441d9",
+    "conversation.py": "a2e7dd19d9d47c07b331a884dcb9b08dcaec811df1d41b172b39a2e03f02afbb",
+    "eval_cases.py": "9751176244db31ea1a87f5404dfe8b8494b959b6a58ecbf57c7732c05f4f54c0",
+    "eval_report.py": "055cf6f175e54c3ac55d2516d3e66eb9ced59592f7248b4dd2ba411c9fa50f82",
+    "eval_runner.py": "df93e445a771298fc1a758842bc4793dcbaaa999ed6036558560b74201dc2b56",
+    "filesystem.py": "a9c2c07c0eef19d0a36279ad65a6f3048c28ad9505fc27b673154c215b7cef2e",
+    "journal.py": "d7e7997b839e8fb342da9e71018a041e0625ae987f8a7085b2ff0a725118640d",
+    "mcp.py": "a200a45c405d652f403746124fe39a33e9608ec2c4d1f7ad22af6f0f0a1eb510",
+    "model_catalog.py": "02dab8834bd53bba68fc79b3ded86d5ebcbe4c30eb8d8897ca9fd17d211ab4f9",
+    "planning.py": "8756ace776b27cb93be9ce85c10e855f63f56384ba69391b349fcccb266de813",
+    "policy.py": "df927f8c4c09c6fcaefb9b1192bd6076d79f85c81e9836a639dc49be4581dbaf",
+    "pricing.py": "2b96e896981c1b4ce8aa32f00fddf3fcc75f08509c18550a001030be92aad5bf",
+    "routing.py": "8a6b7dd44b49c62fd826aef1705e3899ddf3fa7a554b3799365a8753514d95a2",
+    "session.py": "0bf7fc5802eff464f2a1fe3c28f009a77399323cc868081e994621b76a922462",
+    "skill_cards/deadline-report/SKILL.md": "5bcd4f27637ca8015a24b11cfc8333dceae44fec76264172d39a1cd86916473b",
+    "skill_cards/open-task-export/SKILL.md": "1fafba6515d5c90ea127c7390144cbbfd5bc16ffd6e70564dd40e29917a46c72",
+    "skill_cards/review-python-tests/SKILL.md": "6c21201f70118c8bbabb15f82776389d4f84613926a471ff100cfc7268213025",
+    "skills.py": "2fc1bc092bcbaf499e8cb4c464dc4eb5c4d79ee71352d9be898798b933cc50bb",
+    "tasks.py": "78acc1139da3d364fe3eff13dc5bc6743fce1501be0ebd188cb16b663b53af6f",
+    "terminal.py": "829f7afd6eaca65350f719c5e07f7e7646eee550b5e232453f4f6dd7bcf96297",
+    "text.py": "bb7346c3285db62bb5332c2d686d7f5c4404dbb2e5e6cb10322826a8b9b067c4",
+    "tools.py": "d827e1a36b4e1ad50b6b6af2a030fb31b2abd304d625333e0d11e3a2b261849a",
+    "tracker_mcp.py": "28611787b2f511ee50bcb2db157c31546d7beb0cf9652ab606d7b3e877642ce5",
+    "usage.py": "811a082da875d54a86eb4c8d16e952dcba0839db81c5ab3ba169db9e9a05c569"
+  }
+}

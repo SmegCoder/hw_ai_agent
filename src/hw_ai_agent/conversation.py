@@ -53,6 +53,9 @@ class RunStats:
     def __init__(self):
         self.requests = 0
         self.tools = Counter()
+        self.mcp_calls = Counter()
+        self.discovered_skills = set()
+        self.loaded_skills = Counter()
         self.known = Counter()
         self.tokens = Counter()
 
@@ -63,6 +66,12 @@ class RunStats:
         for event in state.events:
             if event["event"] == "tool_call":
                 self.tools[event["name"]] += 1
+                if "server" in event and "mcp_tool" in event:
+                    self.mcp_calls[event["server"], event["mcp_tool"]] += 1
+            elif event["event"] == "skills_discovered":
+                self.discovered_skills.update(event["names"])
+            elif event["event"] == "skill_loaded":
+                self.loaded_skills[event["name"]] += 1
             elif event["event"] in {"model_cost", "model_usage"} and event.get("usage"):
                 if "round" in event:
                     # Both events contain the API counters. A crash can leave only model_cost.
@@ -74,6 +83,10 @@ class RunStats:
                       if type(usage.get(key)) is int and usage[key] >= 0}
             if "total_tokens" not in values and {"prompt_tokens", "completion_tokens"} <= values.keys():
                 values["total_tokens"] = values["prompt_tokens"] + values["completion_tokens"]
+            details = usage.get("prompt_tokens_details")
+            if isinstance(details, dict):
+                values.update({key: details[key] for key in ("cached_tokens", "cache_write_tokens")
+                               if type(details.get(key)) is int and details[key] >= 0})
             self.known.update(values.keys())
             self.tokens.update(values)
 
@@ -94,6 +107,13 @@ class RunStats:
         tools = ", ".join(f"{visible(name)} × {count}" for name, count in sorted(self.tools.items()))
         print(f"  Вызовы инструментов · {self.tools.total()} · уникальных {len(self.tools)}"
               + (f" · {tools}" if tools else ""))
+        skills = ", ".join(f"{visible(name)} × {count}" for name, count in sorted(self.loaded_skills.items()))
+        print(f"  Скиллы · обнаружено {len(self.discovered_skills)} · загрузок {self.loaded_skills.total()}"
+              + f" · уникальных скиллов {len(self.loaded_skills)}" + (f" · {skills}" if skills else ""))
+        if self.mcp_calls:
+            calls = ", ".join(f"{visible(server)}/{visible(tool)} × {count}"
+                              for (server, tool), count in sorted(self.mcp_calls.items()))
+            print(f"  MCP-вызовы · {self.mcp_calls.total()} · {calls}")
 
 
 class Conversation:

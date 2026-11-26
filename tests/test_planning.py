@@ -313,7 +313,8 @@ class TerminalTests(unittest.TestCase):
     runtime = PlanningTests.runtime
 
     def test_plan_prompt_yes_no_empty_eof_and_no_terminal(self):
-        for response, result in (('y', True), ('n', False), ('', None), (EOFError(), None)):
+        for response, result in (('y', True), ('\u200eДА\u200b', True), ('n', False),
+                                 ('нет\u2060', False), ('', None), (EOFError(), None)):
             with patch('sys.stdin.isatty', return_value=True), patch('builtins.input', side_effect=response if isinstance(response, Exception) else None,
                     return_value=response), redirect_stdout(io.StringIO()) as output:
                 if result is None:
