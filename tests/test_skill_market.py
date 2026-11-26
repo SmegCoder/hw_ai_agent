@@ -48,6 +48,7 @@ class SkillMarketTests(unittest.TestCase):
     def settings(self, **options):
         self.config.write_text(json.dumps({**json.loads(self.config.read_text()), **options}))
 
+
     def market(self):
         return SkillMarket(self.config, self.db_path, self.workspace)
 
