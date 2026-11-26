@@ -1,0 +1,29 @@
+{
+  "artifact": "trials/deadlines/A1/workspace/deadlines.json",
+  "case_id": "deadlines",
+  "check": "Запуск не завершился",
+  "error": "Model output was cut off; increase --max-tokens",
+  "events": "trials/deadlines/A1/events.jsonl",
+  "input_tokens": 5162,
+  "input_usage_requests": 3,
+  "mcp_calls": {
+    "tracker/list_tasks": 1
+  },
+  "model_requests": 3,
+  "outcome_pass": false,
+  "output_tokens": 429,
+  "output_usage_requests": 3,
+  "routing_pass_or_na": true,
+  "run_id": "b437443950da466b9ceafd69dfe82fe1",
+  "skill_activations": {
+    "tracker-json-deadlines": 1
+  },
+  "status": "failed",
+  "tool_calls": {
+    "load_skill": 1,
+    "mcp__tracker__list_tasks": 1
+  },
+  "tools_pass": false,
+  "trial": 1,
+  "variant": "A"
+}

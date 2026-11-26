@@ -14,3 +14,5 @@ build/
 .agent/
 .DS_Store
 workspace
+!docs/study-tracker/eval/trials/*/*/workspace/
+!docs/skill-update-eval/trials/*/*/workspace/

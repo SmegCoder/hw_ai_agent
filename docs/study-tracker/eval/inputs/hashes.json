@@ -1,0 +1,16 @@
+{
+  "deadlines/mcp.json": "b7c889f9d5ef03f74e24a40089e9d671f7b15d29286f82a3b67d3d0d228dae86",
+  "deadlines/policy.json": "2cc3f4c18af2989478d76ee51bb99d77ec09bfeafd8f9fc759a75e6133f9d5b2",
+  "deadlines/tasks.json": "6beed8fa4f37a72ada0cc84d4daa6afec165798ea8d5c202aa4d3889a531a665",
+  "mcp-failure/mcp.json": "b7c889f9d5ef03f74e24a40089e9d671f7b15d29286f82a3b67d3d0d228dae86",
+  "mcp-failure/policy.json": "87f81c96c6ff76aa7189d3cbc2f4bb895946a8fea470f86b6dd405fc7bafa814",
+  "missing-deadlines/mcp.json": "b7c889f9d5ef03f74e24a40089e9d671f7b15d29286f82a3b67d3d0d228dae86",
+  "missing-deadlines/policy.json": "2cc3f4c18af2989478d76ee51bb99d77ec09bfeafd8f9fc759a75e6133f9d5b2",
+  "missing-deadlines/tasks.json": "71a98f36cd8c53115d057e6f4fec5c97de4180ea1deb242cba35fae365b20035",
+  "note/mcp.json": "b7c889f9d5ef03f74e24a40089e9d671f7b15d29286f82a3b67d3d0d228dae86",
+  "note/policy.json": "d2799cf40e572521f8b64e5c7f2db8ec24204393b6bb66097cad29eddce2b379",
+  "note/tasks.json": "6beed8fa4f37a72ada0cc84d4daa6afec165798ea8d5c202aa4d3889a531a665",
+  "open-tasks/mcp.json": "b7c889f9d5ef03f74e24a40089e9d671f7b15d29286f82a3b67d3d0d228dae86",
+  "open-tasks/policy.json": "87f81c96c6ff76aa7189d3cbc2f4bb895946a8fea470f86b6dd405fc7bafa814",
+  "open-tasks/tasks.json": "9a8a0d1830361e790eb57dfbae2052f6cc20a6c75cf36c13588640dda736f79e"
+}

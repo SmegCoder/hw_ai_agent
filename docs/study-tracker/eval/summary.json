@@ -1,0 +1,416 @@
+{
+  "by_case": {
+    "deadlines": {
+      "A": {
+        "attempts": 3,
+        "errors": {
+          "BUDGET_EXHAUSTED: side_effects limit exceeded; needs 1, remaining 0": 1
+        },
+        "input_tokens": {
+          "complete_trials": 3,
+          "known_sum": 17230,
+          "mean_complete_trial": 5743.3,
+          "model_requests": 10,
+          "reported_requests": 10
+        },
+        "mcp_calls": {
+          "tracker/list_tasks": 3
+        },
+        "model_requests": 10,
+        "outcome_pass": 2,
+        "output_tokens": {
+          "complete_trials": 3,
+          "known_sum": 2081,
+          "mean_complete_trial": 693.7,
+          "model_requests": 10,
+          "reported_requests": 10
+        },
+        "routing_errors": 0,
+        "skill_activations": {},
+        "tool_calls": {
+          "Bash": 3,
+          "list_files": 3,
+          "mcp__tracker__list_tasks": 3,
+          "write_file": 2
+        },
+        "tools_pass": 2
+      },
+      "B": {
+        "attempts": 3,
+        "errors": {},
+        "input_tokens": {
+          "complete_trials": 3,
+          "known_sum": 19670,
+          "mean_complete_trial": 6556.7,
+          "model_requests": 9,
+          "reported_requests": 9
+        },
+        "mcp_calls": {
+          "tracker/list_tasks": 3
+        },
+        "model_requests": 9,
+        "outcome_pass": 3,
+        "output_tokens": {
+          "complete_trials": 3,
+          "known_sum": 1586,
+          "mean_complete_trial": 528.7,
+          "model_requests": 9,
+          "reported_requests": 9
+        },
+        "routing_errors": 0,
+        "skill_activations": {
+          "deadline-report": 3
+        },
+        "tool_calls": {
+          "list_files": 1,
+          "load_skill": 3,
+          "mcp__tracker__list_tasks": 3,
+          "write_file": 3
+        },
+        "tools_pass": 3
+      }
+    },
+    "mcp-failure": {
+      "A": {
+        "attempts": 3,
+        "errors": {
+          "ERROR: MCP_TOOL_ERROR: Tracker snapshot is unavailable or invalid": 3
+        },
+        "input_tokens": {
+          "complete_trials": 3,
+          "known_sum": 6919,
+          "mean_complete_trial": 2306.3,
+          "model_requests": 6,
+          "reported_requests": 6
+        },
+        "mcp_calls": {
+          "tracker/list_tasks": 3
+        },
+        "model_requests": 6,
+        "outcome_pass": 3,
+        "output_tokens": {
+          "complete_trials": 3,
+          "known_sum": 292,
+          "mean_complete_trial": 97.3,
+          "model_requests": 6,
+          "reported_requests": 6
+        },
+        "routing_errors": 0,
+        "skill_activations": {},
+        "tool_calls": {
+          "mcp__tracker__list_tasks": 3
+        },
+        "tools_pass": 3
+      },
+      "B": {
+        "attempts": 3,
+        "errors": {
+          "ERROR: MCP_TOOL_ERROR: Tracker snapshot is unavailable or invalid": 3
+        },
+        "input_tokens": {
+          "complete_trials": 3,
+          "known_sum": 9383,
+          "mean_complete_trial": 3127.7,
+          "model_requests": 6,
+          "reported_requests": 6
+        },
+        "mcp_calls": {
+          "tracker/list_tasks": 3
+        },
+        "model_requests": 6,
+        "outcome_pass": 3,
+        "output_tokens": {
+          "complete_trials": 3,
+          "known_sum": 403,
+          "mean_complete_trial": 134.3,
+          "model_requests": 6,
+          "reported_requests": 6
+        },
+        "routing_errors": 0,
+        "skill_activations": {
+          "open-task-export": 3
+        },
+        "tool_calls": {
+          "load_skill": 3,
+          "mcp__tracker__list_tasks": 3
+        },
+        "tools_pass": 3
+      }
+    },
+    "missing-deadlines": {
+      "A": {
+        "attempts": 3,
+        "errors": {},
+        "input_tokens": {
+          "complete_trials": 3,
+          "known_sum": 16373,
+          "mean_complete_trial": 5457.7,
+          "model_requests": 9,
+          "reported_requests": 9
+        },
+        "mcp_calls": {
+          "tracker/list_tasks": 3
+        },
+        "model_requests": 9,
+        "outcome_pass": 3,
+        "output_tokens": {
+          "complete_trials": 3,
+          "known_sum": 1438,
+          "mean_complete_trial": 479.3,
+          "model_requests": 9,
+          "reported_requests": 9
+        },
+        "routing_errors": 0,
+        "skill_activations": {},
+        "tool_calls": {
+          "list_files": 2,
+          "mcp__tracker__list_tasks": 3,
+          "write_file": 3
+        },
+        "tools_pass": 3
+      },
+      "B": {
+        "attempts": 3,
+        "errors": {},
+        "input_tokens": {
+          "complete_trials": 3,
+          "known_sum": 22662,
+          "mean_complete_trial": 7554.0,
+          "model_requests": 10,
+          "reported_requests": 10
+        },
+        "mcp_calls": {
+          "tracker/list_tasks": 3
+        },
+        "model_requests": 10,
+        "outcome_pass": 3,
+        "output_tokens": {
+          "complete_trials": 3,
+          "known_sum": 1554,
+          "mean_complete_trial": 518.0,
+          "model_requests": 10,
+          "reported_requests": 10
+        },
+        "routing_errors": 0,
+        "skill_activations": {
+          "deadline-report": 3
+        },
+        "tool_calls": {
+          "load_skill": 3,
+          "mcp__tracker__list_tasks": 3,
+          "write_file": 3
+        },
+        "tools_pass": 3
+      }
+    },
+    "note": {
+      "A": {
+        "attempts": 3,
+        "errors": {
+          "ERROR: POLICY_DENIED: Default permission for Bash": 1
+        },
+        "input_tokens": {
+          "complete_trials": 3,
+          "known_sum": 11432,
+          "mean_complete_trial": 3810.7,
+          "model_requests": 9,
+          "reported_requests": 9
+        },
+        "mcp_calls": {},
+        "model_requests": 9,
+        "outcome_pass": 3,
+        "output_tokens": {
+          "complete_trials": 3,
+          "known_sum": 1022,
+          "mean_complete_trial": 340.7,
+          "model_requests": 9,
+          "reported_requests": 9
+        },
+        "routing_errors": 0,
+        "skill_activations": {},
+        "tool_calls": {
+          "Bash": 1,
+          "list_files": 2,
+          "read_file": 1,
+          "write_file": 3
+        },
+        "tools_pass": 2
+      },
+      "B": {
+        "attempts": 3,
+        "errors": {
+          "ERROR: POLICY_DENIED: Default permission for Bash": 3
+        },
+        "input_tokens": {
+          "complete_trials": 3,
+          "known_sum": 13312,
+          "mean_complete_trial": 4437.3,
+          "model_requests": 9,
+          "reported_requests": 9
+        },
+        "mcp_calls": {},
+        "model_requests": 9,
+        "outcome_pass": 3,
+        "output_tokens": {
+          "complete_trials": 3,
+          "known_sum": 1021,
+          "mean_complete_trial": 340.3,
+          "model_requests": 9,
+          "reported_requests": 9
+        },
+        "routing_errors": 0,
+        "skill_activations": {},
+        "tool_calls": {
+          "Bash": 3,
+          "write_file": 3
+        },
+        "tools_pass": 0
+      }
+    },
+    "open-tasks": {
+      "A": {
+        "attempts": 3,
+        "errors": {},
+        "input_tokens": {
+          "complete_trials": 3,
+          "known_sum": 14039,
+          "mean_complete_trial": 4679.7,
+          "model_requests": 9,
+          "reported_requests": 9
+        },
+        "mcp_calls": {
+          "tracker/list_tasks": 3
+        },
+        "model_requests": 9,
+        "outcome_pass": 3,
+        "output_tokens": {
+          "complete_trials": 3,
+          "known_sum": 744,
+          "mean_complete_trial": 248.0,
+          "model_requests": 9,
+          "reported_requests": 9
+        },
+        "routing_errors": 0,
+        "skill_activations": {},
+        "tool_calls": {
+          "mcp__tracker__list_tasks": 3,
+          "write_file": 3
+        },
+        "tools_pass": 3
+      },
+      "B": {
+        "attempts": 3,
+        "errors": {},
+        "input_tokens": {
+          "complete_trials": 3,
+          "known_sum": 18442,
+          "mean_complete_trial": 6147.3,
+          "model_requests": 9,
+          "reported_requests": 9
+        },
+        "mcp_calls": {
+          "tracker/list_tasks": 3
+        },
+        "model_requests": 9,
+        "outcome_pass": 3,
+        "output_tokens": {
+          "complete_trials": 3,
+          "known_sum": 1000,
+          "mean_complete_trial": 333.3,
+          "model_requests": 9,
+          "reported_requests": 9
+        },
+        "routing_errors": 0,
+        "skill_activations": {
+          "open-task-export": 3
+        },
+        "tool_calls": {
+          "load_skill": 3,
+          "mcp__tracker__list_tasks": 3,
+          "write_file": 3
+        },
+        "tools_pass": 3
+      }
+    }
+  },
+  "by_variant": {
+    "A": {
+      "attempts": 15,
+      "errors": {
+        "BUDGET_EXHAUSTED: side_effects limit exceeded; needs 1, remaining 0": 1,
+        "ERROR: MCP_TOOL_ERROR: Tracker snapshot is unavailable or invalid": 3,
+        "ERROR: POLICY_DENIED: Default permission for Bash": 1
+      },
+      "input_tokens": {
+        "complete_trials": 15,
+        "known_sum": 65993,
+        "mean_complete_trial": 4399.5,
+        "model_requests": 43,
+        "reported_requests": 43
+      },
+      "mcp_calls": {
+        "tracker/list_tasks": 12
+      },
+      "model_requests": 43,
+      "outcome_pass": 14,
+      "output_tokens": {
+        "complete_trials": 15,
+        "known_sum": 5577,
+        "mean_complete_trial": 371.8,
+        "model_requests": 43,
+        "reported_requests": 43
+      },
+      "routing_errors": 0,
+      "skill_activations": {},
+      "tool_calls": {
+        "Bash": 4,
+        "list_files": 7,
+        "mcp__tracker__list_tasks": 12,
+        "read_file": 1,
+        "write_file": 11
+      },
+      "tools_pass": 13
+    },
+    "B": {
+      "attempts": 15,
+      "errors": {
+        "ERROR: MCP_TOOL_ERROR: Tracker snapshot is unavailable or invalid": 3,
+        "ERROR: POLICY_DENIED: Default permission for Bash": 3
+      },
+      "input_tokens": {
+        "complete_trials": 15,
+        "known_sum": 83469,
+        "mean_complete_trial": 5564.6,
+        "model_requests": 43,
+        "reported_requests": 43
+      },
+      "mcp_calls": {
+        "tracker/list_tasks": 12
+      },
+      "model_requests": 43,
+      "outcome_pass": 15,
+      "output_tokens": {
+        "complete_trials": 15,
+        "known_sum": 5564,
+        "mean_complete_trial": 370.9,
+        "model_requests": 43,
+        "reported_requests": 43
+      },
+      "routing_errors": 0,
+      "skill_activations": {
+        "deadline-report": 6,
+        "open-task-export": 6
+      },
+      "tool_calls": {
+        "Bash": 3,
+        "list_files": 1,
+        "load_skill": 12,
+        "mcp__tracker__list_tasks": 12,
+        "write_file": 12
+      },
+      "tools_pass": 12
+    }
+  },
+  "completed": 30,
+  "planned": 30
+}

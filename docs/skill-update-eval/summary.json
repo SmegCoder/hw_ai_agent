@@ -1,0 +1,402 @@
+{
+  "by_case": {
+    "deadlines": {
+      "A": {
+        "attempts": 3,
+        "errors": {
+          "Model output was cut off; increase --max-tokens": 3
+        },
+        "input_tokens": {
+          "complete_trials": 3,
+          "known_sum": 15486,
+          "mean_complete_trial": 5162.0,
+          "model_requests": 9,
+          "reported_requests": 9
+        },
+        "mcp_calls": {
+          "tracker/list_tasks": 3
+        },
+        "model_requests": 9,
+        "outcome_pass": 0,
+        "output_tokens": {
+          "complete_trials": 3,
+          "known_sum": 1287,
+          "mean_complete_trial": 429.0,
+          "model_requests": 9,
+          "reported_requests": 9
+        },
+        "routing_errors": 0,
+        "skill_activations": {
+          "tracker-json-deadlines": 3
+        },
+        "tool_calls": {
+          "load_skill": 3,
+          "mcp__tracker__list_tasks": 3
+        },
+        "tools_pass": 0
+      },
+      "B": {
+        "attempts": 3,
+        "errors": {},
+        "input_tokens": {
+          "complete_trials": 3,
+          "known_sum": 23079,
+          "mean_complete_trial": 7693.0,
+          "model_requests": 12,
+          "reported_requests": 12
+        },
+        "mcp_calls": {
+          "tracker/list_tasks": 3
+        },
+        "model_requests": 12,
+        "outcome_pass": 0,
+        "output_tokens": {
+          "complete_trials": 3,
+          "known_sum": 1023,
+          "mean_complete_trial": 341.0,
+          "model_requests": 12,
+          "reported_requests": 12
+        },
+        "routing_errors": 0,
+        "skill_activations": {
+          "tracker-json-deadlines": 3
+        },
+        "tool_calls": {
+          "load_skill": 3,
+          "mcp__tracker__list_tasks": 3,
+          "write_file": 3
+        },
+        "tools_pass": 3
+      }
+    },
+    "mcp-failure": {
+      "A": {
+        "attempts": 3,
+        "errors": {
+          "ERROR: MCP_TOOL_ERROR: Tracker snapshot is unavailable or invalid": 3
+        },
+        "input_tokens": {
+          "complete_trials": 3,
+          "known_sum": 9877,
+          "mean_complete_trial": 3292.3,
+          "model_requests": 7,
+          "reported_requests": 7
+        },
+        "mcp_calls": {
+          "tracker/list_tasks": 3
+        },
+        "model_requests": 7,
+        "outcome_pass": 3,
+        "output_tokens": {
+          "complete_trials": 3,
+          "known_sum": 121,
+          "mean_complete_trial": 40.3,
+          "model_requests": 7,
+          "reported_requests": 7
+        },
+        "routing_errors": 2,
+        "skill_activations": {
+          "open-task-export": 1
+        },
+        "tool_calls": {
+          "load_skill": 1,
+          "mcp__tracker__list_tasks": 3
+        },
+        "tools_pass": 3
+      },
+      "B": {
+        "attempts": 3,
+        "errors": {
+          "ERROR: MCP_TOOL_ERROR: Tracker snapshot is unavailable or invalid": 3
+        },
+        "input_tokens": {
+          "complete_trials": 3,
+          "known_sum": 7812,
+          "mean_complete_trial": 2604.0,
+          "model_requests": 6,
+          "reported_requests": 6
+        },
+        "mcp_calls": {
+          "tracker/list_tasks": 3
+        },
+        "model_requests": 6,
+        "outcome_pass": 3,
+        "output_tokens": {
+          "complete_trials": 3,
+          "known_sum": 99,
+          "mean_complete_trial": 33.0,
+          "model_requests": 6,
+          "reported_requests": 6
+        },
+        "routing_errors": 3,
+        "skill_activations": {},
+        "tool_calls": {
+          "mcp__tracker__list_tasks": 3
+        },
+        "tools_pass": 3
+      }
+    },
+    "missing-deadlines": {
+      "A": {
+        "attempts": 3,
+        "errors": {},
+        "input_tokens": {
+          "complete_trials": 3,
+          "known_sum": 24636,
+          "mean_complete_trial": 8212.0,
+          "model_requests": 12,
+          "reported_requests": 12
+        },
+        "mcp_calls": {
+          "tracker/list_tasks": 3
+        },
+        "model_requests": 12,
+        "outcome_pass": 0,
+        "output_tokens": {
+          "complete_trials": 3,
+          "known_sum": 815,
+          "mean_complete_trial": 271.7,
+          "model_requests": 12,
+          "reported_requests": 12
+        },
+        "routing_errors": 0,
+        "skill_activations": {
+          "tracker-json-deadlines": 3
+        },
+        "tool_calls": {
+          "load_skill": 3,
+          "mcp__tracker__list_tasks": 3,
+          "write_file": 3
+        },
+        "tools_pass": 3
+      },
+      "B": {
+        "attempts": 3,
+        "errors": {},
+        "input_tokens": {
+          "complete_trials": 3,
+          "known_sum": 24753,
+          "mean_complete_trial": 8251.0,
+          "model_requests": 12,
+          "reported_requests": 12
+        },
+        "mcp_calls": {
+          "tracker/list_tasks": 3
+        },
+        "model_requests": 12,
+        "outcome_pass": 0,
+        "output_tokens": {
+          "complete_trials": 3,
+          "known_sum": 819,
+          "mean_complete_trial": 273.0,
+          "model_requests": 12,
+          "reported_requests": 12
+        },
+        "routing_errors": 0,
+        "skill_activations": {
+          "tracker-json-deadlines": 3
+        },
+        "tool_calls": {
+          "load_skill": 3,
+          "mcp__tracker__list_tasks": 3,
+          "write_file": 3
+        },
+        "tools_pass": 3
+      }
+    },
+    "note": {
+      "A": {
+        "attempts": 3,
+        "errors": {},
+        "input_tokens": {
+          "complete_trials": 3,
+          "known_sum": 7746,
+          "mean_complete_trial": 2582.0,
+          "model_requests": 6,
+          "reported_requests": 6
+        },
+        "mcp_calls": {},
+        "model_requests": 6,
+        "outcome_pass": 3,
+        "output_tokens": {
+          "complete_trials": 3,
+          "known_sum": 156,
+          "mean_complete_trial": 52.0,
+          "model_requests": 6,
+          "reported_requests": 6
+        },
+        "routing_errors": 0,
+        "skill_activations": {},
+        "tool_calls": {
+          "write_file": 3
+        },
+        "tools_pass": 3
+      },
+      "B": {
+        "attempts": 3,
+        "errors": {},
+        "input_tokens": {
+          "complete_trials": 3,
+          "known_sum": 7746,
+          "mean_complete_trial": 2582.0,
+          "model_requests": 6,
+          "reported_requests": 6
+        },
+        "mcp_calls": {},
+        "model_requests": 6,
+        "outcome_pass": 3,
+        "output_tokens": {
+          "complete_trials": 3,
+          "known_sum": 156,
+          "mean_complete_trial": 52.0,
+          "model_requests": 6,
+          "reported_requests": 6
+        },
+        "routing_errors": 0,
+        "skill_activations": {},
+        "tool_calls": {
+          "write_file": 3
+        },
+        "tools_pass": 3
+      }
+    },
+    "open-tasks": {
+      "A": {
+        "attempts": 3,
+        "errors": {},
+        "input_tokens": {
+          "complete_trials": 3,
+          "known_sum": 16623,
+          "mean_complete_trial": 5541.0,
+          "model_requests": 9,
+          "reported_requests": 9
+        },
+        "mcp_calls": {
+          "tracker/list_tasks": 3
+        },
+        "model_requests": 9,
+        "outcome_pass": 0,
+        "output_tokens": {
+          "complete_trials": 3,
+          "known_sum": 411,
+          "mean_complete_trial": 137.0,
+          "model_requests": 9,
+          "reported_requests": 9
+        },
+        "routing_errors": 3,
+        "skill_activations": {},
+        "tool_calls": {
+          "mcp__tracker__list_tasks": 3,
+          "write_file": 3
+        },
+        "tools_pass": 3
+      },
+      "B": {
+        "attempts": 3,
+        "errors": {},
+        "input_tokens": {
+          "complete_trials": 3,
+          "known_sum": 16623,
+          "mean_complete_trial": 5541.0,
+          "model_requests": 9,
+          "reported_requests": 9
+        },
+        "mcp_calls": {
+          "tracker/list_tasks": 3
+        },
+        "model_requests": 9,
+        "outcome_pass": 0,
+        "output_tokens": {
+          "complete_trials": 3,
+          "known_sum": 456,
+          "mean_complete_trial": 152.0,
+          "model_requests": 9,
+          "reported_requests": 9
+        },
+        "routing_errors": 3,
+        "skill_activations": {},
+        "tool_calls": {
+          "mcp__tracker__list_tasks": 3,
+          "write_file": 3
+        },
+        "tools_pass": 3
+      }
+    }
+  },
+  "by_variant": {
+    "A": {
+      "attempts": 15,
+      "errors": {
+        "ERROR: MCP_TOOL_ERROR: Tracker snapshot is unavailable or invalid": 3,
+        "Model output was cut off; increase --max-tokens": 3
+      },
+      "input_tokens": {
+        "complete_trials": 15,
+        "known_sum": 74368,
+        "mean_complete_trial": 4957.9,
+        "model_requests": 43,
+        "reported_requests": 43
+      },
+      "mcp_calls": {
+        "tracker/list_tasks": 12
+      },
+      "model_requests": 43,
+      "outcome_pass": 6,
+      "output_tokens": {
+        "complete_trials": 15,
+        "known_sum": 2790,
+        "mean_complete_trial": 186.0,
+        "model_requests": 43,
+        "reported_requests": 43
+      },
+      "routing_errors": 5,
+      "skill_activations": {
+        "open-task-export": 1,
+        "tracker-json-deadlines": 6
+      },
+      "tool_calls": {
+        "load_skill": 7,
+        "mcp__tracker__list_tasks": 12,
+        "write_file": 9
+      },
+      "tools_pass": 12
+    },
+    "B": {
+      "attempts": 15,
+      "errors": {
+        "ERROR: MCP_TOOL_ERROR: Tracker snapshot is unavailable or invalid": 3
+      },
+      "input_tokens": {
+        "complete_trials": 15,
+        "known_sum": 80013,
+        "mean_complete_trial": 5334.2,
+        "model_requests": 45,
+        "reported_requests": 45
+      },
+      "mcp_calls": {
+        "tracker/list_tasks": 12
+      },
+      "model_requests": 45,
+      "outcome_pass": 6,
+      "output_tokens": {
+        "complete_trials": 15,
+        "known_sum": 2553,
+        "mean_complete_trial": 170.2,
+        "model_requests": 45,
+        "reported_requests": 45
+      },
+      "routing_errors": 6,
+      "skill_activations": {
+        "tracker-json-deadlines": 6
+      },
+      "tool_calls": {
+        "load_skill": 6,
+        "mcp__tracker__list_tasks": 12,
+        "write_file": 12
+      },
+      "tools_pass": 15
+    }
+  },
+  "completed": 30,
+  "planned": 30
+}

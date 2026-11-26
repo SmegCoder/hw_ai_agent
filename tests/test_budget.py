@@ -115,8 +115,9 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(runtime.executions, [])
         self.assertFalse((self.workspace / 'w.py').exists())
         self.assertEqual(self.spent(agent), dict(model_requests=1, tool_calls=0, side_effects=0, result_bytes=0))
-        rejected = self.store.get(agent.session_id).events[-1]
-        self.assertEqual(rejected['event'], 'batch_rejected')
+        events = self.store.get(agent.session_id).events
+        rejected, = [event for event in events if event['event'] == 'batch_rejected']
+        self.assertEqual(events[-1]['event'], 'run_error')
         self.assertEqual(len(rejected['assistant']['tool_calls']), 2)
 
     def test_effect_batch_cannot_execute_first_read_when_short(self):

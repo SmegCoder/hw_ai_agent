@@ -30,10 +30,17 @@ from .policy import ApprovalDeferred, ApprovalRequest, Policy, PolicyError
 from .session import SessionError, SessionStore
 from .terminal import (visible, visible_line, emphasis, confirm_plan, choose_session, choose_workspace,
                        confirm_conflict, confirm_attribution, report_header, report_answer,
-                       color_diff, ProgressDisplay)
+                       color_diff, read_confirmation, ProgressDisplay)
 from .journal import ChangeJournal, JournalError
 from .tasks import checklist
 from .text import json_text
+from .skills import SkillCatalog
+from .skill_market import SkillMarket
+from .skill_updates import evaluate_candidate
+from .eval_cases import CASES
+from .mcp import MCPRegistry
+from .eval_runner import Options as EvalOptions, rebuild_summary, run_evaluation
+from .session_doctor import show_session_report
 
 def show_context_warning(event):
     projected, window = event["projected"], event["window"]
@@ -63,17 +70,8 @@ def show_event(event: dict) -> None:
         show_context_warning(event)
     elif event["event"] == "model_retry":
         show_model_retry(event)
-    elif event["event"] == "tool_result":
-        if event['name'] == 'submit_plan' and not event['content'].startswith('ERROR:'):
-            print("План сохранён.", flush=True)
-        else:
-            print(f"\n[{event['name']}]\n{visible(event['content'])}", flush=True)
-    elif event["event"] == "tool_call":
-        if event['name'] == 'submit_plan':
-            print("Модель подготовила план.", flush=True)
-        else:
-            prefix = f"Задача {event['task_id']}: " if event.get('task_id') else ''
-            print(prefix + f"Вызов {event['name']}: {visible(event['arguments'])}", flush=True)
+    elif event["event"] == "mcp_error":
+        print(f"MCP · {visible_line(event['server'])} · {visible_line(event['error'])}", file=sys.stderr, flush=True)
     elif event["event"] == "policy_decision":
         print(f"Policy: {event['tool']} → {event['action']} / {event['outcome']}", flush=True)
         if event.get("source") == "session_grant":
@@ -112,7 +110,7 @@ def confirm_action(request: ApprovalRequest, *, verbose=False) -> bool:
             print(preview.rstrip("\n"))
         question = f"Разрешить{scope}? [y/N] "
     try:
-        return input(question).strip().lower() in {"y", "yes", "д", "да"}
+        return read_confirmation(question) is True
     except EOFError:
         raise ApprovalDeferred("Ответ не получен. Продолжите через agi resume") from None
 
@@ -127,17 +125,96 @@ def show_compact_event(event: dict, *, chat=False) -> None:
         show_context_warning(event)
     elif kind == "model_retry":
         show_model_retry(event)
+    elif kind == "mcp_error":
+        print(f"MCP · {visible_line(event['server'])} · {visible_line(event['error'])}", file=sys.stderr, flush=True)
     elif kind == "task_completed":
         print(f"[x] {visible(event['task_id'])}", flush=True)
-    elif kind == "tool_result" and event["content"].startswith("ERROR:"):
-        print(f"{visible(event['name'])} · {visible(event['content'].splitlines()[0][:240])}", flush=True)
+    elif kind == "tool_result":
+        if event.get("failed", event["content"].startswith("ERROR:")):
+            print(f"{visible_line(event['name'])} · {visible_line(event['content'][:240])}", flush=True)
+
+
+def show_market_event(event):
+    kind = event["event"]
+    if kind == "market_check":
+        if event["status"] == "error":
+            print(f"Маркет · {visible_line(event['error'])}", file=sys.stderr, flush=True)
+        return
+    name, version = visible_line(event["name"]), visible_line(event["new_version"])
+    if kind == "market_new":
+        print(f"Маркет · новый скилл {name} {version}", flush=True)
+    elif kind == "market_update":
+        old = visible_line(event["old_version"])
+        status = {"updated": "установлено", "available": "доступно", "error": "ошибка",
+                  "pending": "ожидает eval"}[event["status"]]
+        detail = f" · {visible_line(event['error'])}" if event.get("error") else ""
+        print(f"Маркет · {name} {old} → {version} · {status}{detail}", flush=True)
+
+
+def market_command(args) -> int:
+    if args.market_config is None and args.market_action in {"check", "search", "evaluate"}:
+        raise ConfigurationError(f"Для market {args.market_action} укажите --market-config")
+    market = SkillMarket(args.market_config, args.state_db, args.workspace)
+    if args.market_action == "events":
+        for line in market.events():
+            print(line)
+    elif args.market_action == "status":
+        print(json_text(market.installed(), indent=2))
+    elif args.market_action == "candidates":
+        print(json_text(market.candidates(), indent=2))
+    elif args.market_action == "search":
+        source, events = market.check()
+        if events[0]["status"] == "error":
+            show_market_event(events[0])
+            return 1
+        offers = market.search(source, args.skill or "")
+        print(f"Маркет · найдено {len(offers)}")
+        for offer in offers:
+            print(f"{offer.name} {offer.version} · {visible_line(offer.description)}")
+    elif args.market_action == "evaluate":
+        if not args.skill:
+            raise ConfigurationError("Укажите имя скилла после market evaluate")
+        load_env(args.env_file)
+        settings = Settings.from_env(args.provider, args.model)
+        _, events = market.check()
+        for event in events:
+            show_market_event(event)
+        options = EvalOptions(timeout=args.timeout, max_rounds=args.max_rounds, max_tokens=args.max_tokens)
+        status, decision = evaluate_candidate(market, args.skill, settings, options,
+                                              focus=tuple(args.focus), output=args.output)
+        if decision:
+            print("Маркет · " + ("обновление принято" if decision["status"] == "accepted" else "обновление отклонено"))
+            for reason in decision["reasons"]:
+                print("  " + visible_line(reason))
+            print(f"Решение · {Path(decision['output']) / 'decision.json'}")
+        return status
+    else:
+        _, events = market.check()
+        for event in events:
+            show_market_event(event)
+        if "revision" in events[0]:
+            check = events[0]
+            print(f"Anthropic · Git {check['revision'][:12]} · карточек {check['count']}"
+                  f" · пропущено {len(check['skipped'])}")
+        if events[0]["status"] == "unchanged":
+            print("Маркет · каталог без изменений")
+        if any(event.get("status") == "error" for event in events):
+            return 1
+    return 0
 
 
 def event_listener(stop_after_tools=None, stop_after_tasks=None, *, verbose=False, chat=False, progress=None):
     def render(event):
-        if verbose:
+        if event["event"].startswith("market_"):
+            show_market_event(event)
+            return
+        if progress and progress.mode != "off" and progress.render(event):
+            return
+        if verbose and event["event"] not in {"tool_call", "tool_result"}:
+            if progress:
+                progress.finish_line()
             show_event(event)
-        elif progress is None or not progress.enabled or not progress.render(event):
+        else:
             show_compact_event(event, chat=chat)
 
     if stop_after_tools is None and stop_after_tasks is None:
@@ -150,6 +227,8 @@ def event_listener(stop_after_tools=None, stop_after_tasks=None, *, verbose=Fals
         if event["event"] == "tool_result":
             completed += 1
             if stop_after_tools is not None and completed >= stop_after_tools:
+                if progress:
+                    progress.finish_line()
                 print("Пауза после сохранённого результата инструмента.", flush=True)
                 raise KeyboardInterrupt
         if event["event"] == "task_completed":
@@ -215,18 +294,26 @@ def doctor(settings: Settings) -> bool:
         print("API key: configured (network request not made)")
     return success
 
+def open_skills(workspace: Path, directory: Path | None) -> SkillCatalog:
+    catalog = SkillCatalog(workspace.expanduser(), directory)
+    for name, reason in catalog.errors:
+        print(f"Скилл пропущен · {visible_line(name)} · {visible_line(reason)}", file=sys.stderr)
+    return catalog
+
+
 def saved_runtime(state, db_path: Path, approvals=None, on_event=show_event, *,
-                  allow_policy_change=False, verbose=False):
+                  allow_policy_change=False, verbose=False, load_extensions=False):
     metadata = state.metadata
     workspace = Path(metadata["workspace"])
     if db_path.resolve().is_relative_to(workspace.resolve()):
         raise SessionError("Session database must be outside workspace")
     policy_path = metadata.get("policy_path")
+    checkpoint_policy = Policy.restore(metadata["policy"], builtin=metadata.get("policy_source") == "default")
     if policy_path:
         policy = load_policy(Path(policy_path) if policy_path else None, workspace)
     else:
-        policy = Policy.restore(metadata["policy"])
-    if not allow_policy_change and policy.as_dict() != Policy.restore(metadata["policy"]).as_dict():
+        policy = checkpoint_policy
+    if not allow_policy_change and policy.as_dict() != checkpoint_policy.as_dict():
         raise SessionError("Policy changed since the checkpoint; continuation was refused")
     limits = metadata.get("runtime_limits", {})
     if set(limits) != {"command_timeout", "max_output_chars", "max_file_chars"}:
@@ -235,7 +322,34 @@ def saved_runtime(state, db_path: Path, approvals=None, on_event=show_event, *,
         any(type(limits[k]) is not int for k in ("max_output_chars", "max_file_chars"))):
         raise SessionError("Invalid saved runtime limits")
     mode = approvals or metadata.get("approvals", "ask")
+    options = metadata.get("skill_config")
+    skills = None
+    if load_extensions and options is not None:
+        if not isinstance(options, dict) or set(options) != {"directory"}:
+            raise SessionError("Не удалось прочитать настройки каталога скиллов")
+        directory = options["directory"]
+        if directory is not None and (not isinstance(directory, str) or not Path(directory).is_absolute()):
+            raise SessionError("Некорректный путь сохранённого каталога скиллов")
+        skills = open_skills(workspace, Path(directory) if directory is not None else None)
+    market = None
+    market_config = metadata.get("market_config")
+    if load_extensions:
+        project_skills = metadata.get("project_skills", True)
+        if type(project_skills) is not bool or (market_config is not None and (
+                skills is None or not project_skills or not isinstance(market_config, str)
+                or not Path(market_config).is_absolute())):
+            raise SessionError("Не удалось прочитать настройки маркета скиллов")
+        if skills is not None and project_skills:
+            market = SkillMarket(Path(market_config) if market_config is not None else None, db_path, workspace)
+    mcp = None
+    mcp_config = metadata.get("mcp_config")
+    if load_extensions and mcp_config is not None:
+        if (not isinstance(mcp_config, dict) or not isinstance(mcp_config.get("path"), str)
+                or not Path(mcp_config["path"]).is_absolute() or not isinstance(mcp_config.get("digest"), str)):
+            raise SessionError("Не удалось прочитать настройки MCP")
+        mcp = MCPRegistry(Path(mcp_config["path"]), workspace, expected_digest=mcp_config["digest"])
     return ToolRuntime(workspace, policy=policy, mode=metadata.get("execution_mode", "safe"),
+                       skills=skills, market=market, mcp=mcp,
                        trash_dir=metadata.get("trash_dir", str(db_path.resolve().parent / "trash")),
                        approve=partial(confirm_action, verbose=verbose) if mode == "ask" else None,
                        on_policy_event=on_event, **limits)
@@ -259,6 +373,10 @@ def can_resume(metadata: dict) -> bool:
 
 def session_command(args):
     with SessionStore(args.state_db) as store:
+        if args.action == "events":
+            for record in store.event_records(args.session_id):
+                print(json_text(record))
+            return 0
         if args.action == "sessions":
             print(json_text(store.list_sessions(), indent=2))
             return 0
@@ -321,9 +439,10 @@ def session_command(args):
             store.decide_plan(args.session_id, args.action == "approve-plan")
             print("Решение по плану сохранено." + (" Продолжение: agi resume" if args.action == "approve-plan" else " Сессия завершена."))
             return 0
+        progress = ProgressDisplay(getattr(args, "progress", "off"))
         listener = event_listener(getattr(args, "stop_after_tools", None), getattr(args, "stop_after_tasks", None),
                                   verbose=getattr(args, "verbose", False),
-                                  progress=ProgressDisplay(args.progress) if args.action == "resume" else None)
+                                  progress=progress)
         if args.action == "resolve":
             verifier = None
             journal = None
@@ -351,7 +470,8 @@ def session_command(args):
         metadata = state.metadata
         if not can_resume(metadata):
             raise SessionError("Эту сессию можно просмотреть, но её запуск больше не поддерживается")
-        runtime = saved_runtime(state, store.path, getattr(args, "approvals", None), listener, verbose=args.verbose)
+        runtime = saved_runtime(state, store.path, getattr(args, "approvals", None), listener,
+                                verbose=args.verbose, load_extensions=True)
         load_env(args.env_file)
         settings = Settings.from_env(metadata["provider"], metadata["model"])
         client = new_client(settings, metadata["max_tokens"], args)
@@ -360,7 +480,9 @@ def session_command(args):
                             **interactive_options(runtime, args))
         if not args.verbose:
             report_header("resume", runtime.root, settings)
-        report_answer(agent, agent.resume(args.session_id), verbose=args.verbose)
+        with progress:
+            answer = agent.resume(args.session_id)
+        report_answer(agent, answer, verbose=args.verbose)
         return 0
 
 def catalog_for(args, provider):
@@ -453,7 +575,17 @@ def starting_runtime(args, listener):
     workspace = args.workspace or Path("workspace")
     if args.state_db.expanduser().resolve().is_relative_to(workspace.expanduser().resolve()):
         raise SessionError("База сессий должна находиться вне рабочей папки")
+    market_config = getattr(args, "market_config", None)
+    if market_config is not None and args.skills is False:
+        raise ConfigurationError("Для --market-config нужен включённый каталог скиллов")
+    demo_only = getattr(args, "demo_skills_only", False)
+    if demo_only and (args.skills is False or args.skills_dir is not None or market_config is not None):
+        raise ConfigurationError("--demo-skills-only несовместим с --no-skills, --skills-dir и --market-config")
     return ToolRuntime(workspace, policy=load_policy(args.policy, workspace), mode=args.mode,
+                       skills=open_skills(workspace, args.skills_dir) if args.skills is not False else None,
+                       market=SkillMarket(market_config, args.state_db, workspace)
+                       if args.skills is not False and not demo_only else None,
+                       mcp=MCPRegistry(args.mcp_config, workspace) if args.mcp_config is not None else None,
                        trash_dir=args.state_db.expanduser().resolve().parent / "trash",
                        approve=partial(confirm_action, verbose=args.verbose) if args.approvals == "ask" else None,
                        on_policy_event=listener)
@@ -481,7 +613,8 @@ def restore_chat_agent(args, store, listener, configuration):
         raise ConfigurationError("Адрес модели изменился. Откройте диалог с прежним файлом настроек")
     if args.cost_estimate is None:
         args.cost_estimate = configuration["cost_estimate"]
-    runtime = saved_runtime(SimpleNamespace(metadata=binding), store.path, on_event=listener, verbose=args.verbose)
+    runtime = saved_runtime(SimpleNamespace(metadata={"skill_config": {"directory": None}, **binding}),
+                            store.path, on_event=listener, verbose=args.verbose, load_extensions=True)
     client = new_client(settings, binding["max_tokens"], args)
     if getattr(client, "context_window", None) is None:
         client.context_window = configuration["context_window"]
@@ -497,10 +630,14 @@ def restore_chat_agent(args, store, listener, configuration):
 def chat_command(args, limits):
     if not sys.stdin.isatty():
         raise ConfigurationError("Для chat нужен интерактивный терминал")
-    progress = ProgressDisplay(args.progress is True)
+    progress = ProgressDisplay(args.progress or "compact")
     listener = event_listener(verbose=args.verbose, chat=True, progress=progress)
     runtime = starting_runtime(args, listener) if args.resume_chat is None else None
     with SessionStore(args.state_db) as store:
+        if args.resume_chat == "":
+            args.resume_chat = Conversation.choose_open(store)
+            if args.resume_chat is None:
+                return 0
         if args.resume_chat is not None:
             conversation = Conversation(store, args.resume_chat)
         else:
@@ -508,7 +645,7 @@ def chat_command(args, limits):
             conversation = Conversation.create(store, {
                 "binding": agent.binding(), "budget": limits.as_dict(), "cost_estimate": args.cost_estimate,
                 "context_window": getattr(agent.client, "context_window", None),
-                "progress": progress.enabled,
+                "progress": progress.mode,
             })
         with store.lock(conversation.id):
             if args.resume_chat is not None:
@@ -516,8 +653,8 @@ def chat_command(args, limits):
                 if args.progress is None:
                     saved = configuration.get("progress")
                     if saved is None:
-                        saved = os.getenv("AGENT_PROGRESS", "false")
-                    progress.enabled = option_value("progress", saved)
+                        saved = os.getenv("AGENT_PROGRESS", "compact")
+                    progress.mode = option_value("progress", saved)
                 agent = restore_chat_agent(args, store, listener, configuration)
             if agent.client.settings.provider == "openrouter" and not getattr(agent.client, "context_window", None):
                 print("Размер окна модели недоступен · проверка по лимиту OpenRouter пропущена.", file=sys.stderr)
@@ -532,7 +669,7 @@ def chat_command(args, limits):
                                       resume_command=resume_command,
                                       approve_action=partial(confirm_action, verbose=args.verbose),
                                       progress=progress)
-            return shell.run(" ".join(args.request))
+            return shell.run(" ".join(getattr(args, "request", ())))
 
 
 def show_models(args):
@@ -581,17 +718,65 @@ def add_budget_arguments(command):
     command.add_argument("--max-result-bytes", type=int, default=None, help="Total UTF-8 bytes of tool results")
 
 
+def add_progress_option(command):
+    command.add_argument("--progress", nargs="?", const="compact", choices=LAUNCH_OPTIONS["progress"].choices)
+    command.add_argument("--no-progress", dest="progress", action="store_const", const="off")
+
+
+def progress_argv(argv):
+    # An existing bare --progress may be followed by a positional prompt or session ID.
+    result = list(argv)
+    for index, token in enumerate(argv):
+        if token == "--":
+            break
+        following = argv[index + 1] if index + 1 < len(argv) else None
+        if token == "--progress" and following not in LAUNCH_OPTIONS["progress"].choices:
+            result[index] = "--progress=compact"
+    return result
+
+
 def main() -> int:
     parser = HelpParser(prog="agi", usage="agi КОМАНДА [ПАРАМЕТРЫ]", description="Агент для работы с кодом",
                         epilog=project_guide())
     subparsers = parser.add_subparsers(dest="action", required=True)
     help_command = subparsers.add_parser("help", help=COMMAND_HELP["help"], description=COMMAND_HELP["help"])
     help_command.add_argument("command", nargs="?", choices=list(COMMAND_HELP))
+    eval_command = subparsers.add_parser("eval", help=COMMAND_HELP["eval"], description=COMMAND_HELP["eval"])
+    eval_actions = eval_command.add_subparsers(dest="eval_action", required=True, parser_class=argparse.ArgumentParser)
+    eval_run = eval_actions.add_parser("run", help="Запустить или продолжить A/B-серию")
+    eval_run.add_argument("--provider", choices=list(PROVIDERS), help="Провайдер модели, по умолчанию из настроек")
+    eval_run.add_argument("--model", help="Фиксированный ID модели, по умолчанию из настроек")
+    eval_run.add_argument("--env-file", type=Path, default=Path(".env"), help="Файл настроек и ключей (по умолчанию .env)")
+    eval_run.add_argument("--output", type=Path, default=Path(".agent/evals/study-tracker"), help="Папка всей серии")
+    eval_run.add_argument("--trials", type=int, default=3, help="Попыток на сценарий и версию (по умолчанию 3)")
+    eval_run.add_argument("--timeout", type=float, default=180, help="Лимит всей попытки в секундах (по умолчанию 180)")
+    eval_run.add_argument("--max-rounds", type=int, default=8, help="Лимит обращений к модели на попытку (по умолчанию 8)")
+    eval_run.add_argument("--max-tokens", type=int, default=2048, help="Лимит выходных токенов на ответ (по умолчанию 2048)")
+    eval_report = eval_actions.add_parser("report", help="Обновить summary.md по сохранённым результатам")
+    eval_report.add_argument("--output", type=Path, default=Path(".agent/evals/study-tracker"), help="Папка сохранённой серии")
+    market = subparsers.add_parser("market", help=COMMAND_HELP["market"])
+    market.add_argument("market_action", choices=("check", "search", "status", "events", "candidates", "evaluate"))
+    market.add_argument("skill", nargs="?", help="Запрос для search или имя скилла для evaluate")
+    market.add_argument("--market-config", type=Path, help="JSON-конфигурация источника для check, search и evaluate")
+    market.add_argument("--workspace", type=Path, default=Path("workspace"))
+    market.add_argument("--state-db", type=Path)
+    market.add_argument("--env-file", type=Path, default=Path(".env"))
+    market.add_argument("--provider", choices=list(PROVIDERS))
+    market.add_argument("--model")
+    market.add_argument("--output", type=Path, help="Папка сравнения версий")
+    market.add_argument("--focus", action="append", default=[], choices=[case.id for case in CASES],
+                        help="Сценарий, где обе версии проверяются с явной загрузкой скилла")
+    market.add_argument("--timeout", type=float, default=180)
+    market.add_argument("--max-rounds", type=int, default=8)
+    market.add_argument("--max-tokens", type=int, default=2048)
     set_command = subparsers.add_parser("set", help=COMMAND_HELP["set"], description=COMMAND_HELP["set"])
     set_command.add_argument("--provider", choices=list(PROVIDERS))
     set_command.add_argument("--model")
     set_command.add_argument("--env-file", type=Path, default=Path(".env"))
     for name, option in LAUNCH_OPTIONS.items():
+        if name == "progress":
+            add_progress_option(set_command)
+            continue
         flags = {"default": None}
         if option.kind is bool:
             flags["action"] = argparse.BooleanOptionalAction
@@ -600,7 +785,7 @@ def main() -> int:
             if option.choices:
                 flags["choices"] = option.choices
         set_command.add_argument("--" + name.replace("_", "-"), **flags)
-    for action in ("sessions", "session", "resume", "resolve", "approve-plan", "reject-plan", "changes", "rollback", "cost"):
+    for action in ("sessions", "session", "events", "resume", "resolve", "approve-plan", "reject-plan", "changes", "rollback", "cost"):
         command = subparsers.add_parser(action, help=COMMAND_HELP[action], description=COMMAND_HELP[action])
         command.add_argument("--state-db", type=Path, default=None)
         if action != "sessions":
@@ -608,7 +793,7 @@ def main() -> int:
         command.add_argument("--env-file", type=Path, default=Path(".env"))
         if action == "resume":
             command.add_argument("--verbose", action="store_true")
-            command.add_argument("--progress", action=argparse.BooleanOptionalAction, default=None)
+            add_progress_option(command)
             command.add_argument("--cost-estimate", action=argparse.BooleanOptionalAction, default=None)
             command.add_argument("--approvals", choices=["ask", "deny"], default=None)
             command.add_argument("--stop-after-tools", type=int, default=None)
@@ -625,11 +810,25 @@ def main() -> int:
         command.add_argument("--provider", choices=list(PROVIDERS))
         command.add_argument("--model")
         command.add_argument("--env-file", type=Path, default=Path(".env"))
+        if action == "doctor":
+            doctor_actions = command.add_subparsers(dest="doctor_action", parser_class=argparse.ArgumentParser)
+            session_report = doctor_actions.add_parser("session", help="Разобрать сохранённый диалог или запуск")
+            session_report.add_argument("session_id", help="ID диалога или запуска")
+            session_report.add_argument("--state-db", type=Path, help="Путь к базе SQLite")
+            session_report.add_argument("--env-file", type=Path, default=argparse.SUPPRESS, help="Файл настроек")
+            session_report.add_argument("--json", action="store_true", help="Вывести отчёт в JSON")
         if action in START_COMMANDS:
             command.add_argument("--verbose", action="store_true")
-            command.add_argument("--progress", action=argparse.BooleanOptionalAction, default=None)
+            add_progress_option(command)
+            command.add_argument("--skills", action=argparse.BooleanOptionalAction, default=None,
+                                 help="Включить каталог скиллов (по умолчанию включён)")
+            command.add_argument("--skills-dir", type=Path, help="Папка дополнительных SKILL.md вне рабочей папки")
+            command.add_argument("--demo-skills-only", action="store_true", default=None,
+                                 help="Включить только три встроенных демо-скилла")
+            command.add_argument("--market-config", type=Path, help="JSON-конфигурация маркета вне рабочей папки")
+            command.add_argument("--mcp-config", type=Path, help="JSON-конфигурация локальных MCP-серверов вне рабочей папки")
             if action == "chat":
-                command.add_argument("--resume", dest="resume_chat", metavar="ID")
+                command.add_argument("--resume", dest="resume_chat", metavar="ID", nargs="?", const="")
             else:
                 command.add_argument("--journal", action=argparse.BooleanOptionalAction, default=None)
             add_budget_arguments(command)
@@ -671,21 +870,48 @@ def main() -> int:
     if len(sys.argv) == 1:
         parser.print_help()
         return 0
-    args = parser.parse_args()
+    args = parser.parse_args(progress_argv(sys.argv[1:]))
     if args.action == "help":
         target = subparsers.choices[args.command] if args.command else parser
         target.print_help()
         return 0
     try:
         validate_explicit_options(args)
+        if args.action == "doctor" and args.doctor_action == "session":
+            if args.state_db is None:
+                load_launch_env(args.env_file)
+                args.state_db = option_value("state_db", os.getenv("AGENT_STATE_DB", ".agent/sessions.sqlite3"))
+            show_session_report(args.state_db, args.session_id, as_json=args.json)
+            return 0
+        if args.action == "market":
+            if args.state_db is None:
+                load_launch_env(args.env_file)
+                args.state_db = option_value("state_db", os.getenv("AGENT_STATE_DB", ".agent/sessions.sqlite3"))
+            return market_command(args)
+        if args.action == "eval":
+            if args.eval_action == "report":
+                rebuild_summary(args.output)
+                return 0
+            load_env(args.env_file)
+            settings = Settings.from_env(args.provider, args.model)
+            status = run_evaluation(args.output, settings, EvalOptions(args.trials, args.timeout, args.max_rounds, args.max_tokens))
+            if status == 130:
+                print("Серия приостановлена. Повторите ту же команду eval run.", file=sys.stderr)
+            return status
         if args.action == "set":
             updates = set_options(args)
             print(f"Настройки сохранены в {args.env_file}: " + ", ".join(updates))
             print("Применяются к новым запускам; начатые сессии сохраняют прежние параметры.")
             return 0
-        if args.action == "chat" and args.resume_chat is not None:
+        if args.action == "resume" and args.session_id == "chat":
+            if args.stop_after_tools is not None or args.stop_after_tasks is not None:
+                raise ConfigurationError("Флаги --stop-after-tools и --stop-after-tasks относятся к отдельному запуску")
+            args.resume_chat = ""
+        if getattr(args, "resume_chat", None) is not None:
             options = set(LAUNCH_OPTIONS) - {"state_db", "cost_estimate", "progress"}
-            if args.provider or args.model or any(getattr(args, name, None) is not None for name in options):
+            if any(getattr(args, name, None) is not None
+                   for name in options | {"provider", "model", "skills", "skills_dir", "demo_skills_only",
+                                          "mcp_config", "market_config"}):
                 raise ConfigurationError("Для продолжения диалога используются сохранённые настройки запуска")
             load_env(args.env_file)
             if args.state_db is None:
@@ -703,7 +929,7 @@ def main() -> int:
             if args.cost_estimate is None:
                 args.cost_estimate = option_value("cost_estimate", os.getenv("AGENT_COST_ESTIMATE", "true"))
             if args.progress is None:
-                args.progress = option_value("progress", os.getenv("AGENT_PROGRESS", "false"))
+                args.progress = option_value("progress", os.getenv("AGENT_PROGRESS", "compact"))
         if args.action == "models":
             return show_models(args)
         budget_limits = None
@@ -714,7 +940,7 @@ def main() -> int:
             raise ConfigurationError("--stop-after-tools must be positive")
         if getattr(args, "stop_after_tasks", None) is not None and args.stop_after_tasks < 1:
             raise ConfigurationError("--stop-after-tasks must be positive")
-        if args.action in {"sessions", "session", "resume", "resolve", "approve-plan", "reject-plan", "changes", "rollback", "cost"}:
+        if args.action in {"sessions", "session", "events", "resume", "resolve", "approve-plan", "reject-plan", "changes", "rollback", "cost"}:
             return session_command(args)
         if args.action == "setup":
             setup(args.provider or "openrouter", args.model, args.env_file)
@@ -729,21 +955,25 @@ def main() -> int:
                 return 130
         if args.action == "chat":
             return chat_command(args, budget_limits)
-        listener = event_listener(args.stop_after_tools, args.stop_after_tasks, verbose=args.verbose,
-                                  progress=ProgressDisplay(args.progress))
+        progress = ProgressDisplay(args.progress)
+        listener = event_listener(args.stop_after_tools, args.stop_after_tasks, verbose=args.verbose, progress=progress)
         runtime = starting_runtime(args, listener)
         with SessionStore(args.state_db) as store:
             agent = new_agent(args, store, runtime, listener, budget_limits)
             request = " ".join(args.request)
             if not args.verbose:
                 report_header(args.action, runtime.root, getattr(agent.client, "settings", None), request)
-            report_answer(agent, agent.run(request), verbose=args.verbose)
+            with progress:
+                answer = agent.run(request)
+            report_answer(agent, answer, verbose=args.verbose)
         return 0
     except ApprovalDeferred as exc:
         print(f"\nОжидается подтверждение: {exc}", file=sys.stderr)
         return 130
     except KeyboardInterrupt:
-        print("\nРабота остановлена. Продолжите через agi resume и выберите сессию в терминале.", file=sys.stderr)
+        message = ("Серия приостановлена. Повторите ту же команду eval run." if args.action == "eval"
+                   else "Работа остановлена. Продолжите через agi resume и выберите сессию в терминале.")
+        print("\n" + message, file=sys.stderr)
         return 130
     except (ConfigurationError, PricingError, ModelClientError, AgentError, JournalError, BudgetExceeded, ToolError, PolicyError, SessionError, OSError, ValueError) as exc:
         print(f"Ошибка: {visible(exc)}", file=sys.stderr)

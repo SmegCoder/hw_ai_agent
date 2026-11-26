@@ -202,7 +202,7 @@ class TerminalApprovalTests(unittest.TestCase):
             (root / "sub").mkdir()
             runtime = ToolRuntime(root, mode="safe", approve=confirm_action)
             with (patch("sys.stdin.isatty", return_value=True),
-                  patch("builtins.input", side_effect=["y", "n"]) as prompt,
+                  patch("builtins.input", side_effect=["\ufeff\x1b[200~Y\u200b\x1b[201~", "n"]) as prompt,
                   patch.object(runtime, "bash", return_value="ok") as bash,
                   redirect_stdout(io.StringIO()) as output):
                 self.assertEqual(runtime.execute("Bash", {"command": "pwd"}), "ok")
@@ -211,6 +211,23 @@ class TerminalApprovalTests(unittest.TestCase):
             self.assertEqual(output.getvalue(), "")
             self.assertEqual([item.args[0] for item in prompt.call_args_list],
                              ["Выполнить pwd? [y/N] ", "Выполнить pwd (в sub)? [y/N] "])
+            bash.assert_called_once()
+
+    def test_ambiguous_or_unrecognized_input_reprompts_without_approving(self):
+        from hw_ai_agent.cli import confirm_action
+
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = ToolRuntime(directory, mode="safe", approve=confirm_action)
+            with (patch("sys.stdin.isatty", return_value=True),
+                  patch("builtins.input", side_effect=["н", "\u200b", "\x1b[Ay", "нет", "н", " д\u2060а "]) as prompt,
+                  patch.object(runtime, "bash", return_value="ok") as bash,
+                  redirect_stdout(io.StringIO()) as output):
+                with self.assertRaisesRegex(ToolError, "APPROVAL_REQUIRED"):
+                    runtime.execute("Bash", {"command": "pwd"})
+                bash.assert_not_called()
+                self.assertEqual(runtime.execute("Bash", {"command": "pwd"}), "ok")
+            self.assertEqual(prompt.call_count, 6)
+            self.assertIn("клавиша Y вводит «н»", output.getvalue())
             bash.assert_called_once()
 
     def test_verbose_approval_keeps_bash_details_and_compact_write_keeps_diff(self):

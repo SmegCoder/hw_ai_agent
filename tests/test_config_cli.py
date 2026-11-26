@@ -78,11 +78,14 @@ class ConfigCLITests(unittest.TestCase):
         values = parse_env(self.env.read_text())
         self.assertEqual(set(values), {option.env for option in LAUNCH_OPTIONS.values()})
         self.assertEqual(values['AGENT_TASKS'], 'true')
-        self.assertEqual(values['AGENT_PROGRESS'], 'true')
+        self.assertEqual(values['AGENT_PROGRESS'], 'compact')
         self.invoke('set', '--env-file', self.env, '--no-plan', '--no-tasks', '--no-journal', '--no-progress')
         values = parse_env(self.env.read_text())
-        for key in ('AGENT_PLAN', 'AGENT_TASKS', 'AGENT_JOURNAL', 'AGENT_PROGRESS'):
+        for key in ('AGENT_PLAN', 'AGENT_TASKS', 'AGENT_JOURNAL'):
             self.assertEqual(values[key], 'false')
+        self.assertEqual(values['AGENT_PROGRESS'], 'off')
+        self.assertEqual(self.invoke('set', '--env-file', self.env, '--progress', 'full')[0], 0)
+        self.assertEqual(parse_env(self.env.read_text())['AGENT_PROGRESS'], 'full')
 
     def test_invalid_set_leaves_file_unchanged(self):
         original = b'OPENROUTER_API_KEY=example-private-key\n'

@@ -1,0 +1,30 @@
+{
+  "artifact": "trials/deadlines/B2/workspace/deadlines.json",
+  "case_id": "deadlines",
+  "check": "Не удалось прочитать корректный deadlines.json",
+  "error": null,
+  "events": "trials/deadlines/B2/events.jsonl",
+  "input_tokens": 7693,
+  "input_usage_requests": 4,
+  "mcp_calls": {
+    "tracker/list_tasks": 1
+  },
+  "model_requests": 4,
+  "outcome_pass": false,
+  "output_tokens": 341,
+  "output_usage_requests": 4,
+  "routing_pass_or_na": true,
+  "run_id": "b6b5468ebf084cc5aedebd1da7ba0412",
+  "skill_activations": {
+    "tracker-json-deadlines": 1
+  },
+  "status": "completed",
+  "tool_calls": {
+    "load_skill": 1,
+    "mcp__tracker__list_tasks": 1,
+    "write_file": 1
+  },
+  "tools_pass": true,
+  "trial": 2,
+  "variant": "B"
+}

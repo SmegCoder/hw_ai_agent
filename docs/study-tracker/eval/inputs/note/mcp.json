@@ -1,0 +1,11 @@
+{
+  "servers": {
+    "tracker": {
+      "allow_tools": [
+        "list_tasks"
+      ],
+      "snapshot": "tasks.json",
+      "timeout": 5
+    }
+  }
+}

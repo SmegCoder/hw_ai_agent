@@ -15,6 +15,8 @@ from .planning import validate_plan, PlanError
 from .tasks import validate_task_plan, validate_proof, TaskError
 from .budget import BudgetLimits, BudgetExceeded, DIMENSIONS, snapshot, debit, batch_cost, truncate_result
 from .pricing import cost_summary, PricingError
+from .skills import skill_loaded_event
+from .mcp import mcp_event, mcp_fields
 from .text import escape_surrogates, json_text as encoded
 
 
@@ -57,11 +59,22 @@ def stamp() -> str:
 
 
 class SessionStore:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, read_only: bool = False):
+        self.log_credentials: set[str] = set()
         raw_path = Path(path).expanduser().absolute()
         if raw_path.is_symlink():
             raise SessionError("Session database must not be a symlink")
         self.path = raw_path.resolve()
+        if read_only:
+            try:
+                self.db = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=5, isolation_level=None)
+                self.db.row_factory = sqlite3.Row
+                self.db.execute("BEGIN")
+            except sqlite3.Error:
+                if hasattr(self, "db"):
+                    self.db.close()
+                raise SessionError("Не удалось открыть базу сессий для чтения") from None
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         descriptor = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
@@ -127,6 +140,16 @@ class SessionStore:
                     conversation_id TEXT NOT NULL REFERENCES conversations(id),
                     number INTEGER NOT NULL, prompt TEXT NOT NULL, UNIQUE(conversation_id, number)
                 );
+                CREATE VIEW IF NOT EXISTS run_events AS
+                    SELECT s.id || ':' || (e.key + 1) AS id,
+                           json_extract(e.value, '$._time') AS time,
+                           COALESCE(t.conversation_id, s.id) AS session_id,
+                           s.id AS run_id, json_extract(e.value, '$.event') AS type,
+                           json_remove(e.value, '$.event', '$._time', '$.session_id') AS data,
+                           t.number AS turn_number, e.key AS ordinal
+                    FROM sessions AS s
+                    LEFT JOIN conversation_turns AS t ON t.session_id=s.id,
+                         json_each(s.events) AS e;
                 CREATE TABLE IF NOT EXISTS journal_blobs (sha256 TEXT PRIMARY KEY, data BLOB NOT NULL);
                 CREATE TABLE IF NOT EXISTS journal_images (
                     session_id TEXT NOT NULL REFERENCES sessions(id),revision INTEGER NOT NULL,tree TEXT NOT NULL,
@@ -303,6 +326,10 @@ class SessionStore:
                 )
             if metadata.get("plan_mode"):
                 self.db.execute("INSERT INTO plans VALUES (?, 'planning', NULL, ?)", (session_id, now))
+            if messages and messages[-1].get("role") == "user":
+                self._event(session_id, {"event": "user_request", "content": messages[-1]["content"]})
+            if "skill_manifest" in metadata:
+                self._event(session_id, {"event": "skills_discovered", "names": list(metadata["skill_manifest"])})
         return session_id
 
     def get(self, session_id: str) -> SessionState:
@@ -354,6 +381,8 @@ class SessionStore:
         with self.transaction():
             self.db.execute("UPDATE sessions SET status=?,error=?,updated_at=? WHERE id=?",
                             (status, error, stamp(), session_id))
+            if error is not None:
+                self._event(session_id, {"event": "run_error", "status": status, "error": error})
 
     def plan(self, session_id: str) -> dict | None:
         self.validate_id(session_id)
@@ -512,8 +541,45 @@ class SessionStore:
     def _event(self, session_id: str, event: dict):
         row = self.db.execute("SELECT events FROM sessions WHERE id=?", (session_id,)).fetchone()
         events = json.loads(row[0])
-        events.append(event)
-        self.db.execute("UPDATE sessions SET events=?,updated_at=? WHERE id=?", (encoded(events), stamp(), session_id))
+        now = stamp()
+        events.append({**self.redacted_event(event), "_time": now})
+        self.db.execute("UPDATE sessions SET events=?,updated_at=? WHERE id=?", (encoded(events), now, session_id))
+
+    def redacted_event(self, event: dict) -> dict:
+        payload = dict(mcp_event(event))
+        if self.log_credentials:
+            for key in ("content", "arguments", "error", "reason", "assistant", "plan", "preview",
+                        "prompt", "path", "paths", "proof", "tool_call_id", "tool", "name", "names", "task_id",
+                        "server", "mcp_tool"):
+                if key in payload:
+                    payload[key] = self._redact_log_text(payload[key])
+        return payload
+
+    def _redact_log_text(self, value):
+        if isinstance(value, str):
+            for credential in self.log_credentials:
+                value = value.replace(credential, "[REDACTED]")
+        elif isinstance(value, dict):
+            return {self._redact_log_text(key): self._redact_log_text(item) for key, item in value.items()}
+        elif isinstance(value, list):
+            return [self._redact_log_text(item) for item in value]
+        return value
+
+    def event_records(self, identifier: str):
+        self.validate_id(identifier)
+        known = self.db.execute(
+            "SELECT id FROM conversations WHERE id=? UNION ALL SELECT id FROM sessions WHERE id=?",
+            (identifier, identifier),
+        ).fetchone()
+        if known is None:
+            raise SessionError("Диалог или запрос не найден")
+        rows = self.db.execute(
+            """SELECT id, time, session_id, run_id, type, data FROM run_events
+               WHERE session_id=? OR run_id=? ORDER BY time, turn_number, ordinal""",
+            (identifier, identifier),
+        )
+        for row in rows:
+            yield {**dict(row), "data": json.loads(row["data"])}
 
     def event(self, session_id: str, event: dict):
         with self.transaction():
@@ -555,7 +621,8 @@ class SessionStore:
                 self._charge(session_id, **batch_cost(calls, cached))
             except SessionBudgetExceeded as exc:
                 failure = exc
-                self._event(session_id, {"event": "batch_rejected", "assistant": message, "reason": str(exc)})
+                self._event(session_id, {"event": "batch_rejected", "assistant": {"tool_calls": calls},
+                                         "reason": str(exc)})
                 self.db.execute("UPDATE sessions SET status='budget_exhausted',error=?,updated_at=? WHERE id=?",
                                 (str(exc), stamp(), session_id))
             else:
@@ -681,7 +748,10 @@ class SessionStore:
                             (session_id, item["batch"], item["position"]))
             self.db.execute("UPDATE sessions SET messages=?,updated_at=? WHERE id=?",
                             (encoded([*state.messages, result]), stamp(), session_id))
-            self._event(session_id, {"event": "tool_result", "task_id": item.get("task_id"), "phase": item.get("phase"), **result})
+            self._event(session_id, {"event": "tool_result", "call": item["key"], "task_id": item.get("task_id"),
+                                     "phase": item.get("phase"), "failed": failed, **result})
+            if item["call"]["function"]["name"] == "load_skill" and not failed:
+                self._event(session_id, {**skill_loaded_event(item["call"]), "call": item["key"]})
             self._event(session_id, {"event": "budget_settlement", "call": item["key"], "quota": quota,
                                      "result_bytes": len(result["content"].encode("utf-8")),
                                      "forfeited": bool(allocation["forfeited"])})
@@ -751,7 +821,9 @@ class SessionStore:
                 raise SessionError("Journal recovery requires the session runtime and explicit change attribution")
             journal.resolve_changes(item, changes)
         if resolution == "retry":
-            if item["call"]["function"]["name"] not in {"write_file", "delete_file", "read_file", "list_files", "Bash", "bash", "submit_plan", "complete_task", "fail_task"}:
+            name = item["call"]["function"]["name"]
+            if name not in {"write_file", "delete_file", "read_file", "list_files", "load_skill", "install_skill", "Bash", "bash",
+                            "submit_plan", "complete_task", "fail_task"} and not mcp_fields(name):
                 raise SessionError("This instrument has no supported safe retry contract")
             with self.transaction():
                 self.db.execute("UPDATE calls SET state='pending' WHERE session_id=? AND batch=? AND position=?",

@@ -1,0 +1,26 @@
+{
+  "artifact": "trials/mcp-failure/A3/workspace/open-tasks.json",
+  "case_id": "mcp-failure",
+  "check": "Нет файла, ошибка сообщена",
+  "error": "ERROR: MCP_TOOL_ERROR: Tracker snapshot is unavailable or invalid",
+  "events": "trials/mcp-failure/A3/events.jsonl",
+  "input_tokens": 2604,
+  "input_usage_requests": 2,
+  "mcp_calls": {
+    "tracker/list_tasks": 1
+  },
+  "model_requests": 2,
+  "outcome_pass": true,
+  "output_tokens": 33,
+  "output_usage_requests": 2,
+  "routing_pass_or_na": false,
+  "run_id": "1190c37c123949c0b82c06d040e9e523",
+  "skill_activations": {},
+  "status": "completed",
+  "tool_calls": {
+    "mcp__tracker__list_tasks": 1
+  },
+  "tools_pass": true,
+  "trial": 3,
+  "variant": "A"
+}

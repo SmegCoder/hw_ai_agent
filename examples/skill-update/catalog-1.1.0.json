@@ -1,0 +1,11 @@
+{
+  "skills": [
+    {
+      "name": "tracker-json-deadlines",
+      "description": "Подготовить JSON-отчёт о просроченных заданиях учебного трекера и пропущенных сроках.",
+      "version": "1.1.0",
+      "path": "packages/tracker-json-deadlines/1.1.0/SKILL.md",
+      "sha256": "49db814c8bbe39b5c8be3530350266b47f4b9424f022c0f30e0fafd380aa4e91"
+    }
+  ]
+}

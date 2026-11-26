@@ -1,0 +1,8 @@
+[
+  {
+    "name": "tracker-json-deadlines",
+    "source": "registry/catalog.json",
+    "version": "1.0.0",
+    "sha256": "bed4e2326242ca9d1f766b9711bc1b24924cf848bf1b4a30f3fdbe4cef0034f1"
+  }
+]

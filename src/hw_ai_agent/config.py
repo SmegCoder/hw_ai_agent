@@ -78,7 +78,7 @@ LAUNCH_OPTIONS = {
     "journal": LaunchOption("AGENT_JOURNAL", False, bool),
     "route": LaunchOption("AGENT_ROUTE", False, bool),
     "cost_estimate": LaunchOption("AGENT_COST_ESTIMATE", True, bool),
-    "progress": LaunchOption("AGENT_PROGRESS", False, bool),
+    "progress": LaunchOption("AGENT_PROGRESS", "compact", str, choices=("brief", "compact", "full", "off")),
     "route_simple_model": LaunchOption("AGENT_ROUTE_SIMPLE_MODEL", None, str),
     "route_medium_model": LaunchOption("AGENT_ROUTE_MEDIUM_MODEL", None, str),
     "route_complex_model": LaunchOption("AGENT_ROUTE_COMPLEX_MODEL", None, str),
@@ -92,6 +92,12 @@ def option_value(name: str, value):
     label = f"--{name.replace('_', '-')} / {option.env}"
     if value is None:
         return None
+    if name == "progress":
+        value = str(value).lower()
+        if value in {"true", "1", "yes"}:
+            return "compact"
+        if value in {"false", "0", "no"}:
+            return "off"
     if option.kind is bool:
         if isinstance(value, bool):
             return value

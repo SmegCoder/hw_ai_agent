@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections import Counter
 from dataclasses import dataclass
 
 from .agent import AgentError
@@ -11,7 +12,7 @@ from .config import option_value
 from .journal import ChangeJournal, JournalError
 from .policy import ApprovalDeferred, PolicyError
 from .session import SessionError, SessionState, encoded
-from .terminal import color_diff, report_header, visible
+from .terminal import color_diff, report_header, visible, visible_line
 from .tools import ToolError
 
 FINISHED = {"completed", "aborted", "rolled_back", "budget_exhausted", "context_limit"}
@@ -23,18 +24,20 @@ CHAT_OPTIONS = {
     "max-tool-calls": ("budget", "tool_calls", "N"),
     "max-side-effects": ("budget", "side_effects", "N"),
     "max-tokens": ("binding", "max_tokens", "N"),
-    "progress": (None, "progress", "true|false"),
+    "progress": (None, "progress", "brief|compact|full|off"),
 }
 
 COMMANDS = """Введите запрос или команду.
   /plan ТЕКСТ    Запрос с утверждением плана перед правками
   /changes       Показать правки последнего запроса с изменениями
   /rollback      Отменить правки последнего запроса и остаться в диалоге
+  /market-rollback ИМЯ   Вернуть предыдущую проверенную версию скилла
   /tokens        Токены всех обращений к модели в диалоге
+  /stats         Статистика каждого запроса и всего диалога
   /settings      Показать настройки диалога
   /set ИМЯ ЗНАЧЕНИЕ   Сохранить настройку диалога
   /resume        Продолжить приостановленный запрос
-  /stop          Поставить диалог на паузу
+  /exit          Выйти с возможностью продолжить диалог
   /end           Окончательно завершить диалог
   /help          Показать команды"""
 
@@ -47,11 +50,111 @@ class Turn:
     journal_status: str | None
 
 
+class RunStats:
+    def __init__(self):
+        self.requests = 0
+        self.tools = Counter()
+        self.mcp_calls = Counter()
+        self.discovered_skills = set()
+        self.loaded_skills = Counter()
+        self.known = Counter()
+        self.tokens = Counter()
+
+    def include(self, state: SessionState):
+        self.requests += state.rounds
+        usage_by_round = {}
+        legacy_usage = []
+        for event in state.events:
+            if event["event"] == "tool_call":
+                self.tools[event["name"]] += 1
+                if "server" in event and "mcp_tool" in event:
+                    self.mcp_calls[event["server"], event["mcp_tool"]] += 1
+            elif event["event"] == "skills_discovered":
+                self.discovered_skills.update(event["names"])
+            elif event["event"] == "skill_loaded":
+                self.loaded_skills[event["name"]] += 1
+            elif event["event"] in {"model_cost", "model_usage"} and event.get("usage"):
+                if "round" in event:
+                    # Both events contain the API counters. A crash can leave only model_cost.
+                    usage_by_round[event["round"]] = event["usage"]
+                elif event["event"] == "model_usage":
+                    legacy_usage.append(event["usage"])
+        for usage in [*usage_by_round.values(), *legacy_usage]:
+            values = {key: usage[key] for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+                      if type(usage.get(key)) is int and usage[key] >= 0}
+            if "total_tokens" not in values and {"prompt_tokens", "completion_tokens"} <= values.keys():
+                values["total_tokens"] = values["prompt_tokens"] + values["completion_tokens"]
+            details = usage.get("prompt_tokens_details")
+            if isinstance(details, dict):
+                values.update({key: details[key] for key in ("cached_tokens", "cache_write_tokens")
+                               if type(details.get(key)) is int and details[key] >= 0})
+            self.known.update(values.keys())
+            self.tokens.update(values)
+
+    def token_count(self, key):
+        if self.requests == 0:
+            return "0"
+        count = self.known[key]
+        if count == 0:
+            return "unknown"
+        if count < self.requests:
+            return f"{self.tokens[key]} (частично, {count}/{self.requests})"
+        return str(self.tokens[key])
+
+    def display(self):
+        print(f"  Обращения к модели · {self.requests}")
+        print(f"  Токены API · вход {self.token_count('prompt_tokens')} · выход {self.token_count('completion_tokens')}"
+              f" · всего {self.token_count('total_tokens')}")
+        tools = ", ".join(f"{visible(name)} × {count}" for name, count in sorted(self.tools.items()))
+        print(f"  Вызовы инструментов · {self.tools.total()} · уникальных {len(self.tools)}"
+              + (f" · {tools}" if tools else ""))
+        skills = ", ".join(f"{visible(name)} × {count}" for name, count in sorted(self.loaded_skills.items()))
+        print(f"  Скиллы · обнаружено {len(self.discovered_skills)} · загрузок {self.loaded_skills.total()}"
+              + f" · уникальных скиллов {len(self.loaded_skills)}" + (f" · {skills}" if skills else ""))
+        if self.mcp_calls:
+            calls = ", ".join(f"{visible(server)}/{visible(tool)} × {count}"
+                              for (server, tool), count in sorted(self.mcp_calls.items()))
+            print(f"  MCP-вызовы · {self.mcp_calls.total()} · {calls}")
+
+
 class Conversation:
     def __init__(self, store, identifier: str):
         self.store = store
         self.id = identifier
         store.validate_id(identifier)
+
+    @staticmethod
+    def choose_open(store):
+        rows = store.db.execute("""
+            SELECT c.id, json_extract(c.configuration, '$.binding.workspace') AS workspace,
+                   t.prompt, s.updated_at
+            FROM conversations AS c
+            LEFT JOIN conversation_turns AS t ON t.session_id=(
+                SELECT session_id FROM conversation_turns
+                WHERE conversation_id=c.id ORDER BY number DESC LIMIT 1)
+            LEFT JOIN sessions AS s ON s.id=t.session_id
+            WHERE c.ended=0 ORDER BY s.updated_at DESC, c.rowid DESC
+        """).fetchall()
+        if not rows:
+            print("Нет открытых диалогов. Начать новый · agi chat")
+            return None
+        print("Выберите диалог · время UTC, рабочая папка и последний запрос")
+        for number, row in enumerate(rows, 1):
+            title = visible_line(row["prompt"] or "Пока без запросов")
+            updated = (row["updated_at"] or "—")[:16].replace("T", " ")
+            print(f"{number}. {updated} · {visible_line(row['workspace'])} · {title[:90]}")
+        while True:
+            try:
+                value = input("Номер диалога (Enter — отмена): ").strip()
+            except (KeyboardInterrupt, EOFError):
+                return None
+            if not value:
+                return None
+            if value.isascii() and value.isdecimal() and len(value) <= len(str(len(rows))):
+                index = int(value)
+                if 1 <= index <= len(rows):
+                    return rows[index - 1]["id"]
+            print("Введите номер из списка.")
 
     @classmethod
     def create(cls, store, configuration: dict) -> Conversation:
@@ -183,7 +286,7 @@ class ConversationShell:
                     continue
                 parts = line.split(maxsplit=1)
                 command, argument = parts[0], parts[1] if len(parts) == 2 else ""
-                if command in {"/pause", "/stop"} and not argument:
+                if command in {"/pause", "/exit"} and not argument:
                     self.pause()
                     return 0
                 if command == "/end" and not argument:
@@ -201,7 +304,8 @@ class ConversationShell:
 
     def execute(self, action):
         try:
-            action()
+            with self.progress:
+                action()
         except ApprovalDeferred:
             print("Запрос на паузе · продолжить через /resume")
         except ModelClientError as exc:
@@ -225,8 +329,16 @@ class ConversationShell:
             self.resume_turn()
         elif command in {"/changes", "/rollback"} and not argument:
             self.changes(rollback=command == "/rollback")
+        elif command == "/market-rollback" and argument:
+            market = self.agent.runtime.market
+            if market is None:
+                raise SessionError("Для этого диалога маркет скиллов отключён")
+            version = market.rollback(argument)
+            print(f"Маркет · {visible_line(argument)} · восстановлена версия {visible_line(version)}")
         elif command == "/tokens" and not argument:
             self.show_tokens()
+        elif command == "/stats" and not argument:
+            self.show_stats()
         elif command == "/settings" and not argument:
             self.show_settings()
         elif command == "/set":
@@ -237,8 +349,8 @@ class ConversationShell:
             name, value = parts
             saved = self.conversation.set_option(name, value)
             if name == "progress":
-                self.progress.enabled = saved
-                print(f"Ход работы · {'включён' if saved else 'выключен'}")
+                self.progress.mode = saved
+                print(f"Ход работы · {saved}")
             else:
                 print(f"Для новых запросов · {name} = {visible(value)}")
         elif command == "/help" and not argument:
@@ -250,7 +362,7 @@ class ConversationShell:
         configuration = self.conversation.configuration()
         print("Настройки новых запросов")
         for name, (group, key, allowed) in CHAT_OPTIONS.items():
-            value = str(self.progress.enabled).lower() if name == "progress" else configuration[group][key]
+            value = self.progress.mode if name == "progress" else configuration[group][key]
             print(f"  {name} · {visible(value)}   /set {name} {allowed}")
 
     def apply_turn_binding(self, binding):
@@ -294,6 +406,17 @@ class ConversationShell:
         reported, estimated, incomplete = self.conversation.tokens(turns)
         prefix = "≈" if estimated or incomplete else ""
         print(f"Токены за диалог · {prefix}{reported + estimated:,}".replace(",", " "))
+
+    def show_stats(self):
+        total = RunStats()
+        for turn in self.conversation.turns():
+            run = RunStats()
+            run.include(turn.state)
+            total.include(turn.state)
+            print(f"Запрос {turn.number} · {turn.state.id} · {turn.state.status}")
+            run.display()
+        print(f"Итого за диалог · {self.conversation.id}")
+        total.display()
 
     def pause(self):
         print(f"\nДиалог на паузе · {self.resume_command}")

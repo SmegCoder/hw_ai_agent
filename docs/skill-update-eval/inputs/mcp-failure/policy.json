@@ -1,0 +1,23 @@
+{
+  "defaults": {
+    "list_files": "allow",
+    "load_skill": "allow",
+    "read_file": "allow"
+  },
+  "directories": {
+    "allow": [
+      "."
+    ]
+  },
+  "rules": [
+    {
+      "action": "allow",
+      "tool": "mcp__tracker__list_tasks"
+    },
+    {
+      "action": "allow",
+      "path": "open-tasks.json",
+      "tool": "write_file"
+    }
+  ]
+}

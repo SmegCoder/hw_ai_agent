@@ -1,0 +1,24 @@
+{
+  "artifact": "trials/note/B1/workspace/note.txt",
+  "case_id": "note",
+  "check": "Результат совпал с эталоном",
+  "error": null,
+  "events": "trials/note/B1/events.jsonl",
+  "input_tokens": 2582,
+  "input_usage_requests": 2,
+  "mcp_calls": {},
+  "model_requests": 2,
+  "outcome_pass": true,
+  "output_tokens": 52,
+  "output_usage_requests": 2,
+  "routing_pass_or_na": true,
+  "run_id": "a975dbd9040741de89479fbe6db84794",
+  "skill_activations": {},
+  "status": "completed",
+  "tool_calls": {
+    "write_file": 1
+  },
+  "tools_pass": true,
+  "trial": 1,
+  "variant": "B"
+}

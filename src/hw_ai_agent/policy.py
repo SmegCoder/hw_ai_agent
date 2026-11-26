@@ -8,6 +8,8 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Mapping
 
+from .mcp import mcp_fields
+
 
 class PolicyError(ValueError):
     pass
@@ -23,9 +25,11 @@ class Action(str, Enum):
     DENY = "deny"
 
 
-TOOLS = frozenset({"list_files", "read_file", "write_file", "delete_file", "Bash"})
+TOOLS = frozenset({"install_skill", "load_skill", "list_files", "read_file", "write_file", "delete_file", "Bash"})
 FILE_TOOLS = frozenset({"list_files", "read_file", "write_file", "delete_file"})
 DEFAULTS = {
+    "install_skill": Action.ASK,
+    "load_skill": Action.ALLOW,
     "list_files": Action.ALLOW,
     "read_file": Action.ALLOW,
     "write_file": Action.ASK,
@@ -88,18 +92,26 @@ class Policy:
         return any(contains(p) for p in self.directory_allow) and not any(contains(p) for p in self.directory_deny)
 
     @classmethod
-    def restore(cls, data: dict) -> Policy:
+    def restore(cls, data: dict, *, builtin: bool = False) -> Policy:
         if not isinstance(data, dict) or not isinstance(data.get("defaults", {}), dict):
             return cls.from_dict(data)
         if "delete_file" not in data.get("defaults", {}):
             data = {**data, "defaults": {**data.get("defaults", {}), "delete_file": "deny"}}
+        if "load_skill" not in data.get("defaults", {}):
+            data = {**data, "defaults": {**data.get("defaults", {}), "load_skill": "allow" if builtin else "deny"}}
+        if "install_skill" not in data.get("defaults", {}):
+            action = "ask" if builtin else "deny"
+            data = {**data, "defaults": {**data.get("defaults", {}), "install_skill": action}}
         return cls.from_dict(data)
 
     def decide(self, tool: str, *, path: str | None = None,
                command: str | None = None) -> Decision:
-        if tool not in TOOLS:
+        external = bool(mcp_fields(tool))
+        if tool not in TOOLS and not external:
             return Decision(Action.DENY, "Unknown tool")
         matches = [r for r in self.rules if r.matches(tool, path, command)]
+        if external and not any(r.tool == tool for r in matches):
+            return Decision(Action.DENY, "MCP requires a policy rule for this exact tool")
         if matches:
             # Explicit denials always outrank ask/allow, irrespective of rule order.
             priority = {Action.ALLOW: 0, Action.ASK: 1, Action.DENY: 2}
@@ -178,7 +190,7 @@ class Policy:
             if not isinstance(item, dict) or set(item) - {"tool", "action", "path", "command", "reason"}:
                 raise PolicyError("Invalid rule fields")
             tool = item.get("tool")
-            if not isinstance(tool, str) or tool not in TOOLS | {"*"}:
+            if not isinstance(tool, str) or (tool not in TOOLS | {"*"} and not mcp_fields(tool)):
                 raise PolicyError("Invalid rule tool")
             try:
                 action = Action(item["action"])

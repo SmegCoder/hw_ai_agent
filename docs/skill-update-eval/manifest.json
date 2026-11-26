@@ -1,0 +1,142 @@
+{
+  "approvals": "deny",
+  "budget": {
+    "model_requests": 8,
+    "result_bytes": 65536,
+    "side_effects": 3,
+    "tool_calls": 20
+  },
+  "cases": [
+    {
+      "id": "open-tasks",
+      "mcp": "ok",
+      "prompt": "Прочитай задачи учебного трекера. Сохрани в open-tasks.json JSON-массив строк с ID всех незавершённых задач без дублей. Учитывай статусы open, todo, in_progress и blocked.",
+      "skills": [
+        "open-task-export"
+      ],
+      "snapshot": "a51335bd1a4c574b8005cca5f50cbba9260750c2dda1b14924642596fe70a5a6"
+    },
+    {
+      "id": "deadlines",
+      "mcp": "ok",
+      "prompt": "Сначала загрузи установленный скилл tracker-json-deadlines. Собери отчёт по учебному трекеру на 2026-11-25. Сохрани в deadlines.json JSON-объект с полями as_of (дата отчёта), overdue (массив объектов с id, title, due_date, days_overdue), missing_due_date (число незавершённых задач без корректного срока) и skipped_records (число некорректных записей). В overdue включай только незавершённые задачи со сроком строго раньше даты отчёта. Сортируй по due_date, затем по id.",
+      "skills": [
+        "tracker-json-deadlines"
+      ],
+      "snapshot": "858016e84a7ef094179a64e79eb323d1795bc9720d0ad5984e5b6d6bcb922b30"
+    },
+    {
+      "id": "note",
+      "mcp": "unused",
+      "prompt": "Запиши в note.txt ровно этот текст, без кавычек и переноса строки: Повторить RISC-V и транзакции.",
+      "skills": [],
+      "snapshot": "858016e84a7ef094179a64e79eb323d1795bc9720d0ad5984e5b6d6bcb922b30"
+    },
+    {
+      "id": "missing-deadlines",
+      "mcp": "ok",
+      "prompt": "Сначала загрузи установленный скилл tracker-json-deadlines. Проверь незавершённые задачи учебного трекера на 2026-11-25. Сохрани в deadlines.json JSON-объект с двумя полями: overdue (массив объектов с id и due_date, по возрастанию даты и id) и missing_due_date_ids (массив ID незавершённых задач с отсутствующим или некорректным сроком). Просрочены задачи со сроком строго раньше указанной даты. Не выдумывай даты.",
+      "skills": [
+        "tracker-json-deadlines"
+      ],
+      "snapshot": "765128940b484ed9008368c93b0a9de5c76bfb7224f12b84e790cca30f5c318c"
+    },
+    {
+      "id": "mcp-failure",
+      "mcp": "error",
+      "prompt": "Выгрузи ID незавершённых задач учебного трекера в open-tasks.json. Если трекер недоступен, не создавай файл и ответь ровно одной фразой: Данные трекера недоступны.",
+      "skills": [
+        "open-task-export"
+      ],
+      "snapshot": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b"
+    }
+  ],
+  "comparison": {
+    "candidate_id": "9b3bcf29edaf8134f11dab2e4038064e",
+    "focus": [
+      "deadlines",
+      "missing-deadlines"
+    ],
+    "name": "tracker-json-deadlines",
+    "revisions": {
+      "A": {
+        "sha256": "bed4e2326242ca9d1f766b9711bc1b24924cf848bf1b4a30f3fdbe4cef0034f1",
+        "version": "1.0.0"
+      },
+      "B": {
+        "sha256": "49db814c8bbe39b5c8be3530350266b47f4b9424f022c0f30e0fafd380aa4e91",
+        "version": "1.1.0"
+      }
+    },
+    "rule": [
+      "В каждой группе из трёх попыток число успешных результатов B не ниже A.",
+      "Хотя бы одна задача решена в каждом варианте, а проверяемый скилл загружен в обеих версиях.",
+      "Все 15 попыток кандидата проходят проверку допустимых и необходимых инструментов.",
+      "Usage входа и выхода известен для всех обращений в обоих вариантах.",
+      "Средний суммарный расход входных и выходных токенов на попытку вырос максимум на 20%."
+    ]
+  },
+  "dependencies": {
+    "PyYAML": "6.0.3",
+    "certifi": "2026.07.22"
+  },
+  "endpoint": "http://127.0.0.1:11542/v1",
+  "format": 1,
+  "hypothesis": "Новая версия сохраняет качество по всем сценариям и укладывается в лимит токенов.",
+  "mcp": {
+    "allow_tools": [
+      "list_tasks"
+    ],
+    "server": "tracker",
+    "timeout": 5
+  },
+  "mode": "auto",
+  "model": "qwen3:4b-instruct",
+  "parameters": {
+    "max_rounds": 8,
+    "max_tokens": 384,
+    "timeout": 120.0,
+    "trials": 3
+  },
+  "provider": "ollama",
+  "python": "3.14.2",
+  "variants": {
+    "A": "active-skill",
+    "B": "candidate-skill"
+  },
+  "versions": {
+    "__init__.py": "987fdbfe248c938a97eb18ee6796981ae2029c412840e8e5580f660a9e88a521",
+    "__main__.py": "2cdd23d4f5cd6c3b3e4cb690ad16d560637767b9ca5b2a3cf129fcc0a5ebc82b",
+    "agent.py": "b06fc56a026ad569ddc98a3241180a6162f148082c4c03e154319f2e3f137264",
+    "budget.py": "a443a24ac0ef23f9f798c26527902ee18ef98b1f8777aa6a01e89fd21e552d8a",
+    "cli.py": "7d97ae8ae5c82249187d4dfb3cc264e271f28fa5633ad133fd3ff91dd525eade",
+    "client.py": "ab56b6ba012951dba0de47338962661d6cb9fe60a4f88c6c3278b5b1f5ef6219",
+    "config.py": "26a72c4f4a07c3187766fe41d65f4963ef1470aa8ae5e161cda24084c5d441d9",
+    "conversation.py": "3fc69dbeede569e0637b37be7fd65beac50fb7e0f763a19ef5b46e369fd25b2a",
+    "eval_cases.py": "8dbc9accf36992622eb346f4939aa92b9e16520c6ddf99cb612eda5d2bd96cae",
+    "eval_report.py": "a50dc05d45d8f2e809ca785fa10c163a12f0282ecf6b76167d21521fbc898fe5",
+    "eval_runner.py": "9c382103a2261bcb4ad8c903114a6e696f6b908cb01c503a099659d593b4279a",
+    "filesystem.py": "a9c2c07c0eef19d0a36279ad65a6f3048c28ad9505fc27b673154c215b7cef2e",
+    "journal.py": "d7e7997b839e8fb342da9e71018a041e0625ae987f8a7085b2ff0a725118640d",
+    "mcp.py": "a200a45c405d652f403746124fe39a33e9608ec2c4d1f7ad22af6f0f0a1eb510",
+    "model_catalog.py": "02dab8834bd53bba68fc79b3ded86d5ebcbe4c30eb8d8897ca9fd17d211ab4f9",
+    "planning.py": "8756ace776b27cb93be9ce85c10e855f63f56384ba69391b349fcccb266de813",
+    "policy.py": "2631a54a1c136b6057391c23b29c896675dbfa6860a739cc25b3a51f29fe60c3",
+    "pricing.py": "2b96e896981c1b4ce8aa32f00fddf3fcc75f08509c18550a001030be92aad5bf",
+    "routing.py": "8a6b7dd44b49c62fd826aef1705e3899ddf3fa7a554b3799365a8753514d95a2",
+    "session.py": "f954e30c2dff6dacc8a8b77aea56b6066d1e5dc513b735a156451833eb3b9913",
+    "session_doctor.py": "43c00b1f1f76fc0afe14cd7e4ff73bba6f2e5813cf77b52468f78e04dc097a29",
+    "skill_cards/deadline-report/SKILL.md": "5bcd4f27637ca8015a24b11cfc8333dceae44fec76264172d39a1cd86916473b",
+    "skill_cards/open-task-export/SKILL.md": "1fafba6515d5c90ea127c7390144cbbfd5bc16ffd6e70564dd40e29917a46c72",
+    "skill_cards/review-python-tests/SKILL.md": "6c21201f70118c8bbabb15f82776389d4f84613926a471ff100cfc7268213025",
+    "skill_market.py": "56c010a6b794a7ff110b303c3868c8ea069671bcc2696ebe3ffb3d54e618ea32",
+    "skill_updates.py": "a768f4c3bc6dcd3d461da6547df7512aa7e2987503a6afab130b8956c7ff1c42",
+    "skills.py": "be85b4833857ca168168d8d75492c5e3838f311840ab2fe490f5f1751dedf9af",
+    "tasks.py": "78acc1139da3d364fe3eff13dc5bc6743fce1501be0ebd188cb16b663b53af6f",
+    "terminal.py": "cc33c63226e2632283b1679b0c5644ce16ed34071bcbbb7ff592f13c345457ec",
+    "text.py": "bb7346c3285db62bb5332c2d686d7f5c4404dbb2e5e6cb10322826a8b9b067c4",
+    "tools.py": "3599f741e466181b566cdf63da79b0e9b76595c7ce1d0fe4ecc7e85b3d5246a9",
+    "tracker_mcp.py": "28611787b2f511ee50bcb2db157c31546d7beb0cf9652ab606d7b3e877642ce5",
+    "usage.py": "e8b0b98fec8dfa39e636f1091eda1c0f2c4457a037868004a1aae1205f568c1e"
+  }
+}

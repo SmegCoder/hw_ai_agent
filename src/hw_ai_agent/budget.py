@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from .skills import MAX_SKILL_BYTES
+from .mcp import MAX_FRAME, mcp_fields
 from .text import escape_surrogates
 
 
 DIMENSIONS = ("model_requests", "tool_calls", "side_effects", "result_bytes")
-SIDE_EFFECT_TOOLS = frozenset({"write_file", "delete_file", "Bash", "bash"})
+SIDE_EFFECT_TOOLS = frozenset({"install_skill", "write_file", "delete_file", "Bash", "bash"})
 TRUNCATED = "\n[TRUNCATED: result budget]"
 
 
@@ -75,6 +77,10 @@ def truncate_result(content: str, quota: int) -> str:
 
 
 def output_ceiling(name: str, runtime) -> int:
+    if mcp_fields(name):
+        return MAX_FRAME
+    if name == "load_skill":
+        return MAX_SKILL_BYTES
     if name == "read_file":
         return runtime.max_file_chars * 4 + 1024
     if name in {"Bash", "bash", "list_files"}:

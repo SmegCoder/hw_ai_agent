@@ -7,6 +7,7 @@ import re
 import shlex
 import shutil
 import sys
+import unicodedata
 from time import monotonic
 from datetime import date
 from itertools import count
@@ -33,6 +34,24 @@ def visible_line(value: str) -> str:
     return visible(value).replace("\n", "\\n").replace("\t", "\\t")
 
 
+def read_confirmation(prompt: str) -> bool | None:
+    while True:
+        raw = input(prompt)
+        if not raw.strip():
+            return None
+        # Strip bracketed paste markers and invisible Unicode formatting from terminal input.
+        text = raw.replace("\x1b[200~", "").replace("\x1b[201~", "")
+        answer = "".join(char for char in text if unicodedata.category(char) != "Cf").strip().casefold()
+        if answer in {"y", "yes", "д", "да"}:
+            return True
+        if answer in {"n", "no", "нет"}:
+            return False
+        if answer == "н":
+            print("В русской раскладке клавиша Y вводит «н». Введите «да» или «нет».", flush=True)
+        else:
+            print("Введите y или «да» для подтверждения, n или «нет» для отказа.", flush=True)
+
+
 DIFF_HUNK = re.compile(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
 
 
@@ -54,25 +73,80 @@ def color_diff(diff: str) -> str:
 
 
 class ProgressDisplay:
-    def __init__(self, enabled: bool = False):
-        self.enabled = enabled
+    FILE_ACTIONS = {"read_file": "Читаю", "write_file": "Изменяю", "delete_file": "Удаляю", "list_files": "Просматриваю"}
+    TASK_ACTIONS = {"submit_plan": "Предлагаю план", "complete_task": "Завершаю задачу", "fail_task": "Отмечаю ошибку задачи"}
+
+    def __init__(self, mode: str = "compact"):
+        self.mode = mode
         self.started_at = monotonic()
         self.target = ""
         self.is_test = False
+        self.brief_action = ""
+        self.brief_paths: set[str] = set()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.finish_line()
+
+    def finish_line(self):
+        if self.brief_action:
+            extra = len(self.brief_paths) - 3
+            print(f" и ещё {extra}" if extra > 0 else "", flush=True)
+            self.brief_paths.clear()
+            self.brief_action = ""
+
+    def brief_file(self, action: str, path: str):
+        if self.brief_action != action:
+            self.finish_line()
+            self.brief_action = action
+        if path in self.brief_paths:
+            return
+        self.brief_paths.add(path)
+        label = path if len(path) <= 40 else "…" + path[-39:]
+        if len(self.brief_paths) == 1:
+            self.line(f"{action} {label}", end="")
+        elif len(self.brief_paths) <= 3:
+            print(f", {label}", end="", flush=True)
 
     def render(self, event: dict) -> bool:
         """Render a progress line when this event has useful information."""
         kind = event["event"]
+        brief = self.mode == "brief"
+        if brief and (kind in {"final", "context_warning", "model_retry", "task_completed",
+                               "session_created", "session_resumed", "session_cached"}
+                      or (kind == "policy_decision" and event["outcome"] == "waiting")):
+            self.finish_line()
         if kind in {"session_created", "session_resumed"}:
             self.started_at = monotonic()
             self.target, self.is_test = "", False
         elif kind == "model_request":
-            self.line(f"Запрос к модели · {event['round']}")
+            if not brief:
+                self.line(f"Запрос к модели · {event['round']}")
+            elif event["round"] == 1:
+                self.line("Думаю…")
+            return True
+        elif kind == "model_usage" and self.mode == "full":
+            usage = event["usage"]
+            self.line(f"Токены запроса {event['round']} · вход {usage.get('prompt_tokens', 'unknown')}"
+                      f" · выход {usage.get('completion_tokens', 'unknown')}")
             return True
         elif kind == "tool_call":
-            self.tool_start(event)
+            if self.mode == "full":
+                self.line(f"Вызов {visible_line(event['name'])} · {visible(event['arguments'])}")
+            else:
+                self.tool_start(event)
+            return True
         elif kind == "tool_result":
-            self.tool_result(event)
+            if self.mode == "full":
+                self.line(f"Результат {visible_line(event['name'])} · {visible(event['content'])}")
+            elif event.get("failed", event["content"].startswith("ERROR:")):
+                self.finish_line()
+                self.line(f"Ошибка {visible_line(event['name'])} · {visible_line(event['content'][:240])}")
+            elif not brief or event["name"] in {"Bash", "bash"}:
+                self.tool_result(event)
+            return True
         return False
 
     def tool_start(self, event: dict) -> None:
@@ -84,10 +158,17 @@ class ProgressDisplay:
             return
         if not isinstance(arguments, dict):
             return
-        target = arguments.get("command" if name in {"Bash", "bash"} else "path", ".")
+        target_key = {"Bash": "command", "bash": "command", "load_skill": "name"}.get(name, "path")
+        target = arguments.get(target_key, ".")
         if not isinstance(target, str):
             return
         self.target = visible_line(target)
+        brief = self.mode == "brief"
+        if brief:
+            if name in self.FILE_ACTIONS:
+                self.brief_file(self.FILE_ACTIONS[name], self.target)
+                return
+            self.finish_line()
         if len(self.target) > 120:
             self.target = self.target[:119] + "…"
         if name in {"Bash", "bash"}:
@@ -96,14 +177,20 @@ class ProgressDisplay:
                 self.is_test = True
             except PlanError:
                 pass
-            self.line(f"{'Проверка' if self.is_test else 'Команда'} · {self.target}")
+            if brief:
+                self.line("Запускаю тесты" if self.is_test else "Выполняю команду")
+            else:
+                self.line(f"{'Проверка' if self.is_test else 'Команда'} · {self.target}")
         elif name in {"read_file", "list_files"}:
             self.line(f"{'Чтение' if name == 'read_file' else 'Список файлов'} · {self.target}")
+        elif name == "load_skill":
+            self.line(f"Загрузка скилла · {self.target}")
+        elif name not in {"write_file", "delete_file"}:
+            label = f"Инструмент · {visible_line(name)}"
+            self.line(self.TASK_ACTIONS.get(name, label) if brief else label)
 
     def tool_result(self, event: dict) -> None:
         name, content = event["name"], event["content"]
-        if content.startswith("ERROR:"):
-            return
         if name == "write_file" and content.startswith("wrote "):
             self.line(f"Файл записан · {self.target}")
         elif name == "delete_file" and content.startswith(("removed ", "already absent:")):
@@ -120,9 +207,9 @@ class ProgressDisplay:
                     label = "Успех тестов не подтверждён" if self.is_test else "Команда завершена"
                     self.line(f"{label} · код {status[1]}")
 
-    def line(self, text: str) -> None:
+    def line(self, text: str, *, end="\n") -> None:
         minutes, seconds = divmod(int(monotonic() - self.started_at), 60)
-        print(f"{emphasis(f'{minutes:02}:{seconds:02}', '2')}  {text}", flush=True)
+        print(f"{emphasis(f'{minutes:02}:{seconds:02}', '2')}  {text}", end=end, flush=True)
 
 
 def report_header(action, workspace: Path, settings, request: str | None = None) -> None:
@@ -179,7 +266,36 @@ def result_details(agent):
     return files, tests
 
 
+def ollama_answer(answer: str) -> str:
+    opening = re.match(r"\s*<think>", answer, re.IGNORECASE)
+    if opening:
+        tail = answer[opening.end():]
+        closing = re.search(r"</think>", tail, re.IGNORECASE)
+        return tail[closing.end():].lstrip("\r\n") if closing else ""
+
+    # An Ollama response can contain the closing marker alone. Ignore markers in Markdown examples.
+    fence = ""
+    offset = 0
+    for line in answer.splitlines(keepends=True):
+        offset += len(line)
+        marker = re.match(r"^[ \t]*(`{3,}|~{3,})(.*)$", line)
+        if marker:
+            delimiter, info = marker.groups()
+            if not fence:
+                fence = delimiter
+            elif delimiter.startswith(fence) and not info.strip():
+                fence = ""
+        elif not fence and line.strip().casefold() == "</think>":
+            return answer[offset:].lstrip("\r\n")
+    return answer
+
+
 def report_answer(agent, answer: str, *, verbose: bool, chat: bool = False) -> None:
+    settings = getattr(getattr(agent, "client", None), "settings", None)
+    if getattr(settings, "provider", None) == "ollama":
+        answer = ollama_answer(answer)
+        if not answer.strip():
+            answer = "Модель не вернула итоговый текст."
     if verbose:
         print("\n" + visible(answer))
         return
@@ -259,17 +375,12 @@ def confirm_plan(plan: dict, *, verbose=False) -> bool:
     if not sys.stdin.isatty():
         raise PlanApprovalDeferred('План сохранён; запустите resume в терминале для утверждения')
     try:
-        while True:
-            answer = input('Утвердить план и перейти к исполнению? [y/n; Enter — пауза]: ').strip().lower()
-            if answer in {'y', 'yes', 'да', 'д'}:
-                return True
-            if answer in {'n', 'no', 'нет', 'н'}:
-                return False
-            if not answer:
-                raise PlanApprovalDeferred('План ожидает решения; продолжение через resume')
-            print('Введите y для утверждения или n для отклонения.')
+        decision = read_confirmation('Утвердить план и перейти к исполнению? [y/n; Enter — пауза]: ')
     except EOFError:
         raise PlanApprovalDeferred('Ответ не получен; план сохранён без утверждения') from None
+    if decision is None:
+        raise PlanApprovalDeferred('План ожидает решения; продолжение через resume')
+    return decision
 
 
 def choose_workspace(root: Path) -> Path | None:

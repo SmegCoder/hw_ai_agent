@@ -1,0 +1,7 @@
+{
+  "overdue": [
+    {"id": "T5", "due_date": "2026-11-19"},
+    {"id": "T1", "due_date": "2026-11-24"}
+  ],
+  "missing_due_date_ids": ["T6", "T7"]
+}

@@ -1,0 +1,18 @@
+{
+  "skills": [
+    {
+      "name": "study-week-overview",
+      "version": "2.0.0",
+      "description": "Составить учебный план на неделю и распределить учебную нагрузку по дням.",
+      "path": "packages/study-week-overview/2.0.0/SKILL.md",
+      "sha256": "ec760024989304feb5ecbf6e8a4524a148efacc42dbaab8dbbbe6127db878f8d"
+    },
+    {
+      "name": "next-study-task",
+      "version": "1.0.0",
+      "description": "Выбрать один следующий учебный шаг на свободные 15–30 минут.",
+      "path": "packages/next-study-task/1.0.0/SKILL.md",
+      "sha256": "24c26dd1667e739e29878ed2f67edf74e38966615c408d1f685e1adbd67ae12d"
+    }
+  ]
+}
