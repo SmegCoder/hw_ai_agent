@@ -20,6 +20,7 @@ from .text import json_text
 MAX_CATALOG_BYTES = 128 * 1024
 DIGEST = re.compile(r"[0-9a-f]{64}")
 VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,63}")
+LEGACY_DATABASE = re.compile(r"skill-market-[0-9a-f]{24}\.sqlite3")
 MarketSource = Path | str
 
 
@@ -85,12 +86,12 @@ class CatalogSnapshot:
 
 
 class SkillMarket:
-    def __init__(self, config: Path, state_db: Path, workspace: Path):
-        self.path = config.expanduser().resolve()
+    def __init__(self, config: Path | None, state_db: Path, workspace: Path):
+        self.path = config.expanduser().resolve() if config is not None else None
         self.workspace = workspace.expanduser().resolve()
-        key = hashlib.sha256(os.fsencode(self.path)).hexdigest()[:24]
-        self.db_path = state_db.expanduser().resolve().parent / f"skill-market-{key}.sqlite3"
-        self.outside_workspace(self.path)
+        self.db_path = state_db.expanduser().resolve().parent / "skill-market.sqlite3"
+        if self.path is not None:
+            self.outside_workspace(self.path)
         self.outside_workspace(self.db_path)
 
     def outside_workspace(self, path: Path):
@@ -98,6 +99,8 @@ class SkillMarket:
             raise MarketError("Конфигурация, каталог, пакеты и состояние маркета хранятся вне рабочей папки")
 
     def config(self) -> MarketConfig:
+        if self.path is None:
+            raise MarketError("Укажите --market-config для работы с источником маркета")
         raw = read_json(self.path, 8192)
         if (set(raw) - {"catalog", "marketplace", "check_on_start", "auto_update", "require_eval"}
                 or len(raw.keys() & {"catalog", "marketplace"}) != 1):
@@ -142,11 +145,37 @@ class SkillMarket:
                         source TEXT NOT NULL, old_version TEXT NOT NULL, old_sha256 TEXT NOT NULL,
                         new_version TEXT NOT NULL, new_sha256 TEXT NOT NULL, status TEXT NOT NULL, decision TEXT);
                     CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY, data TEXT NOT NULL);
+                    CREATE TABLE IF NOT EXISTS legacy_imports (name TEXT PRIMARY KEY);
                 """)
+                self.import_legacy(db)
                 with db:
                     yield db
         except (sqlite3.Error, OSError):
             raise MarketError("Невозможно открыть хранилище маркета скиллов") from None
+
+    def import_legacy(self, db):
+        imported = {row["name"] for row in db.execute("SELECT name FROM legacy_imports")}
+        paths = sorted(path for path in self.db_path.parent.iterdir()
+                       if LEGACY_DATABASE.fullmatch(path.name) and path.name not in imported)
+        if not paths:
+            return
+        with db:
+            db.execute("BEGIN IMMEDIATE")
+            for path in paths:
+                if not db.execute("INSERT OR IGNORE INTO legacy_imports VALUES (?)", (path.name,)).rowcount:
+                    continue
+                info = path.lstat()
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise MarketError("Прежнее хранилище маркета должно быть обычным файлом")
+                with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=35)) as legacy:
+                    legacy.execute("BEGIN")
+                    for table, placeholders in (("catalog", "?,?"), ("versions", "?,?,?"),
+                                                ("active", "?,?,?,?"), ("installs", "?,?,?"),
+                                                ("candidates", "?,?,?,?,?,?,?,?,?")):
+                        db.executemany(f"INSERT OR IGNORE INTO {table} VALUES ({placeholders})",
+                                       legacy.execute(f"SELECT * FROM {table}"))
+                    db.executemany("INSERT INTO events(data) VALUES (?)",
+                                   legacy.execute("SELECT data FROM events ORDER BY seq"))
 
     @staticmethod
     def record(db, event: str, *, source: MarketSource | None, **data) -> dict:
@@ -219,6 +248,8 @@ class SkillMarket:
         return self.record(db, "market_update", source=source, status="pending", candidate_id=identifier, **change)
 
     def check(self, *, startup: bool = False) -> tuple[MarketSource | None, list[dict]]:
+        if startup and self.path is None:
+            return None, []
         with self.database() as db:
             db.execute("BEGIN IMMEDIATE")
             source = None

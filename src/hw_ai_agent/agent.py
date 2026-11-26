@@ -200,7 +200,9 @@ class CodingAgent:
         if self.runtime.skills is not None:
             directory = self.runtime.skills.directory
             metadata["skill_config"] = {"directory": str(directory) if directory is not None else None}
-        if self.runtime.market is not None:
+            if self.runtime.market is None:
+                metadata["project_skills"] = False
+        if self.runtime.market is not None and self.runtime.market.path is not None:
             metadata["market_config"] = str(self.runtime.market.path)
         if self.runtime.mcp is not None:
             metadata["mcp_config"] = {"path": str(self.runtime.mcp.path), "digest": self.runtime.mcp.config_digest}
@@ -220,6 +222,8 @@ class CodingAgent:
                 raise SessionError(f"Session {key} differs from current configuration; continuation was refused")
         if "skill_config" in metadata and metadata["skill_config"] != current["skill_config"]:
             raise SessionError("Session skill catalog configuration differs from current configuration")
+        if metadata.get("project_skills", True) != current.get("project_skills", True):
+            raise SessionError("Session project skill settings differ from current configuration")
         if metadata.get("market_config") != current.get("market_config"):
             raise SessionError("Session skill market configuration differs from current configuration")
         if metadata.get("mcp_config") != current.get("mcp_config"):

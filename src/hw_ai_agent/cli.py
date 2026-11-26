@@ -152,6 +152,8 @@ def show_market_event(event):
 
 
 def market_command(args) -> int:
+    if args.market_config is None and args.market_action in {"check", "search", "evaluate"}:
+        raise ConfigurationError(f"Для market {args.market_action} укажите --market-config")
     market = SkillMarket(args.market_config, args.state_db, args.workspace)
     if args.market_action == "events":
         for line in market.events():
@@ -331,10 +333,14 @@ def saved_runtime(state, db_path: Path, approvals=None, on_event=show_event, *,
         skills = open_skills(workspace, Path(directory) if directory is not None else None)
     market = None
     market_config = metadata.get("market_config")
-    if load_extensions and market_config is not None:
-        if skills is None or not isinstance(market_config, str) or not Path(market_config).is_absolute():
+    if load_extensions:
+        project_skills = metadata.get("project_skills", True)
+        if type(project_skills) is not bool or (market_config is not None and (
+                skills is None or not project_skills or not isinstance(market_config, str)
+                or not Path(market_config).is_absolute())):
             raise SessionError("Не удалось прочитать настройки маркета скиллов")
-        market = SkillMarket(Path(market_config), db_path, workspace)
+        if skills is not None and project_skills:
+            market = SkillMarket(Path(market_config) if market_config is not None else None, db_path, workspace)
     mcp = None
     mcp_config = metadata.get("mcp_config")
     if load_extensions and mcp_config is not None:
@@ -572,9 +578,13 @@ def starting_runtime(args, listener):
     market_config = getattr(args, "market_config", None)
     if market_config is not None and args.skills is False:
         raise ConfigurationError("Для --market-config нужен включённый каталог скиллов")
+    demo_only = getattr(args, "demo_skills_only", False)
+    if demo_only and (args.skills is False or args.skills_dir is not None or market_config is not None):
+        raise ConfigurationError("--demo-skills-only несовместим с --no-skills, --skills-dir и --market-config")
     return ToolRuntime(workspace, policy=load_policy(args.policy, workspace), mode=args.mode,
                        skills=open_skills(workspace, args.skills_dir) if args.skills is not False else None,
-                       market=SkillMarket(market_config, args.state_db, workspace) if market_config else None,
+                       market=SkillMarket(market_config, args.state_db, workspace)
+                       if args.skills is not False and not demo_only else None,
                        mcp=MCPRegistry(args.mcp_config, workspace) if args.mcp_config is not None else None,
                        trash_dir=args.state_db.expanduser().resolve().parent / "trash",
                        approve=partial(confirm_action, verbose=args.verbose) if args.approvals == "ask" else None,
@@ -747,7 +757,7 @@ def main() -> int:
     market = subparsers.add_parser("market", help=COMMAND_HELP["market"])
     market.add_argument("market_action", choices=("check", "search", "status", "events", "candidates", "evaluate"))
     market.add_argument("skill", nargs="?", help="Запрос для search или имя скилла для evaluate")
-    market.add_argument("--market-config", type=Path, required=True, help="Путь к JSON-конфигурации маркета")
+    market.add_argument("--market-config", type=Path, help="JSON-конфигурация источника для check, search и evaluate")
     market.add_argument("--workspace", type=Path, default=Path("workspace"))
     market.add_argument("--state-db", type=Path)
     market.add_argument("--env-file", type=Path, default=Path(".env"))
@@ -813,6 +823,8 @@ def main() -> int:
             command.add_argument("--skills", action=argparse.BooleanOptionalAction, default=None,
                                  help="Включить каталог скиллов (по умолчанию включён)")
             command.add_argument("--skills-dir", type=Path, help="Папка дополнительных SKILL.md вне рабочей папки")
+            command.add_argument("--demo-skills-only", action="store_true", default=None,
+                                 help="Включить только три встроенных демо-скилла")
             command.add_argument("--market-config", type=Path, help="JSON-конфигурация маркета вне рабочей папки")
             command.add_argument("--mcp-config", type=Path, help="JSON-конфигурация локальных MCP-серверов вне рабочей папки")
             if action == "chat":
@@ -898,7 +910,8 @@ def main() -> int:
         if getattr(args, "resume_chat", None) is not None:
             options = set(LAUNCH_OPTIONS) - {"state_db", "cost_estimate", "progress"}
             if any(getattr(args, name, None) is not None
-                   for name in options | {"provider", "model", "skills", "skills_dir", "mcp_config", "market_config"}):
+                   for name in options | {"provider", "model", "skills", "skills_dir", "demo_skills_only",
+                                          "mcp_config", "market_config"}):
                 raise ConfigurationError("Для продолжения диалога используются сохранённые настройки запуска")
             load_env(args.env_file)
             if args.state_db is None:

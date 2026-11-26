@@ -118,6 +118,75 @@ class SkillMarketTests(unittest.TestCase):
         self.assertEqual([r["version"] for r in self.market().installed()], ["1.1.0"])
         self.assertEqual(sum(e["event"] == "market_install" for e in self.events()), 1)
 
+    def test_imports_old_storage_and_shares_installed_skills_across_sources(self):
+        original = self.runtime()
+        original.prepare_skills()
+        original.execute("install_skill", {"name": WEEK})
+        document = original.execute("load_skill", {"name": WEEK})
+        original_events = self.events()
+        database = original.market.db_path
+        legacy = database.with_name("skill-market-0123456789abcdef01234567.sqlite3")
+        database.rename(legacy)
+
+        shared = SkillMarket(None, self.db_path, self.workspace)
+        self.assertEqual([row["name"] for row in shared.installed()], [WEEK])
+        self.assertEqual(shared.installed_by_run(original.market_run_id, original.market_offers[WEEK]).document,
+                         document)
+        self.assertEqual(self.events(), original_events)
+        self.assertTrue(legacy.is_file())
+
+        shutil.copyfile(self.source / "catalog-v2.json", self.source / "other-catalog.json")
+        other_config = self.source / "other-market.json"
+        other_config.write_text(json.dumps({"catalog": "other-catalog.json", "auto_update": True,
+                                            "require_eval": False}))
+        other_market = SkillMarket(other_config, self.db_path, self.workspace)
+        other = ToolRuntime(self.workspace, skills=SkillCatalog(self.workspace), market=other_market)
+        other.prepare_skills()
+        self.assertEqual(other.execute("load_skill", {"name": WEEK}), document)
+        self.assertEqual(set(other.market_offers), {NEXT})
+        self.assertEqual(other_market.installed()[0]["version"], "1.0.0")
+
+    def test_cli_chat_lists_project_skills_and_resumes_demo_mode(self):
+        runtime = self.runtime()
+        runtime.prepare_skills()
+        runtime.execute("install_skill", {"name": WEEK})
+        prompts = []
+        tool_sets = []
+
+        class Model:
+            def __init__(self, settings, **kwargs):
+                self.settings = settings
+                self.max_tokens = kwargs["max_tokens"]
+
+            def complete(self, messages, tools):
+                prompts.append(messages[0]["content"])
+                tool_sets.append({schema["function"]["name"] for schema in tools})
+                return {"content": "Готово."}
+
+        def invoke(*args):
+            argv = ["agi", *args, "--state-db", str(self.db_path), "--env-file", str(self.root / "missing.env")]
+            out, err = io.StringIO(), io.StringIO()
+            with patch.object(sys, "argv", argv), patch.object(cli, "OpenAICompatibleClient", Model), \
+                    patch("sys.stdin.isatty", return_value=True), patch("builtins.input", side_effect=["Привет", "/exit"]), \
+                    redirect_stdout(out), redirect_stderr(err):
+                self.assertEqual(cli.main(), 0, err.getvalue())
+            return out.getvalue()
+
+        self.assertEqual([row["name"] for row in json.loads(invoke("market", "status"))], [WEEK])
+        chat = ["chat", "--workspace", str(self.workspace), "--provider", "ollama", "--model", "demo"]
+        invoke(*chat, "--demo-skills-only")
+        with SessionStore(self.db_path) as store:
+            demo_conversation = store.db.execute("SELECT id FROM conversations").fetchone()["id"]
+        invoke(*chat)
+        invoke("chat", "--resume", demo_conversation)
+        self.assertNotIn(WEEK, prompts[0])
+        self.assertIn(WEEK, prompts[1])
+        self.assertNotIn(WEEK, prompts[2])
+        for demo_prompt in (prompts[0], prompts[2]):
+            for name in ("deadline-report", "open-task-export", "review-python-tests"):
+                self.assertIn(name, demo_prompt)
+        self.assertTrue(all("load_skill" in tools and "install_skill" not in tools for tools in tool_sets))
+
     def test_cli_resume_loads_installed_revision_after_another_run_updates_it(self):
         loaded_documents = {}
 
