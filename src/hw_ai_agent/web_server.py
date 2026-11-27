@@ -98,6 +98,8 @@ class Handler(BaseHTTPRequestHandler):
         app = self.server.app
         if path == "/api/new":
             return app.new_chat(provider=body.get("provider"), model=body.get("model"), folder=body.get("folder"))
+        if path == "/api/delete-chat":
+            return app.delete_chat(body["id"])
         if path == "/api/model":
             return app.save_model(body)
         if path == "/api/send":

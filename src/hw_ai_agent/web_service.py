@@ -20,7 +20,7 @@ from .eval_cases import CASES
 from .eval_runner import Options, read_json, run_evaluation, save_json
 from .filesystem import create_chat_folder
 from .mcp import MCPRegistry
-from .session import SessionStore
+from .session import SessionBusyError, SessionStore
 from .session_doctor import stats_snapshot
 from .skill_market import SkillMarket
 from .skill_updates import evaluate_candidate
@@ -274,6 +274,18 @@ class WebService:
                 WHERE conversation_id=c.id ORDER BY number LIMIT 1) AS title FROM conversations c
                 ORDER BY c.rowid DESC""")
             return [dict(r) for r in rows]
+
+    def delete_chat(self, identifier):
+        SessionStore.validate_id(identifier)
+        with self.lock:
+            if self.job_state(identifier)["running"]:
+                raise ValueError("Дождитесь завершения запроса перед удалением чата")
+            try:
+                with SessionStore(self.db) as store:
+                    Conversation(store, identifier).delete()
+            except SessionBusyError:
+                raise ValueError("Этот чат сейчас открыт для работы в другом процессе") from None
+            self.jobs.pop(identifier, None)
 
     def job_state(self, key):
         with self.lock:

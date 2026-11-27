@@ -55,6 +55,29 @@
   --ok:#28674c;
 }
 
+:root[data-theme=fjord] {
+  color-scheme:dark;
+  --bg:#102327; --side:#0b1c20; --surface:#172e32; --line:#365459;
+  --ink:#e0f4f0; --muted:#a3c2c0; --accent:#85dcc9; --on:#102b29;
+  --bubble:#244b4f; --bubble-text:#e7faf5; --soft:#23423e;
+  --warn:#ffd295; --tint:#3a3023; --ok:#91d8ac;
+}
+
+:root[data-theme=lilac] {
+  --bg:#faf7fc; --side:#f0e9f5; --surface:#fffcff; --line:#ded4e6;
+  --ink:#34273e; --muted:#6f5c78; --accent:#78508f; --on:#fff;
+  --bubble:#eadcf2; --bubble-text:#463053; --soft:#eadff1;
+  --warn:#78521c; --tint:#fbf1df; --ok:#387251;
+}
+
+:root[data-theme=ember] {
+  color-scheme:dark;
+  --bg:#241e1d; --side:#1b1616; --surface:#302725; --line:#54413b;
+  --ink:#fff0e4; --muted:#ceb3a4; --accent:#ffb18e; --on:#391f16;
+  --bubble:#57352c; --bubble-text:#fff0e4; --soft:#49332c;
+  --warn:#f8d68e; --tint:#413423; --ok:#b2d2a5;
+}
+
 * {
   box-sizing:border-box;
 }
@@ -805,7 +828,7 @@ td,th {
   max-width:100%;
 }
 
-#folderDialog {
+#folderDialog,#deleteDialog {
   width:min(430px,95vw);
   max-height:85dvh;
   color:var(--ink);
@@ -815,9 +838,28 @@ td,th {
   padding:20px;
 }
 
-#folderDialog::backdrop {
+#folderDialog::backdrop,#deleteDialog::backdrop {
   background:#12151a66;
 }
+
+#deleteChat {
+  margin-left:auto;
+  order:1;
+  padding:4px 8px;
+  font-size:12px;
+  color:var(--muted);
+}
+
+#deleteName {
+  margin:10px 0;
+  font-weight:600;
+  overflow-wrap:anywhere;
+}
+
+#deleteDescription,#deleteError { font-size:14px; }
+#deleteError { color:var(--warn); margin-top:8px; }
+#confirmDelete { background:#9b3546; color:white; border-color:#9b3546; }
+#deleteDialog .buttons { justify-content:flex-end; margin-top:16px; }
 
 #folderLocation {
   color:var(--muted);

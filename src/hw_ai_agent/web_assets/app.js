@@ -351,6 +351,8 @@ function renderChat() {
   $("workspacePath").textContent = chat?.workspace || "";
   $("workspacePath").title = chat?.workspace || "";
   $("newModelPicker").hidden = Boolean(id);
+  $("deleteChat").hidden = !id;
+  $("deleteChat").disabled = submitBusy || !chat || chat.running;
   const pending = chat?.approval;
   const openStats = new Set([...$("messages").querySelectorAll(".turnStats[open]")].map(el => el.dataset.turn));
   $("messages").innerHTML = turns.length ? turns.map(t => exchangeHtml(t, openStats)).join("") :
@@ -713,6 +715,34 @@ $("messages").addEventListener("click", guard(async event => {
     control.title = control.ariaLabel = "Копировать ответ";
   }, 1600);
 }));
+$("deleteChat").onclick = () => {
+  if (!id || !chat || submitBusy || chat.running) return;
+  $("deleteDialog").dataset.chat = id;
+  $("deleteName").textContent = $("title").textContent;
+  $("deleteError").hidden = true;
+  $("deleteDialog").showModal();
+};
+$("cancelDelete").onclick = () => $("deleteDialog").close();
+$("deleteDialog").oncancel = event => {
+  if ($("confirmDelete").disabled) event.preventDefault();
+};
+$("confirmDelete").onclick = guard(async () => {
+  const target = $("deleteDialog").dataset.chat;
+  $("confirmDelete").disabled = $("cancelDelete").disabled = true;
+  try {
+    await api("delete-chat", {id: target});
+  } catch (error) {
+    $("deleteError").textContent = error.message;
+    $("deleteError").hidden = false;
+    return;
+  } finally {
+    $("confirmDelete").disabled = $("cancelDelete").disabled = false;
+  }
+  $("deleteDialog").close();
+  if (id === target) await act("new", "");
+  else await listSessions();
+  notice("Чат удалён.");
+});
 $("new").onclick = guard(() => act("new", ""));
 $("filter").onchange = renderEvents;
 $("compose").onsubmit = guard(async e => {

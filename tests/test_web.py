@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent_fixtures import tool_call
+from hw_ai_agent.session import SessionStore
 from hw_ai_agent.web_server import Handler
 from hw_ai_agent.web_service import WebService
 
@@ -160,6 +161,7 @@ class WebTests(unittest.TestCase):
                 state = self.wait(identifier, lambda d: d["approval"])
                 self.assertFalse((self.workspace / "report.md").exists())
                 self.assertEqual(state["approval"]["target"], "report.md")
+                self.assertEqual(self.http("/api/delete-chat", {"id": identifier})[0], 400)
                 state_key = {"id":identifier, "request":state["approval"]["id"], "allow":allow}
                 self.api("decision", state_key)
                 self.assertEqual(self.http("/api/decision", state_key)[0], 400)
@@ -173,6 +175,34 @@ class WebTests(unittest.TestCase):
             self.assertEqual(state["stats"]["mcp_calls"]["tracker/list_tasks"], 2)
             self.assertEqual(self.api("sessions")[0]["id"], identifier)
             self.assertNotIn("review-python-tests", history[0][0]["content"])
+
+    def test_deleting_chat_preserves_shared_workspace_and_other_history(self):
+        self.api("settings", self.profile)
+        first = self.api("new", {})
+        other = self.api("new", {"folder": first[:8]})
+        report = self.workspace / first[:8] / "report.md"
+        report.write_text("Сохранённый отчёт")
+        with patch("hw_ai_agent.client.OpenAICompatibleClient.complete",
+                   return_value={"role": "assistant", "content": "Готово"}):
+            for identifier in (first, other):
+                self.api("send", {"id": identifier, "prompt": "Проверка"})
+                state = self.wait(identifier, lambda data: not data["running"])
+                self.assertFalse(state["error"])
+                if identifier == first:
+                    run_id = state["turns"][0]["id"]
+        with SessionStore(self.app.db) as store:
+            for key in (first, run_id):
+                with store.lock(key):
+                    self.assertEqual(self.http("/api/delete-chat", {"id": first})[0], 400)
+            self.assertEqual(len(self.api("sessions")), 2)
+            for _ in range(2):
+                self.api("delete-chat", {"id": first})
+            self.assertFalse(store.db.execute("SELECT 1 FROM sessions WHERE id=?", (run_id,)).fetchone())
+            self.assertFalse(store.db.execute("PRAGMA foreign_key_check").fetchall())
+        self.assertEqual([r["id"] for r in self.api("sessions")], [other])
+        self.assertEqual(self.http("/api/chat?id=" + first)[0], 400)
+        self.assertEqual(self.api("chat?id=" + other)["turns"][0]["answer"], "Готово")
+        self.assertEqual(report.read_text(), "Сохранённый отчёт")
 
     def test_evaluation_actions_and_update_rollback(self):
         self.api("settings", {**self.profile, "source":"demo"})
