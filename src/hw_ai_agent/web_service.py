@@ -26,7 +26,6 @@ from .skill_market import SkillMarket
 from .skill_updates import evaluate_candidate
 from .skills import SKILL_NAME, SkillCatalog
 
-
 CHAT_MODELS = {
     "openrouter": [
         ("nvidia/nemotron-3-ultra-550b-a55b:free", "NVIDIA Nemotron 3 Ultra (Free)"),
@@ -101,7 +100,15 @@ class WebService:
         self.prefs = read_json(self.prefs_file) if self.prefs_file.exists() else {
             "provider": os.getenv("AGENT_PROVIDER", "openrouter"), "model": "",
             "mcp": "mcp/tracker.json" if Path("mcp/tracker.json").is_file() else "",
-            "source": "", "sources": {}, "disabled": [], "demo": False,
+            "source": "anthropic",
+            "sources": {
+                "anthropic": {
+                    "check_on_start": True,
+                    "auto_update": True,
+                }
+            },
+            "disabled": [],
+            "demo": False,
         }
 
     def scrub(self, value):
@@ -225,7 +232,8 @@ class WebService:
             available = market.installed()
             builtin = SkillCatalog(self.workspace, Path(p["skills_dir"]) if p.get("skills_dir") else None)
             return {**p, "workspace": str(self.workspace), "policy": str(self.policy or "default"),
-                    "skills": [dict(name=s.name, description=s.description, origin="Встроенный" if s.name in builtin.builtin_names else "Из папки")
+                    "skills": [dict(name=s.name, description=s.description,
+                                    origin="Встроенный" if s.name in builtin.builtin_names else "Из папки")
                                for s in builtin.skills.values()] +
                               [dict(name=s["name"], description=s["version"], origin="Установлен") for s in available],
                     "offers": [asdict(o) for o in market.search(market.config().source, "")] if market.path else [],
@@ -234,12 +242,13 @@ class WebService:
 
     def args(self, p):
         args = SimpleNamespace(action="chat", workspace=self.workspace, state_db=self.db, policy=self.policy, mode=None,
-            provider=p["provider"], model=p["model"] or None, skills=True,
-            skills_dir=Path(p["skills_dir"]) if p.get("skills_dir") and not p["demo"] else None,
-            demo_skills_only=p["demo"], market_config=None if p["demo"] else self.market(p).path,
-            mcp_config=Path(p["mcp"]) if p["mcp"] else None, approvals=None, verbose=False,
-            max_rounds=None, max_tokens=None, max_tool_calls=None, max_side_effects=None, max_result_bytes=None,
-            plan=None, tasks=None, cost_estimate=None)
+                               provider=p["provider"], model=p["model"] or None, skills=True,
+                               skills_dir=Path(p["skills_dir"]) if p.get("skills_dir") and not p["demo"] else None,
+                               demo_skills_only=p["demo"], market_config=None if p["demo"] else self.market(p).path,
+                               mcp_config=Path(p["mcp"]) if p["mcp"] else None, approvals=None, verbose=False,
+                               max_rounds=None, max_tokens=None, max_tool_calls=None, max_side_effects=None,
+                               max_result_bytes=None,
+                               plan=None, tasks=None, cost_estimate=None)
         apply_launch_defaults(args)
         return args
 
@@ -273,8 +282,9 @@ class WebService:
         with SessionStore(self.db) as store:
             agent = cli.new_agent(args, store, runtime, None, limits, chat=True)
             chat = Conversation.create(store, {"binding": agent.binding(), "budget": limits.as_dict(),
-                "cost_estimate": args.cost_estimate, "context_window": getattr(agent.client, "context_window", None)},
-                identifier=identifier)
+                                               "cost_estimate": args.cost_estimate,
+                                               "context_window": getattr(agent.client, "context_window", None)},
+                                       identifier=identifier)
             return chat.id
 
     def sessions(self):
@@ -317,6 +327,7 @@ class WebService:
                 with job.condition:
                     job.running = False
                     job.pending = None
+
         threading.Thread(target=work, daemon=True).start()
 
     def send(self, identifier, prompt, resume=False):
@@ -324,6 +335,7 @@ class WebService:
         prompt = self.scrub(prompt.strip())
         if not resume and not 0 < len(prompt) <= 32_000:
             raise ValueError("Введите сообщение длиной до 32 000 символов")
+
         def turn(job):
             with SessionStore(self.db) as store, store.lock(identifier):
                 store.log_credentials.update(os.environ[key] for _, key, _ in PROVIDERS.values() if os.getenv(key))
@@ -334,7 +346,7 @@ class WebService:
                 if config["binding"].get("approvals", "ask") == "ask":
                     agent.runtime.approve = lambda request: job.ask(asdict(request))
                 agent.approve_plan = lambda plan: job.ask({"tool": "plan", "target": "План действий",
-                                                            "preview": json.dumps(plan, ensure_ascii=False, indent=2)})
+                                                           "preview": json.dumps(plan, ensure_ascii=False, indent=2)})
                 agent.resolve_uncertain = agent.attribute_changes = None
                 turns = chat.turns()
                 pending = chat.pending(turns)
@@ -346,12 +358,14 @@ class WebService:
                     raise ValueError("Нет незавершённого запроса")
                 else:
                     agent.run(prompt, history=chat.history(turns), conversation_id=identifier)
+
         self.start(identifier, turn, prompt=prompt)
 
     def chat(self, identifier):
         with SessionStore(self.db, read_only=True) as store:
             chat = Conversation(store, identifier)
-            row = store.db.execute("SELECT configuration, ended FROM conversations WHERE id=?", (identifier,)).fetchone()
+            row = store.db.execute("SELECT configuration, ended FROM conversations WHERE id=?",
+                                   (identifier,)).fetchone()
             if not row:
                 raise ValueError("Нет такого диалога")
             turns = chat.turns()
@@ -365,7 +379,8 @@ class WebService:
                                  "id": turn.state.id, "stats": stats_snapshot(run)})
             binding = json.loads(row["configuration"])["binding"]
             return {"turns": messages, "events": list(store.event_records(identifier)), "stats": stats_snapshot(total),
-                    "model": binding["model"], "workspace": binding.get("workspace"), "ended": bool(row["ended"]), "pending": bool(chat.pending(turns)),
+                    "model": binding["model"], "workspace": binding.get("workspace"), "ended": bool(row["ended"]),
+                    "pending": bool(chat.pending(turns)),
                     **self.job_state(identifier)}
 
     def catalog_action(self, action, name=""):
@@ -403,7 +418,8 @@ class WebService:
         path = self.reports().get(key)
         if path is None:
             raise ValueError("Серия не найдена")
-        rows = [json.loads(line) for line in (path / "results.jsonl").read_text().splitlines()] if (path / "results.jsonl").exists() else []
+        rows = [json.loads(line) for line in (path / "results.jsonl").read_text().splitlines()] if (
+                    path / "results.jsonl").exists() else []
         if run:
             row = next((r for r in rows if r["run_id"] == run), None)
             if not row:
@@ -427,6 +443,7 @@ class WebService:
             output = self.reports()[series]
         else:
             output = self.home / "evals" / uuid.uuid4().hex[:12]
+
         def work(job):
             if candidate:
                 status, _ = evaluate_candidate(market, candidate, settings, Options(),
@@ -435,5 +452,6 @@ class WebService:
                 status = run_evaluation(output, settings, Options())
             if status:
                 raise ValueError("Серия прервана. Повторите запуск для продолжения")
+
         self.start("eval", work)
         return None if candidate else "ab/" + output.name
