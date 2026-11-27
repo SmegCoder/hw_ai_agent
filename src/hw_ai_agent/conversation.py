@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections import Counter
+from contextlib import ExitStack
 from dataclasses import dataclass
 
 from .agent import AgentError
@@ -157,12 +158,27 @@ class Conversation:
             print("Введите номер из списка.")
 
     @classmethod
-    def create(cls, store, configuration: dict) -> Conversation:
-        identifier = uuid.uuid4().hex
+    def create(cls, store, configuration: dict, *, identifier: str | None = None) -> Conversation:
+        identifier = identifier or uuid.uuid4().hex
         with store.transaction():
             store.db.execute("INSERT INTO conversations (id, configuration) VALUES (?, ?)",
                              (identifier, encoded(configuration)))
         return cls(store, identifier)
+
+    def delete(self) -> None:
+        with self.store.lock(self.id), ExitStack() as locks, self.store.transaction():
+            db = self.store.db
+            runs = db.execute("SELECT session_id FROM conversation_turns WHERE conversation_id=?",
+                              (self.id,)).fetchall()
+            for run in runs:
+                locks.enter_context(self.store.lock(run["session_id"]))
+            # Remove children before their parents. Journal blobs can be shared by other runs.
+            for table in ("call_tasks", "call_budgets", "tasks", "calls", "plans", "budgets",
+                          "journal_actions", "journal_entries", "journal_images", "journals"):
+                db.executemany(f"DELETE FROM {table} WHERE session_id=?", runs)
+            db.execute("DELETE FROM conversation_turns WHERE conversation_id=?", (self.id,))
+            db.executemany("DELETE FROM sessions WHERE id=?", runs)
+            db.execute("DELETE FROM conversations WHERE id=?", (self.id,))
 
     def configuration(self) -> dict:
         row = self.store.db.execute("SELECT configuration, ended FROM conversations WHERE id=?", (self.id,)).fetchone()

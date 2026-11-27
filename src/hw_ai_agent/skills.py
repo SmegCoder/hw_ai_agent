@@ -75,9 +75,10 @@ class SkillCatalog:
                 raise SkillError("--skills-dir must be outside the workspace")
         self.skills: dict[str, Skill] = {}
         self.errors: list[tuple[str, str]] = []
-        for root in (BUILTIN_SKILLS, self.directory):
-            if root is not None:
-                self._discover(root)
+        self._discover(BUILTIN_SKILLS)
+        self.builtin_names = frozenset(self.skills)
+        if self.directory is not None:
+            self._discover(self.directory)
 
     def _discover(self, root: Path) -> None:
         try:

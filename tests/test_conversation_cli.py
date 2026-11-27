@@ -654,6 +654,14 @@ Brand styling guidelines.
             self.assertEqual({Path(session["workspace"]).name for session in store.list_sessions()},
                              {"2026-11-24", "2026-11-24-2"})
 
+    def test_enter_creates_short_workspace_for_new_chat(self):
+        with chdir(self.root):
+            code, out, err = self.invoke("chat", "--model", "test/model", inputs=("", "/exit"))
+        self.assertEqual(code, 0, err)
+        self.assertRegex(out, r"Создана папка · workspace/[0-9a-f]{8}\b")
+        name = out.split("Создана папка · workspace/", 1)[1].splitlines()[0]
+        self.assertTrue((self.workspace / name).is_dir())
+
     def test_chat_can_create_a_named_workspace_and_reopen_it_without_menu(self):
         (self.workspace / "wok").mkdir()
         with chdir(self.root):

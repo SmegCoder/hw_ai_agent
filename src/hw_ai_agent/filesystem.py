@@ -10,6 +10,17 @@ from pathlib import Path
 from .text import json_text
 
 
+def create_chat_folder(root: Path) -> tuple[str, Path]:
+    while True:
+        identifier = uuid.uuid4().hex
+        folder = root / identifier[:8]
+        try:
+            folder.mkdir(mode=0o700)
+        except FileExistsError:
+            continue
+        return identifier, folder
+
+
 class TargetChangedError(OSError):
     pass
 
