@@ -12,11 +12,12 @@
 из ветки `main`. Для проверки нужны Git и доступ к GitHub. Поиск работает без
 ключа Anthropic и без модели.
 
-Из корня проекта выполните поиск, затем откройте чат с тем же источником.
+Anthropic подключён по умолчанию. Для явного выбора можно указать
+`--market-config anthropic`.
 
 ```bash
-agi market search 'brand guidelines' --market-config examples/skill-market/anthropic.json
-agi chat --market-config examples/skill-market/anthropic.json
+agi market search 'brand guidelines'
+agi chat
 ```
 
 Попросите «Используй `brand-guidelines` и опиши цвета и шрифты для слайда».
@@ -32,10 +33,12 @@ agi chat --market-config examples/skill-market/anthropic.json
 `agi market events`. Версия карточки определяется содержимым. Изменения в
 других файлах репозитория не создают её новую версию.
 
-В [готовой конфигурации](../examples/skill-market/anthropic.json) `market check`
-и `market search` обновляют сохранённый каталог, а чат использует его без
-запроса к GitHub на каждое сообщение. Установите `check_on_start: true`, чтобы
-проверять каталог перед каждым новым запросом. При сбое GitHub сохранённые
+Встроенная конфигурация загружает каталог при первом запросе и повторно
+использует сохранённые предложения. `agi market check` и `agi market search`
+обновляют каталог. Чтобы настроить частоту проверок, возьмите
+[пример JSON-конфигурации](../examples/skill-market/anthropic.json) и передайте
+её путь через `--market-config`. При `check_on_start: true` эта конфигурация
+проверяет каталог перед каждым новым запросом. При сбое GitHub сохранённые
 предложения и установленные карточки остаются доступны агенту.
 Обновление установленной карточки попадает в `market candidates` и проходит
 [A/B-проверку перед активацией](skill-update.md).

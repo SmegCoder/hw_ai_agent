@@ -21,6 +21,7 @@ MAX_CATALOG_BYTES = 128 * 1024
 DIGEST = re.compile(r"[0-9a-f]{64}")
 VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,63}")
 LEGACY_DATABASE = re.compile(r"skill-market-[0-9a-f]{24}\.sqlite3")
+ANTHROPIC_MARKET = "anthropic"
 MarketSource = Path | str
 
 
@@ -38,9 +39,18 @@ def read_bytes(root: Path, file: Path, limit: int) -> bytes:
 
 def read_json(file: Path, limit: int) -> dict:
     try:
-        data = json.loads(read_bytes(Path(file.anchor), file, limit))
-    except (OSError, UnicodeError, ValueError, RecursionError):
-        raise MarketError(f"Невозможно прочитать JSON · {file.name}") from None
+        file.stat()
+        raw = read_bytes(Path(file.anchor), file, limit)
+    except FileNotFoundError:
+        raise MarketError(f"Файл JSON не найден · {file.name}") from None
+    except OSError:
+        raise MarketError(f"Не удалось открыть файл JSON · {file.name}") from None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise MarketError(f"Некорректный JSON · {file.name}, строка {exc.lineno}, столбец {exc.colno}") from None
+    except (ValueError, RecursionError):
+        raise MarketError(f"Некорректный JSON · {file.name}") from None
     if not isinstance(data, dict):
         raise MarketError(f"Ожидается объект JSON · {file.name}")
     return data
@@ -86,8 +96,9 @@ class CatalogSnapshot:
 
 
 class SkillMarket:
-    def __init__(self, config: Path | None, state_db: Path, workspace: Path):
-        self.path = config.expanduser().resolve() if config is not None else None
+    def __init__(self, config: Path | str | None, state_db: Path, workspace: Path):
+        self.path = config.expanduser().resolve() if isinstance(config, Path) else None
+        self.reference = str(self.path) if self.path is not None else config
         self.workspace = workspace.expanduser().resolve()
         self.db_path = state_db.expanduser().resolve().parent / "skill-market.sqlite3"
         if self.path is not None:
@@ -99,6 +110,8 @@ class SkillMarket:
             raise MarketError("Конфигурация, каталог, пакеты и состояние маркета хранятся вне рабочей папки")
 
     def config(self) -> MarketConfig:
+        if self.reference == ANTHROPIC_MARKET:
+            return MarketConfig(ANTHROPIC_REPOSITORY, check_on_start=True, auto_update=True, require_eval=True)
         if self.path is None:
             raise MarketError("Укажите --market-config для работы с источником маркета")
         raw = read_json(self.path, 8192)
@@ -110,7 +123,7 @@ class SkillMarket:
         if any(type(value) is not bool for value in (check, update, gate)):
             raise MarketError("check_on_start, auto_update и require_eval должны быть true или false")
         if "marketplace" in raw:
-            if raw["marketplace"] != "anthropic":
+            if raw["marketplace"] != ANTHROPIC_MARKET:
                 raise MarketError('Поддерживаемый публичный marketplace: "anthropic"')
             return MarketConfig(ANTHROPIC_REPOSITORY, check, update, gate)
         catalog = raw["catalog"]
@@ -248,7 +261,7 @@ class SkillMarket:
         return self.record(db, "market_update", source=source, status="pending", candidate_id=identifier, **change)
 
     def check(self, *, startup: bool = False) -> tuple[MarketSource | None, list[dict]]:
-        if startup and self.path is None:
+        if startup and self.reference is None:
             return None, []
         with self.database() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -257,6 +270,8 @@ class SkillMarket:
                 config = self.config()
                 source = config.source
                 if startup and not config.check_on_start:
+                    return source, []
+                if startup and self.reference == ANTHROPIC_MARKET and self.catalog(db, source):
                     return source, []
                 snapshot = self.read_catalog(source)
             except MarketError as exc:
