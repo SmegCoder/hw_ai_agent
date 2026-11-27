@@ -70,6 +70,21 @@ class WebTests(unittest.TestCase):
         self.assertEqual(restored.prefs["disabled"], ["review-python-tests"])
         self.assertEqual(self.api("mcp")["tools"][0]["function"]["name"], "mcp__tracker__list_tasks")
 
+    def test_model_choice_is_bound_only_to_new_chat(self):
+        self.api("settings", self.profile)
+        default_id = self.api("new", {})
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-web-key"}), \
+                patch("hw_ai_agent.cli.configure_client", side_effect=lambda client, *args: client):
+            chosen = self.api("new", {"provider":"openrouter", "model":"deepseek/deepseek-v4.1-flash"})
+        restarted = WebService(self.app.db, self.workspace)
+        self.assertEqual(restarted.chat(chosen)["model"], "deepseek/deepseek-v4.1-flash")
+        self.assertEqual(restarted.chat(default_id)["model"], self.profile["model"])
+        self.assertEqual(restarted.prefs["provider"], self.profile["provider"])
+        self.assertEqual(self.api("chat?id="+self.api("new", {}))["model"], self.profile["model"])
+        before = self.api("sessions")
+        self.assertEqual(self.http("/api/new", {"model":"invalid"})[0], 400)
+        self.assertEqual(self.api("sessions"), before)
+
     def test_dialogue_tool_policy_history_and_doctor(self):
         self.api("settings", self.profile)
         responses = []

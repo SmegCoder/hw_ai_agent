@@ -170,9 +170,14 @@ class WebService:
         apply_launch_defaults(args)
         return args
 
-    def new_chat(self):
+    def new_chat(self, *, provider=None, model=None):
         with self.lock:
             p = self.prefs.copy()
+        if provider is not None or model is not None:
+            if (not isinstance(provider, str) or provider not in PROVIDERS or not isinstance(model, str)
+                    or not re.fullmatch(r"[\w./:+@-]{1,180}", model)):
+                raise ValueError("Проверьте провайдера и ID модели для нового диалога")
+            p.update(provider=provider, model=model)
         args = self.args(p)
         runtime = cli.starting_runtime(args, None)
         runtime.disable_skills(p["disabled"])

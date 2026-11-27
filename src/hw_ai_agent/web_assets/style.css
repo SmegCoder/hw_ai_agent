@@ -113,7 +113,9 @@ button:disabled {
   background:var(--side);
   padding:26px 17px 18px;
   border-right:1px solid var(--line);
+  min-width:0;
   min-height:0;
+  overflow-y:auto;
 }
 
 .brand {
@@ -177,10 +179,39 @@ small {
   font-weight:650;
 }
 
+.sidebar > :not(#sessions) {
+  flex-shrink:0;
+}
+
 #sessions {
-  overflow:auto;
-  align-content:start;
-  min-height:35px;
+  display:flex;
+  flex-direction:column;
+  flex:1 1 0;
+  min-height:42px;
+  min-width:0;
+  overflow-y:auto;
+  overflow-x:hidden;
+}
+
+#sessions > button {
+  flex:none;
+  min-width:0;
+  min-height:38px;
+}
+
+#newModelPicker {
+  display:flex;
+  flex-wrap:wrap;
+  align-items:center;
+  gap:8px;
+  margin:0 0 10px;
+  font-size:13px;
+  color:var(--muted);
+}
+
+#newModel {
+  min-width:0;
+  color:var(--ink);
 }
 
 .sections {
@@ -655,6 +686,8 @@ td,th {
     display:flex;
   }
   .sidebar #sessions {
+    flex:0 0 100%;
+    flex-direction:row;
     max-width:100%;
     overflow:auto;
     order:4;
@@ -662,6 +695,7 @@ td,th {
     min-height:0;
   }
   .sidebar nav button {
+    max-width:100%;
     width:auto;
     flex-shrink:0;
   }

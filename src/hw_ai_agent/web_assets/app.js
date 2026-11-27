@@ -61,6 +61,9 @@ async function api(action, data = null, query = {}) {
 }
 async function listSessions() {
   sessions = await api("sessions");
+  renderSessions();
+}
+function renderSessions() {
   $("sessions").innerHTML =
       sessions.map(s => button("session", s.title || "Новый диалог", s.id, s.id === id ? "active" : ""))
           .join("") ||
@@ -128,6 +131,7 @@ function renderChat() {
       $("conversation").scrollHeight - $("conversation").scrollTop - $("conversation").clientHeight < 45;
   $("title").textContent = turns.length ? turns[0].prompt.slice(0, 75) : "Новый диалог";
   $("model").textContent = chat?.model || "";
+  $("newModelPicker").hidden = Boolean(id);
   const pending = chat?.approval;
   $("messages").innerHTML = turns.length ?
       turns
@@ -359,7 +363,9 @@ async function submit() {
   $("send").disabled = true;
   try {
     if (!id) {
-      id = await api("new", {});
+      const selected = $("newModel").selectedOptions[0];
+      const choice = selected.value ? {provider: selected.dataset.provider, model: selected.value} : {};
+      id = await api("new", choice);
       localStorage.setItem("agi.chat", id);
     }
     await api("send", {id, prompt});
@@ -374,7 +380,9 @@ async function submit() {
 async function act(action, v) {
   notice();
   if (action === "session" || action === "new") {
+    if (submitBusy) return;
     id = action === "session" ? v : "";
+    if (!id) $("newModel").value = "";
     chat = null;
     localStorage.setItem("agi.chat", id);
     $("prompt").value = "";
@@ -508,7 +516,7 @@ async function refresh() {
     await listSessions();
     const saved = localStorage.getItem("agi.chat");
     if (sessions.some(s => s.id === saved)) id = saved;
-    await listSessions();
+    renderSessions();
     await show("chat");
     setInterval(refresh, 1100);
   } catch (e) {

@@ -15,6 +15,25 @@
 <section id="chatPage" class="chatGrid">
   <div class="chat"><div class="heading"><small id="model"></small><h1 id="title">Новый диалог</h1></div>
   <div id="conversation" class="scroll"><div id="messages"></div><div id="approval"></div><div id="runStatus" role="status"></div></div>
+  <label id="newModelPicker" hidden>Модель для нового чата
+    <select id="newModel">
+      <option value="">Из настроек агента</option>
+      <optgroup label="OpenRouter">
+        <option value="deepseek/deepseek-v4.1-flash" data-provider="openrouter">DeepSeek V4.1 Flash</option>
+        <option value="deepseek/deepseek-v3.2" data-provider="openrouter">DeepSeek V3.2</option>
+        <option value="openai/gpt-4.1-mini" data-provider="openrouter">GPT-4.1 mini</option>
+        <option value="anthropic/claude-sonnet-4.6" data-provider="openrouter">Claude Sonnet 4.6</option>
+        <option value="qwen/qwen3-coder" data-provider="openrouter">Qwen3 Coder</option>
+      </optgroup>
+      <optgroup label="OpenAI">
+        <option value="gpt-4.1-mini" data-provider="openai">GPT-4.1 mini · OpenAI</option>
+      </optgroup>
+      <optgroup label="Ollama">
+        <option value="qwen3:4b" data-provider="ollama">Qwen3 4B · локально</option>
+        <option value="qwen3:4b-instruct" data-provider="ollama">Qwen3 4B Instruct · локально</option>
+      </optgroup>
+    </select>
+  </label>
   <form id="compose"><textarea id="prompt" rows="2" placeholder="Сообщение агенту…" aria-label="Сообщение агенту" required maxlength="32000"></textarea><button class="primary" id="send" title="Отправить" aria-label="Отправить">↑</button></form>
   </div>
   <aside class="inspector"><div class="headRow"><h2>События</h2><span id="eventCount" class="chip">0</span></div><details class="scope"><summary>Фильтр событий</summary><select id="filter"><option value="">Все события</option><option value="skill">Скиллы</option><option value="mcp">MCP</option><option value="error">Ошибки и отказы</option></select></details>

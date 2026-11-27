@@ -93,7 +93,7 @@ class Handler(BaseHTTPRequestHandler):
     def mutate(self, path, body):
         app = self.server.app
         if path == "/api/new":
-            return app.new_chat()
+            return app.new_chat(provider=body.get("provider"), model=body.get("model"))
         if path == "/api/send":
             return app.send(body["id"], body["prompt"], body.get("resume") is True)
         if path == "/api/decision":
