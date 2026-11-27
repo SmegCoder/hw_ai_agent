@@ -445,6 +445,11 @@ class SkillMarket:
                         new_version=row["old_version"], new_sha256=row["old_sha256"])
             return row["old_version"]
 
+    def recent_events(self, limit: int) -> list[dict]:
+        with self.database() as db:
+            rows = db.execute("SELECT data FROM events ORDER BY seq DESC LIMIT ?", (limit,)).fetchall()
+            return [json.loads(row["data"]) for row in reversed(rows)]
+
     def events(self):
         with self.database() as db:
             for row in db.execute("SELECT data FROM events ORDER BY seq"):

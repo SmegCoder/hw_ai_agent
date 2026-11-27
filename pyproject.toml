@@ -18,5 +18,5 @@ hw-ai-agent = "hw_ai_agent.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-hw_ai_agent = ["skill_cards/*/SKILL.md"]
+hw_ai_agent = ["skill_cards/*/SKILL.md", "web_assets/*"]
 

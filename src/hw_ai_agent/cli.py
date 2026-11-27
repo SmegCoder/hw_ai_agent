@@ -348,11 +348,13 @@ def saved_runtime(state, db_path: Path, approvals=None, on_event=show_event, *,
                 or not Path(mcp_config["path"]).is_absolute() or not isinstance(mcp_config.get("digest"), str)):
             raise SessionError("Не удалось прочитать настройки MCP")
         mcp = MCPRegistry(Path(mcp_config["path"]), workspace, expected_digest=mcp_config["digest"])
-    return ToolRuntime(workspace, policy=policy, mode=metadata.get("execution_mode", "safe"),
+    runtime = ToolRuntime(workspace, policy=policy, mode=metadata.get("execution_mode", "safe"),
                        skills=skills, market=market, mcp=mcp,
                        trash_dir=metadata.get("trash_dir", str(db_path.resolve().parent / "trash")),
                        approve=partial(confirm_action, verbose=verbose) if mode == "ask" else None,
                        on_policy_event=on_event, **limits)
+    runtime.disable_skills(metadata.get("disabled_skills", ()))
+    return runtime
 
 def verify_applied(runtime, item):
     try:
@@ -739,6 +741,12 @@ def main() -> int:
     parser = HelpParser(prog="agi", usage="agi КОМАНДА [ПАРАМЕТРЫ]", description="Агент для работы с кодом",
                         epilog=project_guide())
     subparsers = parser.add_subparsers(dest="action", required=True)
+    web = subparsers.add_parser("web", help=COMMAND_HELP["web"], description=COMMAND_HELP["web"])
+    web.add_argument("--port", type=int, default=8765)
+    web.add_argument("--workspace", type=Path)
+    web.add_argument("--state-db", type=Path)
+    web.add_argument("--env-file", type=Path, default=Path(".env"))
+    web.add_argument("--policy", type=Path)
     help_command = subparsers.add_parser("help", help=COMMAND_HELP["help"], description=COMMAND_HELP["help"])
     help_command.add_argument("command", nargs="?", choices=list(COMMAND_HELP))
     eval_command = subparsers.add_parser("eval", help=COMMAND_HELP["eval"], description=COMMAND_HELP["eval"])
@@ -876,6 +884,9 @@ def main() -> int:
         target.print_help()
         return 0
     try:
+        if args.action == "web":
+            from .web_server import serve
+            return serve(args)
         validate_explicit_options(args)
         if args.action == "doctor" and args.doctor_action == "session":
             if args.state_db is None:

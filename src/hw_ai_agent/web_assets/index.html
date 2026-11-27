@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="ru">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>agi · Диалог</title><link rel="stylesheet" href="/style.css"><script defer src="/app.js"></script></head>
+<body>
+<div class="layout">
+<aside class="sidebar">
+  <div class="brand"><b class="mark">a.</b><div><strong>agi</strong><small>Учебный трекер</small></div></div>
+  <button id="new" class="primary">＋ Новый диалог</button>
+  <h3>Сессии</h3><nav id="sessions" aria-label="Сохранённые диалоги"></nav>
+  <nav class="sections" aria-label="Инструменты"><button data-page="chat">◌　Диалог</button><button data-page="settings">⊞　Скиллы и MCP</button><button data-page="doctor">✧　Доктор сессии</button><button data-page="eval">⇄　Eval и обновления</button></nav>
+  <label class="theme">Оформление<select id="theme"><option value="system">Системное</option><option value="light">Светлое</option><option value="dark">Тёмное</option><option value="paper">Бумага</option></select></label>
+</aside>
+<main><header><div class="crumb">agi <span>/</span> <strong id="crumb">Диалог</strong></div><span class="local"><i></i> Локальный агент</span></header>
+<div role="alert" id="notice" hidden></div>
+<section id="chatPage" class="chatGrid">
+  <div class="chat"><div class="heading"><small id="model"></small><h1 id="title">Новый диалог</h1></div>
+  <div id="conversation" class="scroll"><div id="messages"></div><div id="approval"></div><div id="runStatus" role="status"></div></div>
+  <form id="compose"><textarea id="prompt" rows="2" placeholder="Сообщение агенту…" aria-label="Сообщение агенту" required maxlength="32000"></textarea><button class="primary" id="send" title="Отправить" aria-label="Отправить">↑</button></form>
+  </div>
+  <aside class="inspector"><div class="headRow"><h2>События</h2><span id="eventCount" class="chip">0</span></div><details class="scope"><summary>Фильтр событий</summary><select id="filter"><option value="">Все события</option><option value="skill">Скиллы</option><option value="mcp">MCP</option><option value="error">Ошибки и отказы</option></select></details>
+  <div id="events"></div><section id="stats"></section></aside>
+</section>
+<section id="secondary" hidden></section>
+</main></div>
+</body></html>

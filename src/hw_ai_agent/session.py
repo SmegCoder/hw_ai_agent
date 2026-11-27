@@ -552,17 +552,19 @@ class SessionStore:
                         "prompt", "path", "paths", "proof", "tool_call_id", "tool", "name", "names", "task_id",
                         "server", "mcp_tool"):
                 if key in payload:
-                    payload[key] = self._redact_log_text(payload[key])
+                    payload[key] = self.redact_credentials(payload[key])
         return payload
 
-    def _redact_log_text(self, value):
+    def redact_credentials(self, value):
+        if not self.log_credentials:
+            return value
         if isinstance(value, str):
             for credential in self.log_credentials:
                 value = value.replace(credential, "[REDACTED]")
         elif isinstance(value, dict):
-            return {self._redact_log_text(key): self._redact_log_text(item) for key, item in value.items()}
+            return {self.redact_credentials(key): self.redact_credentials(item) for key, item in value.items()}
         elif isinstance(value, list):
-            return [self._redact_log_text(item) for item in value]
+            return [self.redact_credentials(item) for item in value]
         return value
 
     def event_records(self, identifier: str):

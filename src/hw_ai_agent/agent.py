@@ -198,6 +198,8 @@ class CodingAgent:
         metadata.setdefault("max_tokens", getattr(self.client, "max_tokens", 2048))
         metadata["skill_config"] = None
         if self.runtime.skills is not None:
+            if self.runtime.disabled_skills:
+                metadata["disabled_skills"] = sorted(self.runtime.disabled_skills)
             directory = self.runtime.skills.directory
             metadata["skill_config"] = {"directory": str(directory) if directory is not None else None}
             if self.runtime.market is None:
@@ -435,6 +437,8 @@ class CodingAgent:
                 continue
             retries = 0
             assistant = self._assistant_message(response)
+            if self.store:
+                assistant = self.store.redact_credentials(assistant)
             tool_calls = assistant.get("tool_calls") or []
             for call in tool_calls:
                 self._remember_call(call)
@@ -702,6 +706,8 @@ class CodingAgent:
                     if not task or (normalized != "load_skill" and normalized not in task["tools"]):
                         raise TaskError("TASK_TOOL_DENIED: tool is not allowed for CURRENT_TASK")
                 content = self.runtime.execute(name, arguments)
+                if self.store:
+                    content = self.store.redact_credentials(content)
         except JournalConflict as exc:
             self._journal_failure = exc
             failed = True

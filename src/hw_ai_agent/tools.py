@@ -70,6 +70,7 @@ class ToolRuntime:
         if mode not in {"safe", "auto"}:
             raise ValueError("Execution mode must be safe or auto")
         self.mode = mode
+        self.disabled_skills: set[str] = set()
         self.skills = skills
         if mcp is not None and mcp.workspace != self.root:
             raise ValueError("MCP registry was configured for a different workspace")
@@ -93,6 +94,13 @@ class ToolRuntime:
         self.result_limit_bytes: int | None = None
         self.journal = None
 
+    def disable_skills(self, names):
+        self.disabled_skills = set(names)
+        if self.skills is not None:
+            for name in self.disabled_skills:
+                self.skills.skills.pop(name, None)
+            self.skill_manifest = self.skills.manifest()
+
     def prepare_skills(self, *, allow_install: bool = True) -> tuple[str, list[dict]]:
         if self.skills is None:
             return "", []
@@ -100,7 +108,7 @@ class ToolRuntime:
             self.skill_manifest = self.skills.manifest()
             return self.skills.prompt(), []
         source, events = self.market.check(startup=True)
-        installed, offers = self.market.available(source, set(self.skills.skills))
+        installed, offers = self.market.available(source, set(self.skills.skills) | self.disabled_skills)
         if not allow_install or self.policy.decide("install_skill").action == Action.DENY:
             offers = {}
         self.market_skills, self.market_offers = installed, offers
