@@ -562,6 +562,25 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere; }
   min-width:0;
 }
 
+#eventPanel { display:flex; flex-direction:column; flex:1; min-height:0; }
+#filesPanel { overflow:auto; min-height:0; }
+.inspectorSwitch { display:flex; gap:2px; flex-wrap:wrap; margin-bottom:16px; border-bottom:1px solid var(--line); }
+.inspectorSwitch button { padding:7px 6px; color:var(--muted); border:0; border-bottom:2px solid transparent; border-radius:0; }
+.inspectorSwitch button[aria-pressed=true] { border-color:var(--accent); color:var(--accent); font-weight:650; }
+#filesPanel h2,#previewTitle { font-size:16px; }
+#reloadFiles { font-size:12px; padding:4px 6px; }
+#fileDirectory { color:var(--muted); margin:9px 0; font:12px ui-monospace,monospace; overflow-wrap:anywhere; }
+#chatFiles,#fileChanges { display:grid; gap:4px; }
+#fileChanges h3 { margin-top:18px; }
+#chatFiles button,#fileChanges button { text-align:left; overflow-wrap:anywhere; font-size:13px; }
+#previewTitle { min-width:0; overflow-wrap:anywhere; }
+#previewBody { margin-top:12px; }
+#previewBody pre { max-height:60dvh; white-space:pre-wrap; }
+#previewBody .added { color:var(--ok); }
+#previewBody .removed { color:var(--warn); }
+.turnProgress { display:flex; align-items:baseline; gap:8px; font-size:13px; color:var(--muted); overflow-wrap:anywhere; }
+.turnProgress::before { content:""; flex:none; width:7px; height:7px; border-radius:50%; background:var(--accent); }
+
 .headRow,.row,.buttons {
   display:flex;
   align-items:center;
@@ -828,7 +847,7 @@ td,th {
   max-width:100%;
 }
 
-#folderDialog,#deleteDialog {
+#folderDialog,#deleteDialog,#previewDialog {
   width:min(430px,95vw);
   max-height:85dvh;
   color:var(--ink);
@@ -838,7 +857,9 @@ td,th {
   padding:20px;
 }
 
-#folderDialog::backdrop,#deleteDialog::backdrop {
+#previewDialog { width:min(780px,94vw); }
+
+#folderDialog::backdrop,#deleteDialog::backdrop,#previewDialog::backdrop {
   background:#12151a66;
 }
 

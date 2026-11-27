@@ -11,7 +11,7 @@
 
 </aside>
 <div class="divider" id="leftDivider" tabindex="0" role="separator" aria-orientation="vertical" aria-label="Ширина списка сессий" aria-controls="sidebar"></div>
-<main><header><div class="crumb">agi <span>/</span> <strong id="crumb">Диалог</strong></div><div class="headerTools"><button id="toggleEvents" type="button" aria-controls="inspector" aria-expanded="true">Скрыть события</button><span class="local"><i></i> Локальный агент</span></div></header>
+<main><header><div class="crumb">agi <span>/</span> <strong id="crumb">Диалог</strong></div><div class="headerTools"><button id="toggleEvents" type="button" aria-controls="inspector" aria-expanded="true">Скрыть панель</button><span class="local"><i></i> Локальный агент</span></div></header>
 <div role="alert" id="notice" hidden></div>
 <section id="chatPage" class="chatGrid">
   <div class="chat"><div class="heading"><h1 id="title">Новый диалог</h1><div class="chatMeta"><button type="button" id="deleteChat" hidden>Удалить чат</button><small id="model"></small><small id="workspacePath"></small></div></div>
@@ -23,9 +23,13 @@
   </div>
   <form id="compose"><textarea id="prompt" rows="2" placeholder="Сообщение агенту…" aria-label="Сообщение агенту" required maxlength="32000"></textarea><button class="primary" id="send" title="Отправить" aria-label="Отправить">↑</button></form>
   </div>
-  <div class="divider" id="rightDivider" tabindex="0" role="separator" aria-orientation="vertical" aria-label="Ширина панели событий" aria-controls="inspector"></div>
-  <aside class="inspector" id="inspector"><div class="headRow"><h2>События</h2><span id="eventCount" class="chip">0</span></div><details class="scope"><summary>Фильтр событий</summary><select id="filter"><option value="">Все события</option><option value="skill">Скиллы</option><option value="mcp">MCP</option><option value="error">Ошибки и отказы</option></select></details>
-  <div id="events"></div><section id="stats"></section></aside>
+  <div class="divider" id="rightDivider" tabindex="0" role="separator" aria-orientation="vertical" aria-label="Ширина правой панели" aria-controls="inspector"></div>
+  <aside class="inspector" id="inspector"><div class="inspectorSwitch" role="group" aria-label="Раздел правой панели"><button type="button" id="eventsTab" aria-controls="eventPanel" aria-pressed="true">События <span id="eventCount" class="chip">0</span></button><button type="button" id="filesTab" aria-controls="filesPanel" aria-pressed="false">Файлы чата</button></div>
+  <div id="eventPanel"><details class="scope"><summary>Фильтр событий</summary><select id="filter"><option value="">Все события</option><option value="skill">Скиллы</option><option value="mcp">MCP</option><option value="error">Ошибки и отказы</option></select></details>
+  <div id="events"></div><section id="stats"></section></div>
+  <section id="filesPanel" hidden><div class="headRow"><h2>Рабочая папка</h2><button id="reloadFiles" type="button">Обновить</button></div>
+    <div id="fileDirectory"></div><div id="chatFiles"></div><div id="fileChanges"></div>
+  </section></aside>
 </section>
 <section id="preferences" hidden>
   <h1>Настройки</h1><div class="cards">
@@ -43,6 +47,7 @@
       <button id="resetLayout" type="button">Сбросить размеры панелей</button></article>
   </div>
 </section>
+<dialog id="previewDialog" aria-labelledby="previewTitle"><div class="headRow"><h2 id="previewTitle">Файл</h2><button id="closePreview" type="button" autofocus>Закрыть</button></div><div id="previewBody"></div></dialog>
 <dialog id="deleteDialog" aria-labelledby="deleteTitle" aria-describedby="deleteDescription">
   <h2 id="deleteTitle">Удалить чат?</h2><p id="deleteName"></p>
   <p id="deleteDescription">Переписка, события и история отката будут удалены. Файлы рабочей папки сохранятся.</p>

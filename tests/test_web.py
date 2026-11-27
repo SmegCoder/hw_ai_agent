@@ -159,6 +159,7 @@ class WebTests(unittest.TestCase):
                 ])
                 self.api("send", {"id":identifier, "prompt":["Собери отчёт", "Теперь сохрани"][number]})
                 state = self.wait(identifier, lambda d: d["approval"])
+                self.assertEqual(state["active_run"], state["turns"][-1]["id"])
                 self.assertFalse((self.workspace / "report.md").exists())
                 self.assertEqual(state["approval"]["target"], "report.md")
                 self.assertEqual(self.http("/api/delete-chat", {"id": identifier})[0], 400)
@@ -169,12 +170,44 @@ class WebTests(unittest.TestCase):
                 self.assertFalse(state["error"], state["error"])
                 self.assertEqual((folder / "report.md").exists(), allow)
                 self.assertFalse((self.workspace / "report.md").exists())
+            self.assertIsNone(state["active_run"])
+            files = self.api("chat-files?id=" + identifier)
+            self.assertIn({"directory": False, "name": "report.md"}, files["items"])
+            change, = files["changes"]
+            self.assertEqual(change["turn"], 2)
+            preview = "chat-file?id=" + identifier + "&path=report.md"
+            self.assertEqual(self.api(preview)["text"], "report")
+            (folder / "report.md").unlink()
+            self.assertIn("+report", self.api(preview + "&run=" + change["run"])["text"])
+            self.assertEqual(self.api("sessions")[0]["id"], identifier)
+            other = self.api("new", {"folder": identifier[:8]})
+            self.assertEqual(self.api("chat-files?id=" + other)["changes"], [])
+            self.assertEqual(self.http("/api/chat-file?id=" + other + "&path=report.md&run=" + change["run"])[0], 400)
             self.assertIn("Запись отклонена", [m.get("content") for m in history[-1]])
             self.assertEqual(state["stats"]["usage"]["prompt_tokens"]["tokens"], 60)
             self.assertEqual(len(self.api("doctor?id="+identifier)["runs"]), 2)
             self.assertEqual(state["stats"]["mcp_calls"]["tracker/list_tasks"], 2)
-            self.assertEqual(self.api("sessions")[0]["id"], identifier)
             self.assertNotIn("review-python-tests", history[0][0]["content"])
+
+    def test_file_browser_scopes_previews_to_readable_workspace_files(self):
+        self.api("settings", self.profile)
+        identifier = self.api("new", {})
+        folder = self.workspace / identifier[:8]
+        (folder / "docs").mkdir()
+        (folder / "docs" / "hello.txt").write_text("Привет")
+        (folder / "binary").write_bytes(b"\x00")
+        (folder / ".env").write_text("private")
+        (folder / "outside").symlink_to(self.root)
+        (folder / "large").write_bytes(b"x" * 100_000)
+        listing = self.api("chat-files?id=" + identifier)
+        names = [item["name"] for item in listing["items"]]
+        self.assertIn("docs", names)
+        self.assertNotIn(".env", names)
+        self.assertNotIn("outside", names)
+        self.assertEqual(self.api("chat-file?id=" + identifier + "&path=docs/hello.txt")["text"], "Привет")
+        for path in ("../other", ".env", "outside/state/db", "binary", "large"):
+            self.assertEqual(self.http("/api/chat-file?id=" + identifier + "&path=" + path)[0], 400)
+        self.assertEqual(self.http("/api/chat-files?id=" + identifier + "&path=outside")[0], 400)
 
     def test_deleting_chat_preserves_shared_workspace_and_other_history(self):
         self.api("settings", self.profile)

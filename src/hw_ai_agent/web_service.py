@@ -46,12 +46,19 @@ CHAT_MODELS = {
 
 
 class Job:
-    def __init__(self):
+    def __init__(self, prompt=""):
+        self.prompt = prompt
+        self.run_id = None
         self.condition = threading.Condition()
         self.pending = None
         self.answer = None
         self.error = ""
         self.running = True
+
+    def observe(self, event):
+        if event.get("event") in {"session_created", "session_resumed"}:
+            with self.condition:
+                self.run_id = event["session_id"]
 
     def ask(self, content):
         with self.condition:
@@ -72,7 +79,9 @@ class Job:
 
     def state(self):
         with self.condition:
-            return {"running": self.running, "approval": self.pending, "error": self.error}
+            return {"running": self.running, "approval": self.pending, "error": self.error,
+                    "active_run": self.run_id if self.running else None,
+                    "starting_prompt": self.prompt if self.running and not self.run_id else ""}
 
 
 class WebService:
@@ -292,11 +301,11 @@ class WebService:
             job = self.jobs.get(key)
             return job.state() if job else {"running": False, "approval": None, "error": ""}
 
-    def start(self, key, action):
+    def start(self, key, action, *, prompt=""):
         with self.lock:
             if self.job_state(key)["running"]:
                 raise ValueError("Операция уже выполняется")
-            job = self.jobs[key] = Job()
+            job = self.jobs[key] = Job(prompt)
 
         def work():
             try:
@@ -321,7 +330,7 @@ class WebService:
                 chat = Conversation(store, identifier)
                 config = chat.configuration()
                 args = SimpleNamespace(verbose=False, cost_estimate=None, state_db=self.db)
-                agent = cli.restore_chat_agent(args, store, None, config)
+                agent = cli.restore_chat_agent(args, store, job.observe, config)
                 if config["binding"].get("approvals", "ask") == "ask":
                     agent.runtime.approve = lambda request: job.ask(asdict(request))
                 agent.approve_plan = lambda plan: job.ask({"tool": "plan", "target": "План действий",
@@ -337,7 +346,7 @@ class WebService:
                     raise ValueError("Нет незавершённого запроса")
                 else:
                     agent.run(prompt, history=chat.history(turns), conversation_id=identifier)
-        self.start(identifier, turn)
+        self.start(identifier, turn, prompt=prompt)
 
     def chat(self, identifier):
         with SessionStore(self.db, read_only=True) as store:

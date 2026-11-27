@@ -152,7 +152,7 @@ function setEventsOpen(open) {
   $("chatPage").classList.toggle("collapsed", !open);
   $("rightDivider").hidden = $("inspector").hidden = !open;
   $("toggleEvents").setAttribute("aria-expanded", String(open));
-  $("toggleEvents").textContent = open ? "Скрыть события" : "Показать события";
+  $("toggleEvents").textContent = open ? "Скрыть панель" : "Показать панель";
   localStorage.setItem("agi.events", open ? "open" : "closed");
 }
 setEventsOpen(localStorage.getItem("agi.events") !== "closed");
@@ -260,6 +260,119 @@ function renderEvents() {
   for (const item of $("events").children)
     if (opened.has(item.dataset.event)) item.open = true;
 }
+let inspectorPage = "events", folder = ".", filesRequest = 0, previewRequest = 0;
+function selectInspector(section) {
+  inspectorPage = section;
+  $("eventPanel").hidden = section !== "events";
+  $("filesPanel").hidden = section !== "files";
+  $("eventsTab").setAttribute("aria-pressed", String(section === "events"));
+  $("filesTab").setAttribute("aria-pressed", String(section === "files"));
+  if (section === "files") loadFiles();
+}
+function resetFiles() {
+  folder = ".";
+  filesRequest++;
+  previewRequest++;
+  if ($("previewDialog").open) $("previewDialog").close();
+  $("chatFiles").replaceChildren();
+  $("fileChanges").replaceChildren();
+  $("fileDirectory").replaceChildren();
+}
+function fileButton(label, click) {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.textContent = label;
+  b.onclick = click;
+  return b;
+}
+async function loadFiles() {
+  const request = ++filesRequest, key = id, directory = folder;
+  const listing = $("chatFiles"), changes = $("fileChanges");
+  $("fileDirectory").textContent = directory === "." ? "/" : "/" + directory;
+  listing.replaceChildren();
+  changes.replaceChildren();
+  if (directory !== ".") listing.append(fileButton("↑ На уровень выше", () => {
+    folder = directory.split("/").slice(0, -1).join("/") || ".";
+    loadFiles();
+  }));
+  const message = document.createElement("p");
+  message.className = "empty";
+  message.textContent = key ? "Загрузка…" : "Файлы появятся после создания чата.";
+  listing.append(message);
+  if (!key) return;
+  try {
+    const data = await api("chat-files", null, {id: key, path: directory});
+    if (request !== filesRequest || id !== key) return;
+    message.textContent = "Папка пуста";
+    if (data.items.length) message.remove();
+    for (const item of data.items) {
+      const path = directory === "." ? item.name : directory + "/" + item.name;
+      listing.append(fileButton(item.name + (item.directory ? "/" : ""), () => {
+        if (item.directory) { folder = path; loadFiles(); }
+        else previewFile(path);
+      }));
+    }
+    if (data.changes.length) {
+      const h = document.createElement("h3");
+      h.textContent = "Изменения по запросам";
+      changes.append(h);
+      for (const change of data.changes) {
+        const label = "№" + change.turn + " · " + change.path + (change.rolled_back ? " · отменено" : "");
+        changes.append(fileButton(label, () => previewFile(change.path, change.run, change.turn)));
+      }
+    }
+  } catch (error) {
+    if (request === filesRequest) message.textContent = error.message;
+  }
+}
+async function previewFile(path, run, turn) {
+  const request = ++previewRequest, key = id;
+  $("previewTitle").textContent = run ? "Изменения · №" + turn + " · " + path : path;
+  $("previewBody").textContent = "Загрузка…";
+  $("previewDialog").showModal();
+  try {
+    const query = {id: key, path};
+    if (run) query.run = run;
+    const result = await api("chat-file", null, query);
+    if (request !== previewRequest || key !== id) return;
+    const pre = document.createElement("pre");
+    pre.textContent = result.text;
+    if (!result.text) pre.textContent = "Пустой файл";
+    if (run) {
+      const lines = document.createDocumentFragment();
+      for (const line of result.text.split("\n")) {
+        const row = document.createElement("span");
+        row.className = line.startsWith("+") ? "added" : line.startsWith("-") ? "removed" : "";
+        row.textContent = line + "\n";
+        lines.append(row);
+      }
+      pre.replaceChildren(lines);
+    }
+    $("previewBody").replaceChildren(pre);
+  } catch (error) {
+    if (request === previewRequest) $("previewBody").textContent = error.message;
+  }
+}
+$("filesTab").onclick = () => selectInspector("files");
+$("eventsTab").onclick = () => selectInspector("events");
+$("reloadFiles").onclick = loadFiles;
+$("closePreview").onclick = () => $("previewDialog").close();
+
+function progressText(state) {
+  if (state.approval) return "Ждёт подтверждения · " + (state.approval.target || state.approval.tool);
+  const event = state.active_run && state.events?.findLast(e => e.run_id === state.active_run &&
+      ["tool_call", "tool_result", "model_request", "model_usage"].includes(e.type));
+  if (!event) return "Подготавливает запрос…";
+  if (event.type === "model_request") return "Ожидает ответ модели…";
+  if (event.type === "model_usage") return "Обрабатывает ответ модели…";
+  const data = event.data;
+  if (event.type === "tool_result") return data.failed ? "Обрабатывает ошибку инструмента…" : "Обрабатывает результат инструмента…";
+  let path;
+  try { path = JSON.parse(data.arguments).path; } catch {}
+  const actions = {read_file: "Читает файл", write_file: "Записывает файл", delete_file: "Удаляет файл",
+                   list_files: "Просматривает папку", mcp__tracker__list_tasks: "Читает задачи трекера"};
+  return (Object.hasOwn(actions, data.name) ? actions[data.name] : "Вызывает " + data.name) + (typeof path === "string" ? " · " + path : "…");
+}
 function tokens(x) {
   if (!x) return "—";
   if (x.tokens === null) return "неизвестно";
@@ -331,14 +444,15 @@ const runLabels = {
   waiting_approval: "Ожидает решения", waiting_plan_approval: "Ожидает решения по плану",
   budget_exhausted: "Лимит исчерпан", context_limit: "Достигнут предел контекста", journal_conflict: "Конфликт правок"
 };
-function exchangeHtml(turn, opened) {
+function exchangeHtml(turn, opened, progress = "") {
   const key = esc(turn.id);
   const answer = turn.answer ? '<div class="answer" aria-label="Ответ агента">' + answerHtml(turn.answer) + '</div>' : "";
   const copy = turn.answer ? '<button type="button" class="copyAnswer" data-copy="' + key +
       '" aria-label="Копировать ответ" title="Копировать ответ"><span aria-hidden="true"></span></button>' : "";
   const status = esc(runLabels[turn.status] || turn.status);
   return '<article class="exchange"><div class="bubble" aria-label="Ваше сообщение">' + esc(turn.prompt) +
-      '</div>' + answer + '<div class="answerActions">' + copy +
+       '</div>' + (progress ? '<div class="turnProgress" role="status">' + esc(progress) + '</div>' : '') +
+      answer + '<div class="answerActions">' + copy +
       '<details class="turnStats" data-turn="' + key + '"' + (opened.has(turn.id) ? " open" : "") +
       '><summary>Статистика<span> · ' + status + '</span></summary>' + metrics(turn.stats) + '</details></div></article>';
 }
@@ -355,7 +469,13 @@ function renderChat() {
   $("deleteChat").disabled = submitBusy || !chat || chat.running;
   const pending = chat?.approval;
   const openStats = new Set([...$("messages").querySelectorAll(".turnStats[open]")].map(el => el.dataset.turn));
-  $("messages").innerHTML = turns.length ? turns.map(t => exchangeHtml(t, openStats)).join("") :
+  const progress = chat?.running ? progressText(chat) : "";
+  const inTurn = progress && turns.some(t => t.id === chat.active_run);
+  $("messages").innerHTML = turns.length || progress ? turns.map(t =>
+      exchangeHtml(t, openStats, t.id === chat.active_run ? progress : "")).join("") +
+      (progress && !inTurn ? (chat.starting_prompt && turns.at(-1)?.prompt !== chat.starting_prompt ?
+          '<div class="bubble">' + esc(chat.starting_prompt) + '</div>' : '') +
+          '<div class="turnProgress" role="status">' + esc(progress) + '</div>' : '') :
       "<div class=\"intro\"><h2>С чем помочь по учёбе?</h2><p>Спроси о задачах трекера или попроси сохранить отчёт.</p>" +
           button("suggest", "Открытые задачи", "Какие задачи открыты в учебном трекере?") +
           button(
@@ -370,8 +490,7 @@ function renderChat() {
       "";
   $("runStatus").innerHTML = esc(chat?.error ||
                                  (chat?.ended       ? "Диалог завершён" :
-                                      pending       ? "Ожидает решения" :
-                                      chat?.running ? "Агент работает…" :
+
                                                       "")) +
       (chat?.pending && !chat.running && !chat.ended ? button("resume", "Продолжить запрос") : "");
   $("send").disabled = submitBusy || !!(chat?.running || chat?.ended || chat?.pending);
@@ -386,7 +505,9 @@ async function refreshChat() {
   if (key !== id || page !== "chat") return;
   const sig = JSON.stringify(result);
   if (lastChat !== sig) {
+    const needFiles = !lastChat || chat?.running !== result?.running || chat?.events?.length !== result?.events?.length;
     chat = result;
+    if (inspectorPage === "files" && needFiles) loadFiles();
     lastChat = sig;
     renderChat();
   }
@@ -599,6 +720,7 @@ async function act(action, v) {
   notice();
   if (action === "session" || action === "new") {
     if (submitBusy) return;
+    resetFiles();
     id = action === "session" ? v : "";
     if (!id) {
       $("newModel").value = "";
@@ -621,6 +743,7 @@ async function act(action, v) {
   } else if (action === "event") {
     await show("chat");
     setEventsOpen(true);
+    selectInspector("events");
     $("filter").value = "";
     renderEvents();
     const el = [...$("events").children].find(x => x.dataset.event === v);

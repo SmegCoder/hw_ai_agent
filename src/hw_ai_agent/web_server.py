@@ -10,6 +10,8 @@ from urllib.parse import parse_qs, urlsplit
 
 from .config import load_env
 from .session_doctor import inspect_session
+from .session import SessionStore
+from .web_files import ChatFiles
 from .web_service import WebService
 
 
@@ -74,6 +76,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def get_data(self, path, query):
         app = self.server.app
+        if path in {"/api/chat-files", "/api/chat-file"}:
+            with SessionStore(app.db, read_only=True) as store:
+                files = ChatFiles(store, query["id"])
+                if path == "/api/chat-files":
+                    return files.listing(query.get("path", "."))
+                return files.preview(query["path"], query.get("run"))
         if path == "/api/chat-options":
             return app.chat_options()
         if path == "/api/folders":
