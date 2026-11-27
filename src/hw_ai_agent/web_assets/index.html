@@ -14,7 +14,7 @@
 <main><header><div class="crumb">agi <span>/</span> <strong id="crumb">Диалог</strong></div><div class="headerTools"><button id="toggleEvents" type="button" aria-controls="inspector" aria-expanded="true">Скрыть события</button><span class="local"><i></i> Локальный агент</span></div></header>
 <div role="alert" id="notice" hidden></div>
 <section id="chatPage" class="chatGrid">
-  <div class="chat"><div class="heading"><small id="model"></small><small id="workspacePath"></small><h1 id="title">Новый диалог</h1></div>
+  <div class="chat"><div class="heading"><h1 id="title">Новый диалог</h1><div class="chatMeta"><small id="model"></small><small id="workspacePath"></small></div></div>
   <div id="conversation" class="scroll"><div id="messages"></div><div id="approval"></div><div id="runStatus" role="status"></div></div>
   <div id="newModelPicker" hidden>
     <label>Модель <select id="newModel"><option value="">Из настроек агента</option></select></label>
@@ -35,6 +35,11 @@
       <button class="primary">Сохранить модель</button></form>
     </article>
     <article class="card"><h2>Интерфейс</h2><label class="field">Оформление<select id="theme"><option value="system">Системное</option><option value="light">Светлое</option><option value="dark">Тёмное</option><option value="paper">Бумага</option></select></label>
+      <label class="field">Размер текста<select id="textSize"><option value="small">Мелкий</option><option value="normal" selected>Обычный</option><option value="large">Крупный</option></select></label>
+      <label class="field">Расстояние между репликами<select id="spacing"><option value="compact">Компактное</option><option value="relaxed" selected>Свободное</option></select></label>
+      <label class="field">Ширина переписки<select id="readingWidth"><option value="narrow">Узкая</option><option value="standard" selected>Средняя</option><option value="wide">Широкая</option></select></label>
+      <label class="check"><input type="checkbox" id="showTurnStats" checked>Статистика под ответами</label>
+      <label class="check"><input type="checkbox" id="wrapCode" checked>Перенос длинных строк кода</label>
       <button id="resetLayout" type="button">Сбросить размеры панелей</button></article>
   </div>
 </section>

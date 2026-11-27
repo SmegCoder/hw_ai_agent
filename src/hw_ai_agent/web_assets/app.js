@@ -44,6 +44,19 @@ $("theme").value = localStorage.getItem("agi.theme") || "system";
 $("theme").onchange = applyTheme;
 systemTheme.addEventListener("change", applyTheme);
 applyTheme();
+for (const name of ["textSize", "spacing", "readingWidth", "showTurnStats", "wrapCode"]) {
+  const field = $(name), key = "agi." + name, saved = localStorage.getItem(key);
+  const checkbox = field.type === "checkbox";
+  if (checkbox && saved !== null) field.checked = saved === "true";
+  if (!checkbox && [...field.options].some(option => option.value === saved)) field.value = saved;
+  function apply() {
+    const value = checkbox ? String(field.checked) : field.value;
+    document.documentElement.dataset[name] = value;
+    localStorage.setItem(key, value);
+  }
+  field.onchange = apply;
+  apply();
+}
 function notice(message = "") {
   $("notice").textContent = message;
   $("notice").hidden = !message;
@@ -265,22 +278,82 @@ function metrics(s) {
                           скиллы: s.skill_loads
                         }));
 }
+function inlineAnswer(text) {
+  const tokens = /(`[^`\n]+`|\*\*[^*\n]+\*\*|\*[^*\n]+\*|(?<![\w\p{L}])_[^_\n]+_(?![\w\p{L}]))/gu;
+  return text.split(tokens).map((part, index) => {
+    if (index % 2 === 0) return esc(part);
+    if (part.startsWith("`")) return "<code>" + esc(part.slice(1, -1)) + "</code>";
+    if (part.startsWith("**")) return "<strong>" + esc(part.slice(2, -2)) + "</strong>";
+    return "<em>" + esc(part.slice(1, -1)) + "</em>";
+  }).join("");
+}
+function answerHtml(answer) {
+  const blocks = [], lines = answer.replace(/\r\n?/g, "\n").split("\n");
+  let paragraph = [];
+  function flush() {
+    if (paragraph.length) blocks.push("<p>" + inlineAnswer(paragraph.join("\n")) + "</p>");
+    paragraph = [];
+  }
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i], fence = line.match(/^ {0,3}(`{3,}|~{3,})\s*([^\s]*)\s*$/);
+    const heading = line.match(/^#{1,6}\s+(.+)/);
+    const item = /^\s*(?:([-+*])|(\d{1,9})\.)\s+(.+)/;
+    const first = line.match(item);
+    if (fence) {
+      flush();
+      const code = [], end = new RegExp("^ {0,3}" + fence[1][0] + "{" + fence[1].length + ",}\\s*$");
+      while (++i < lines.length && !end.test(lines[i])) code.push(lines[i]);
+      blocks.push("<pre class=\"codeBlock\"><code>" + esc(code.join("\n")) + "</code></pre>");
+    } else if (heading) {
+      flush();
+      blocks.push("<h3>" + inlineAnswer(heading[1]) + "</h3>");
+    } else if (first) {
+      flush();
+      const ordered = !!first[2], tag = ordered ? "ol" : "ul";
+      const items = ["<li>" + inlineAnswer(first[3]) + "</li>"];
+      while (i + 1 < lines.length) {
+        const next = lines[i + 1].match(item);
+        if (!next || !!next[2] !== ordered) break;
+        items.push("<li>" + inlineAnswer(next[3]) + "</li>");
+        i++;
+      }
+      const start = ordered ? ' start="' + Number(first[2]) + '"' : "";
+      blocks.push("<" + tag + start + ">" + items.join("") + "</" + tag + ">");
+    } else if (!line.trim()) flush();
+    else paragraph.push(line);
+  }
+  flush();
+  return blocks.join("");
+}
+const runLabels = {
+  completed: "Готово", running: "В работе", ready: "Готов к запуску", failed: "Ошибка",
+  interrupted: "Прерван", blocked: "Заблокирован", aborted: "Отменён", rolled_back: "Изменения отменены",
+  waiting_approval: "Ожидает решения", waiting_plan_approval: "Ожидает решения по плану",
+  budget_exhausted: "Лимит исчерпан", context_limit: "Достигнут предел контекста", journal_conflict: "Конфликт правок"
+};
+function exchangeHtml(turn, opened) {
+  const key = esc(turn.id);
+  const answer = turn.answer ? '<div class="answer" aria-label="Ответ агента">' + answerHtml(turn.answer) + '</div>' : "";
+  const copy = turn.answer ? '<button type="button" class="copyAnswer" data-copy="' + key +
+      '" aria-label="Копировать ответ" title="Копировать ответ"><span aria-hidden="true"></span></button>' : "";
+  const status = esc(runLabels[turn.status] || turn.status);
+  return '<article class="exchange"><div class="bubble" aria-label="Ваше сообщение">' + esc(turn.prompt) +
+      '</div>' + answer + '<div class="answerActions">' + copy +
+      '<details class="turnStats" data-turn="' + key + '"' + (opened.has(turn.id) ? " open" : "") +
+      '><summary>Статистика<span> · ' + status + '</span></summary>' + metrics(turn.stats) + '</details></div></article>';
+}
 function renderChat() {
   const turns = chat?.turns || [];
   const atBottom =
       $("conversation").scrollHeight - $("conversation").scrollTop - $("conversation").clientHeight < 45;
   $("title").textContent = turns.length ? turns[0].prompt.slice(0, 75) : "Новый диалог";
   $("model").textContent = chat?.model || "";
-  $("workspacePath").textContent = chat?.workspace ? "Папка · " + chat.workspace : "";
+  $("workspacePath").textContent = chat?.workspace || "";
+  $("workspacePath").title = chat?.workspace || "";
   $("newModelPicker").hidden = Boolean(id);
   const pending = chat?.approval;
-  $("messages").innerHTML = turns.length ?
-      turns
-          .map(
-              t => "<div class=\"turn user\"><b>Вы</b><p>" + esc(t.prompt) + "</p></div>" +
-                  (t.answer ? "<div class=\"turn agent\"><b>agi</b><p>" + esc(t.answer) + "</p></div>" : "") +
-                  detail("Статистика запроса · " + t.status, metrics(t.stats)))
-          .join("") :
+  const openStats = new Set([...$("messages").querySelectorAll(".turnStats[open]")].map(el => el.dataset.turn));
+  $("messages").innerHTML = turns.length ? turns.map(t => exchangeHtml(t, openStats)).join("") :
       "<div class=\"intro\"><h2>С чем помочь по учёбе?</h2><p>Спроси о задачах трекера или попроси сохранить отчёт.</p>" +
           button("suggest", "Открытые задачи", "Какие задачи открыты в учебном трекере?") +
           button(
@@ -627,6 +700,19 @@ document.addEventListener("click", guard(async e => {
                               }
                             }
                           }));
+$("messages").addEventListener("click", guard(async event => {
+  const control = event.target.closest("[data-copy]");
+  if (!control) return;
+  const turn = chat?.turns.find(t => t.id === control.dataset.copy);
+  if (!turn?.answer) return;
+  await navigator.clipboard.writeText(turn.answer);
+  control.classList.add("copied");
+  control.title = control.ariaLabel = "Скопировано";
+  setTimeout(() => {
+    control.classList.remove("copied");
+    control.title = control.ariaLabel = "Копировать ответ";
+  }, 1600);
+}));
 $("new").onclick = guard(() => act("new", ""));
 $("filter").onchange = renderEvents;
 $("compose").onsubmit = guard(async e => {
