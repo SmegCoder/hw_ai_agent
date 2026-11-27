@@ -569,9 +569,12 @@ function renderSettings() {
                button("source", "Учебный каталог", "demo") + button("source", "Anthropic", "anthropic") +
                "</div>" + check("checkStart", "Проверять при старте", flags.check_on_start) +
                check("autoUpdate", "Автообновление с проверкой через eval", flags.auto_update) +
-               info("Автообновление создаёт кандидата. До применения сравниваются обе версии.")) +
+               info("Автообновление создаёт кандидата. До применения сравниваются обе версии.") +
+               (p.demo ? info("Демо-режим: скиллы маркета недоступны новым диалогам.") : "") +
+               (!p.market_install_allowed ? info("Policy запрещает install_skill: агент не увидит предложения маркета. " +
+                   "Установленные скиллы можно загружать, если разрешён load_skill. Policy: " + p.policy) : "")) +
       "</div><div class=\"buttons\">" + button("save", "Сохранить настройки", "", "primary") +
-      button("check", "Проверить сохранённый источник") +
+      button("check", "Сохранить и проверить источник") +
       (p.source === "demo" ? button("publish", "Опубликовать учебную v1.1", "1.1.0") : "") +
       "</div><h2 class=\"subhead\">Каталог</h2><input id=\"search\" aria-label=\"Найти скилл\" placeholder=\"Поиск по каталогу\"><div id=\"offers\"></div>" +
       detail("Новинки и журнал маркета",
@@ -602,6 +605,20 @@ function renderOffers() {
                   "<p>" + esc(o.description) + "</p></div>")
           .join("") ||
       info("Нет карточек. Проверь источник или измени поиск.");
+}
+async function saveSkillSettings() {
+  const disabled = new Set(prefs.disabled);
+  document.querySelectorAll("[data-skill]")
+      .forEach(el => el.checked ? disabled.delete(el.dataset.skill) : disabled.add(el.dataset.skill));
+  return api("settings", {
+    mcp: $("mcpPath").value,
+    source: $("source").value,
+    demo: $("demo").checked,
+    skills_dir: $("skillsDir").value,
+    check_on_start: $("checkStart").checked,
+    auto_update: $("autoUpdate").checked,
+    disabled: [...disabled]
+  });
 }
 function doctorHtml(d) {
   return "<div class=\"cards\">" + card("Расход диалога", metrics(d.total)) +
@@ -757,21 +774,19 @@ async function act(action, v) {
   } else if (action === "publish") {
     await api("publish-demo", {version: v});
     notice("В учебном каталоге опубликована v1.1. Проверь источник, чтобы увидеть кандидата.");
-  } else if (action === "save") {
-    const disabled = new Set(prefs.disabled);
-    document.querySelectorAll("[data-skill]")
-        .forEach(el => el.checked ? disabled.delete(el.dataset.skill) : disabled.add(el.dataset.skill));
-    prefs = await api("settings", {
-      mcp: $("mcpPath").value,
-      source: $("source").value,
-      demo: $("demo").checked,
-      skills_dir: $("skillsDir").value,
-      check_on_start: $("checkStart").checked,
-      auto_update: $("autoUpdate").checked,
-      disabled: [...disabled]
-    });
-    renderSettings();
-    notice("Настройки сохранены.");
+  } else if (action === "save" || action === "check") {
+    prefs = await saveSkillSettings();
+    let error = null;
+    if (action === "check") {
+      try {
+        await api("check", {});
+      } catch (exc) {
+        error = exc;
+      }
+    }
+    await show("settings");
+    if (error) throw error;
+    notice(action === "check" ? "Каталог проверен." : "Настройки сохранены.");
   } else if (action === "mcp") {
     const data = await api("mcp");
     $("mcpResult").innerHTML =
@@ -780,10 +795,10 @@ async function act(action, v) {
                 .join("") +
             data.events.filter(e => e.error).map(e => info(e.error)).join("") ||
         info("Нет подключённых инструментов. Сохрани путь к конфигурации.");
-  } else if (action === "check" || action === "install") {
-    await api(action, {name: v});
+  } else if (action === "install") {
+    await api("install", {name: v});
     await show("settings");
-    notice(action === "check" ? "Каталог проверен." : "Скилл установлен.");
+    notice("Скилл установлен.");
   } else if (["eval", "continueEval", "candidate"].includes(action)) {
     const focus = $("focus")?.value;
     const series = await api("eval", {

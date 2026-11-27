@@ -135,7 +135,7 @@ def serve(args):
     load_env(args.env_file)
     db = args.state_db or os.getenv("AGENT_STATE_DB", ".agent/sessions.sqlite3")
     workspace = args.workspace or os.getenv("AGENT_WORKSPACE", "workspace")
-    policy = args.policy or os.getenv("AGENT_POLICY") or ("policies/tracker.json" if Path("policies/tracker.json").exists() else None)
+    policy = args.policy or os.getenv("AGENT_POLICY") or ("policies/web.json" if Path("policies/web.json").exists() else None)
     app = WebService(db, workspace, Path(policy) if policy else None)
     with ThreadingHTTPServer(("127.0.0.1", args.port), Handler) as server:
         server.app = app

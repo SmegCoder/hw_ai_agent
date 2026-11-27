@@ -20,6 +20,7 @@ from .eval_cases import CASES
 from .eval_runner import Options, read_json, run_evaluation, save_json
 from .filesystem import create_chat_folder
 from .mcp import MCPRegistry
+from .policy import Action
 from .session import SessionBusyError, SessionStore
 from .session_doctor import stats_snapshot
 from .skill_market import SkillMarket
@@ -100,16 +101,15 @@ class WebService:
         self.prefs = read_json(self.prefs_file) if self.prefs_file.exists() else {
             "provider": os.getenv("AGENT_PROVIDER", "openrouter"), "model": "",
             "mcp": "mcp/tracker.json" if Path("mcp/tracker.json").is_file() else "",
-            "source": "anthropic",
-            "sources": {
-                "anthropic": {
-                    "check_on_start": True,
-                    "auto_update": True,
-                }
-            },
-            "disabled": [],
-            "demo": False,
+            "source": "anthropic", "sources": {}, "disabled": [], "demo": False,
         }
+        self.prefs.setdefault("skills_dir", "")
+        sources = self.prefs.setdefault("sources", {})
+        sources.setdefault("anthropic", {"check_on_start": True, "auto_update": True})
+        if not self.prefs.get("source") and not self.prefs.get("demo", False):
+            self.prefs["source"] = "anthropic"
+        if self.prefs["source"]:
+            sources.setdefault(self.prefs["source"], {"check_on_start": True, "auto_update": True})
 
     def scrub(self, value):
         for _, key, _ in PROVIDERS.values():
@@ -231,7 +231,9 @@ class WebService:
             market = self.market(p)
             available = market.installed()
             builtin = SkillCatalog(self.workspace, Path(p["skills_dir"]) if p.get("skills_dir") else None)
+            policy = cli.load_policy(self.policy, self.workspace)
             return {**p, "workspace": str(self.workspace), "policy": str(self.policy or "default"),
+                    "market_install_allowed": policy.decide("install_skill").action != Action.DENY,
                     "skills": [dict(name=s.name, description=s.description,
                                     origin="Встроенный" if s.name in builtin.builtin_names else "Из папки")
                                for s in builtin.skills.values()] +

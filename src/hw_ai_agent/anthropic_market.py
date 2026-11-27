@@ -38,9 +38,24 @@ def git(directory: Path, *args: str, timeout: int = 5) -> bytes:
             capture_output=True, check=True, timeout=timeout,
         ).stdout
     except FileNotFoundError:
-        raise PublicMarketError("Для маркета Anthropic нужен Git") from None
-    except (OSError, subprocess.SubprocessError):
-        raise PublicMarketError("Не удалось прочитать маркет Anthropic через Git") from None
+        raise PublicMarketError("Для маркета Anthropic нужен Git. Установите Git и повторите проверку") from None
+    except subprocess.TimeoutExpired:
+        raise PublicMarketError("Превышено время ожидания GitHub при проверке Anthropic. "
+                                "Проверьте интернет или VPN и попробуйте снова") from None
+    except subprocess.CalledProcessError as exc:
+        details = (exc.stderr or b"").decode("utf-8", errors="replace").lower()
+        if "could not resolve host" in details or "name or service not known" in details:
+            message = "GitHub недоступен: ошибка DNS. Проверьте интернет или VPN"
+        elif "certificate" in details or "ssl" in details:
+            message = "Не удалось проверить TLS-сертификат GitHub. Проверьте Git и настройки прокси"
+        elif "proxy" in details or "connection" in details or "timed out" in details:
+            message = "Не удалось подключиться к GitHub через Git. Проверьте сеть или прокси"
+        else:
+            message = "Git не смог загрузить каталог Anthropic. Проверьте команду git ls-remote "
+            message += "https://github.com/anthropics/skills.git HEAD"
+        raise PublicMarketError(message) from None
+    except OSError:
+        raise PublicMarketError("Не удалось запустить Git для проверки маркета Anthropic") from None
 
 
 def read_blob(repo: Path, revision: str, path: str, limit: int) -> bytes:

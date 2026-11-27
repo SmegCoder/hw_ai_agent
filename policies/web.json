@@ -1,0 +1,13 @@
+{
+  "directories": {"allow": ["."]},
+  "defaults": {
+    "install_skill": "ask",
+    "load_skill": "allow",
+    "list_files": "allow",
+    "read_file": "allow",
+    "write_file": "ask"
+  },
+  "rules": [
+    {"tool": "mcp__tracker__list_tasks", "action": "allow", "reason": "Read the study tracker snapshot"}
+  ]
+}
