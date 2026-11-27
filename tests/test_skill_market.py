@@ -10,11 +10,12 @@ from unittest.mock import patch
 
 from hw_ai_agent import cli
 from hw_ai_agent.agent import CodingAgent
+from hw_ai_agent.anthropic_market import Publication
 from hw_ai_agent.budget import BudgetLimits
 from hw_ai_agent.policy import Policy
 from hw_ai_agent.session import SessionStore
 from hw_ai_agent.skill_market import MarketError, SkillMarket
-from hw_ai_agent.skills import SkillCatalog
+from hw_ai_agent.skills import Skill, SkillCatalog
 from hw_ai_agent.tools import ToolError, ToolRuntime
 
 
@@ -175,18 +176,29 @@ class SkillMarketTests(unittest.TestCase):
 
         self.assertEqual([row["name"] for row in json.loads(invoke("market", "status"))], [WEEK])
         chat = ["chat", "--workspace", str(self.workspace), "--provider", "ollama", "--model", "demo"]
-        invoke(*chat, "--demo-skills-only")
-        with SessionStore(self.db_path) as store:
-            demo_conversation = store.db.execute("SELECT id FROM conversations").fetchone()["id"]
-        invoke(*chat)
-        invoke("chat", "--resume", demo_conversation)
-        self.assertNotIn(WEEK, prompts[0])
-        self.assertIn(WEEK, prompts[1])
-        self.assertNotIn(WEEK, prompts[2])
-        for demo_prompt in (prompts[0], prompts[2]):
-            for name in ("deadline-report", "open-task-export", "review-python-tests"):
-                self.assertIn(name, demo_prompt)
-        self.assertTrue(all("load_skill" in tools and "install_skill" not in tools for tools in tool_sets))
+        name = "brand-guidelines"
+        card = Skill.parse(name, b"---\nname: brand-guidelines\ndescription: Colors\n---\nBrand styling.\n")
+        publication = Publication("a" * 40, {name: card}, {})
+        with patch("hw_ai_agent.skill_market.read_publication", return_value=publication) as remote:
+            invoke(*chat, "--demo-skills-only")
+            invoke(*chat)
+            with SessionStore(self.db_path) as store:
+                demo, default = store.db.execute("SELECT id, configuration FROM conversations ORDER BY rowid")
+            self.assertEqual(json.loads(default["configuration"])["binding"]["market_config"], "anthropic")
+            invoke("chat", "--resume", demo["id"])
+            invoke("chat", "--resume", default["id"])
+        remote.assert_called_once()
+        for index in (0, 2):
+            self.assertNotIn(WEEK, prompts[index])
+            self.assertNotIn(name, prompts[index])
+            for demo_name in ("deadline-report", "open-task-export", "review-python-tests"):
+                self.assertIn(demo_name, prompts[index])
+            self.assertIn("load_skill", tool_sets[index])
+            self.assertNotIn("install_skill", tool_sets[index])
+        for index in (1, 3):
+            self.assertIn(WEEK, prompts[index])
+            self.assertIn(name, prompts[index])
+            self.assertIn("install_skill", tool_sets[index])
 
     def test_cli_resume_loads_installed_revision_after_another_run_updates_it(self):
         loaded_documents = {}

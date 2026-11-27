@@ -202,8 +202,8 @@ class CodingAgent:
             metadata["skill_config"] = {"directory": str(directory) if directory is not None else None}
             if self.runtime.market is None:
                 metadata["project_skills"] = False
-        if self.runtime.market is not None and self.runtime.market.path is not None:
-            metadata["market_config"] = str(self.runtime.market.path)
+        if self.runtime.market is not None and self.runtime.market.reference is not None:
+            metadata["market_config"] = self.runtime.market.reference
         if self.runtime.mcp is not None:
             metadata["mcp_config"] = {"path": str(self.runtime.mcp.path), "digest": self.runtime.mcp.config_digest}
         route = getattr(self.client, "routing", None)

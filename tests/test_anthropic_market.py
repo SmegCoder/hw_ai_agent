@@ -1,9 +1,13 @@
+import io
 import json
+import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
+from hw_ai_agent import cli
 from hw_ai_agent.anthropic_market import ANTHROPIC_REPOSITORY, Publication, PublicMarketError, published_names
 from hw_ai_agent.skill_market import MarketError, SkillMarket
 from hw_ai_agent.skills import Skill, SkillCatalog
@@ -33,6 +37,27 @@ class AnthropicMarketTests(unittest.TestCase):
 
     def runtime(self, approve):
         return ToolRuntime(self.workspace, skills=SkillCatalog(self.workspace), market=self.market, approve=approve)
+
+    def test_market_search_uses_anthropic_by_default_and_by_name(self):
+        command = ["agi", "market", "search", "--workspace", str(self.workspace),
+                   "--state-db", str(self.market.db_path.parent / "sessions.sqlite3")]
+        for options in ([], ["--market-config", "anthropic"]):
+            with self.subTest(options=options):
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with patch.object(sys, "argv", command + options), redirect_stdout(stdout), redirect_stderr(stderr):
+                    self.assertEqual(cli.main(), 0, stderr.getvalue())
+                self.assertIn(NAME, stdout.getvalue())
+        self.assertEqual(self.remote.call_count, 2)
+
+    def test_missing_market_file_and_invalid_json_have_distinct_errors(self):
+        catalog = self.workspace.parent / "broken.json"
+        market = SkillMarket(catalog, self.market.db_path, self.workspace)
+        with self.assertRaisesRegex(MarketError, "Файл JSON не найден · broken.json"):
+            market.config()
+        catalog.write_text('{"marketplace":\n}', encoding="utf-8")
+        with self.assertRaisesRegex(MarketError, "Некорректный JSON · broken.json, строка 2, столбец 1"):
+            market.config()
+        self.remote.assert_not_called()
 
     def test_declared_card_paths_cannot_leave_repository_skill_directory(self):
         def manifest(path):
