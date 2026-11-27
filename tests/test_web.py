@@ -75,15 +75,64 @@ class WebTests(unittest.TestCase):
         default_id = self.api("new", {})
         with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-web-key"}), \
                 patch("hw_ai_agent.cli.configure_client", side_effect=lambda client, *args: client):
-            chosen = self.api("new", {"provider":"openrouter", "model":"deepseek/deepseek-v4.1-flash"})
+            chosen = self.api("new", {"provider":"openrouter", "model":"deepseek/deepseek-v4.1-flash-1017"})
         restarted = WebService(self.app.db, self.workspace)
-        self.assertEqual(restarted.chat(chosen)["model"], "deepseek/deepseek-v4.1-flash")
+        self.assertEqual(restarted.chat(chosen)["model"], "deepseek/deepseek-v4.1-flash-1017")
         self.assertEqual(restarted.chat(default_id)["model"], self.profile["model"])
         self.assertEqual(restarted.prefs["provider"], self.profile["provider"])
         self.assertEqual(self.api("chat?id="+self.api("new", {}))["model"], self.profile["model"])
         before = self.api("sessions")
         self.assertEqual(self.http("/api/new", {"model":"invalid"})[0], 400)
         self.assertEqual(self.api("sessions"), before)
+
+    def test_workspace_creation_reuse_and_recovery(self):
+        self.api("settings", self.profile)
+        project = self.workspace / "курс" / "дз"
+        project.mkdir(parents=True)
+        (self.workspace / "external").symlink_to(self.root)
+        self.assertEqual(self.api("folders")["folders"], ["курс"])
+        self.assertEqual(self.app.folders("курс")["folders"], ["дз"])
+        ids = [self.api("new", {}) for _ in range(2)]
+        folders = [self.workspace / i[:8] for i in ids]
+        self.assertNotEqual(*folders)
+        for identifier, folder in zip(ids, folders):
+            self.assertTrue(folder.is_dir())
+            self.assertEqual(self.api("chat?id=" + identifier)["workspace"], str(folder.resolve()))
+        for relative, expected in (("курс/дз", project), (".", self.workspace)):
+            identifier = self.api("new", {"folder": relative})
+            restored = WebService(self.app.db, self.workspace)
+            self.assertEqual(restored.chat(identifier)["workspace"], str(expected.resolve()))
+        for relative in ("../state", str(self.root), "external", "unknown"):
+            self.assertEqual(self.http("/api/new", {"folder": relative})[0], 400)
+        before = set(self.workspace.iterdir())
+        with patch("hw_ai_agent.cli.new_agent", side_effect=ValueError("invalid config")):
+            self.assertEqual(self.http("/api/new", {})[0], 400)
+            self.assertEqual(self.http("/api/new", {"folder": "курс/дз"})[0], 400)
+        self.assertEqual(set(self.workspace.iterdir()), before)
+        self.assertTrue(project.is_dir())
+
+    def test_available_models_and_saved_defaults(self):
+        self.api("settings", self.profile)
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-web-key"}):
+            options = self.api("chat-options")
+            self.assertIn("openai", options["models"])
+            self.api("model", {"provider": "openai", "model": "gpt-4.1-mini"})
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "", "OPENROUTER_API_KEY": ""}):
+            options = self.api("chat-options")
+            self.assertNotIn("openai", options["models"])
+            self.assertEqual(options["provider"], "ollama")
+            router = options["models"]["openrouter"]
+            self.assertEqual(len(router), 10)
+            self.assertEqual(router[0][0], "nvidia/nemotron-3-ultra-550b-a55b:free")
+            self.assertIn(["openai/gpt-6.2-sol", "GPT-6.2 Sol"], router)
+            direct = {"provider": "openai", "model": "gpt-4.1-mini"}
+            for endpoint in ("model", "new"):
+                self.assertEqual(self.http("/api/" + endpoint, direct)[0], 400)
+            self.assertEqual(self.http("/api/settings", {**self.profile, **direct})[0], 400)
+            self.api("model", {"provider": "openrouter", "model": router[-1][0]})
+            integrations = {k: v for k, v in self.profile.items() if k not in {"provider", "model"}}
+            self.api("settings", integrations)
+            self.assertEqual(WebService(self.app.db, self.workspace).chat_options()["model"], router[-1][0])
 
     def test_dialogue_tool_policy_history_and_doctor(self):
         self.api("settings", self.profile)
@@ -100,6 +149,7 @@ class WebTests(unittest.TestCase):
 
         with patch("hw_ai_agent.cli.OpenAICompatibleClient", Client):
             identifier = self.api("new", {})
+            folder = self.workspace / identifier[:8]
             for number, allow in enumerate((False, True)):
                 responses.extend([
                     {"role": "assistant", "tool_calls": [tool_call("list", "mcp__tracker__list_tasks", {})]},
@@ -115,7 +165,8 @@ class WebTests(unittest.TestCase):
                 self.assertEqual(self.http("/api/decision", state_key)[0], 400)
                 state = self.wait(identifier, lambda d: not d["running"])
                 self.assertFalse(state["error"], state["error"])
-                self.assertEqual((self.workspace / "report.md").exists(), allow)
+                self.assertEqual((folder / "report.md").exists(), allow)
+                self.assertFalse((self.workspace / "report.md").exists())
             self.assertIn("Запись отклонена", [m.get("content") for m in history[-1]])
             self.assertEqual(state["stats"]["usage"]["prompt_tokens"]["tokens"], 60)
             self.assertEqual(len(self.api("doctor?id="+identifier)["runs"]), 2)

@@ -18,12 +18,31 @@ from .config import PROVIDERS, Settings, apply_launch_defaults
 from .conversation import Conversation, RunStats
 from .eval_cases import CASES
 from .eval_runner import Options, read_json, run_evaluation, save_json
+from .filesystem import create_chat_folder
 from .mcp import MCPRegistry
 from .session import SessionStore
 from .session_doctor import stats_snapshot
 from .skill_market import SkillMarket
 from .skill_updates import evaluate_candidate
 from .skills import SKILL_NAME, SkillCatalog
+
+
+CHAT_MODELS = {
+    "openrouter": [
+        ("nvidia/nemotron-3-ultra-550b-a55b:free", "NVIDIA Nemotron 3 Ultra (Free)"),
+        ("baidu/ernie-5.5-flash-preview:free", "ERNIE 5.5 Flash Preview (Free)"),
+        ("openrouter/auto-code", "OpenRouter Auto Code"),
+        ("openrouter/auto", "OpenRouter Auto"),
+        ("openai/gpt-6.2-sol", "GPT-6.2 Sol"),
+        ("anthropic/claude-fable-5.2", "Claude Fable 5.2"),
+        ("google/gemini-4-neon", "Gemini 4 Neon"),
+        ("openai/gpt-6-luna", "GPT-6 Luna"),
+        ("deepseek/deepseek-v4.1-flash-1017", "DeepSeek V4.1 Flash 1017"),
+        ("anthropic/claude-sonnet-5.5", "Claude Sonnet 5.5"),
+    ],
+    "openai": [("gpt-4.1-mini", "GPT-4.1 mini")],
+    "ollama": [("qwen3:4b", "Qwen3 4B"), ("qwen3:4b-instruct", "Qwen3 4B Instruct")],
+}
 
 
 class Job:
@@ -83,10 +102,53 @@ class WebService:
                 value = value.replace(secret, "[REDACTED]")
         return value
 
+    def chat_options(self):
+        models = CHAT_MODELS.copy()
+        if not os.getenv("OPENAI_API_KEY", "").strip():
+            del models["openai"]
+        with self.lock:
+            provider, model = self.prefs["provider"], self.prefs["model"]
+        if provider == "openai" and provider not in models:
+            provider = "openrouter" if os.getenv("OPENROUTER_API_KEY", "").strip() else "ollama"
+            model = ""
+        default_model = model or os.getenv(f"{provider.upper()}_MODEL") or PROVIDERS[provider][2]
+        return {"models": models, "provider": provider, "model": model, "default_model": default_model}
+
+    def model_choice(self, provider, model, *, allow_default=False):
+        if provider not in self.chat_options()["models"]:
+            raise ValueError("Провайдер недоступен. Для OpenAI требуется OPENAI_API_KEY.")
+        if not isinstance(model, str):
+            raise ValueError("Проверьте ID модели")
+        model = model.strip()
+        if not (allow_default and not model) and not re.fullmatch(r"[\w./:+@-]{1,180}", model):
+            raise ValueError("Проверьте ID модели")
+        return {"provider": provider, "model": model}
+
+    def save_model(self, data):
+        with self.lock:
+            prefs = {**self.prefs, **self.model_choice(data["provider"], data["model"], allow_default=True)}
+            save_json(self.prefs_file, prefs)
+            self.prefs = prefs
+        return self.chat_options()
+
+    def folder_path(self, relative):
+        if not isinstance(relative, str) or not relative or Path(relative).is_absolute():
+            raise ValueError("Выберите папку внутри workspace")
+        folder = self.workspace
+        for part in Path(relative).parts:
+            folder = folder / part
+            if part.startswith(".") or folder.is_symlink() or not folder.is_dir():
+                raise ValueError("Папка недоступна")
+        return folder
+
+    def folders(self, relative):
+        folder = self.folder_path(relative)
+        return {"root": str(self.workspace), "path": str(folder.relative_to(self.workspace)),
+                "folders": sorted((p.name for p in folder.iterdir()
+                                   if not p.name.startswith(".") and not p.is_symlink() and p.is_dir()),
+                                  key=str.casefold)}
+
     def save_settings(self, data):
-        provider, model = data["provider"], data["model"].strip()
-        if provider not in PROVIDERS or (model and not re.fullmatch(r"[\w./:+@-]{1,180}", model)):
-            raise ValueError("Проверьте провайдера и ID модели")
         mcp, source = data["mcp"].strip(), data["source"].strip()
         if mcp:
             MCPRegistry(Path(mcp), self.workspace)
@@ -109,7 +171,9 @@ class WebService:
         with self.lock:
             sources = dict(self.prefs["sources"])
             sources[source] = {k: data[k] for k in ("check_on_start", "auto_update")}
-            prefs = dict(provider=provider, model=model, mcp=mcp, source=source, sources=sources,
+            model = self.model_choice(data["provider"], data["model"], allow_default=True) if "provider" in data else {}
+            prefs = dict(self.prefs, **model)
+            prefs.update(mcp=mcp, source=source, sources=sources,
                          disabled=sorted(set(disabled)), demo=data["demo"], skills_dir=directory)
             self.market(prefs)
             save_json(self.prefs_file, prefs)
@@ -170,22 +234,38 @@ class WebService:
         apply_launch_defaults(args)
         return args
 
-    def new_chat(self, *, provider=None, model=None):
+    def new_chat(self, *, provider=None, model=None, folder=None):
         with self.lock:
             p = self.prefs.copy()
-        if provider is not None or model is not None:
-            if (not isinstance(provider, str) or provider not in PROVIDERS or not isinstance(model, str)
-                    or not re.fullmatch(r"[\w./:+@-]{1,180}", model)):
-                raise ValueError("Проверьте провайдера и ID модели для нового диалога")
-            p.update(provider=provider, model=model)
+            options = self.chat_options()
+        choice = (self.model_choice(provider, model) if provider is not None or model is not None
+                  else {"provider": options["provider"], "model": options["model"]})
+        p.update(choice)
         args = self.args(p)
+        identifier = None
+        if folder is None:
+            identifier, args.workspace = create_chat_folder(self.workspace)
+        else:
+            args.workspace = self.folder_path(folder)
+        try:
+            return self.create_chat(args, p, identifier)
+        except Exception:
+            if folder is None:
+                try:
+                    args.workspace.rmdir()
+                except OSError:
+                    pass
+            raise
+
+    def create_chat(self, args, p, identifier):
         runtime = cli.starting_runtime(args, None)
         runtime.disable_skills(p["disabled"])
         limits = BudgetLimits(args.max_rounds, args.max_tool_calls, args.max_side_effects, args.max_result_bytes)
         with SessionStore(self.db) as store:
             agent = cli.new_agent(args, store, runtime, None, limits, chat=True)
             chat = Conversation.create(store, {"binding": agent.binding(), "budget": limits.as_dict(),
-                "cost_estimate": args.cost_estimate, "context_window": getattr(agent.client, "context_window", None)})
+                "cost_estimate": args.cost_estimate, "context_window": getattr(agent.client, "context_window", None)},
+                identifier=identifier)
             return chat.id
 
     def sessions(self):
@@ -264,7 +344,7 @@ class WebService:
                                  "id": turn.state.id, "stats": stats_snapshot(run)})
             binding = json.loads(row["configuration"])["binding"]
             return {"turns": messages, "events": list(store.event_records(identifier)), "stats": stats_snapshot(total),
-                    "model": binding["model"], "ended": bool(row["ended"]), "pending": bool(chat.pending(turns)),
+                    "model": binding["model"], "workspace": binding.get("workspace"), "ended": bool(row["ended"]), "pending": bool(chat.pending(turns)),
                     **self.job_state(identifier)}
 
     def catalog_action(self, action, name=""):

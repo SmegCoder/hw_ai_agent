@@ -3,42 +3,48 @@
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>agi · Диалог</title><link rel="stylesheet" href="/style.css"><script defer src="/app.js"></script></head>
 <body>
 <div class="layout">
-<aside class="sidebar">
+<aside class="sidebar" id="sidebar">
   <div class="brand"><b class="mark">a.</b><div><strong>agi</strong><small>Учебный трекер</small></div></div>
   <button id="new" class="primary">＋ Новый диалог</button>
   <h3>Сессии</h3><nav id="sessions" aria-label="Сохранённые диалоги"></nav>
-  <nav class="sections" aria-label="Инструменты"><button data-page="chat">◌　Диалог</button><button data-page="settings">⊞　Скиллы и MCP</button><button data-page="doctor">✧　Доктор сессии</button><button data-page="eval">⇄　Eval и обновления</button></nav>
-  <label class="theme">Оформление<select id="theme"><option value="system">Системное</option><option value="light">Светлое</option><option value="dark">Тёмное</option><option value="paper">Бумага</option></select></label>
+  <nav class="sections" aria-label="Инструменты"><button data-page="settings">⊞　Скиллы и MCP</button><button data-page="doctor">✧　Доктор сессии</button><button data-page="eval">⇄　Eval и обновления</button><button data-page="preferences">⚙　Настройки</button></nav>
+
 </aside>
-<main><header><div class="crumb">agi <span>/</span> <strong id="crumb">Диалог</strong></div><span class="local"><i></i> Локальный агент</span></header>
+<div class="divider" id="leftDivider" tabindex="0" role="separator" aria-orientation="vertical" aria-label="Ширина списка сессий" aria-controls="sidebar"></div>
+<main><header><div class="crumb">agi <span>/</span> <strong id="crumb">Диалог</strong></div><div class="headerTools"><button id="toggleEvents" type="button" aria-controls="inspector" aria-expanded="true">Скрыть события</button><span class="local"><i></i> Локальный агент</span></div></header>
 <div role="alert" id="notice" hidden></div>
 <section id="chatPage" class="chatGrid">
-  <div class="chat"><div class="heading"><small id="model"></small><h1 id="title">Новый диалог</h1></div>
+  <div class="chat"><div class="heading"><small id="model"></small><small id="workspacePath"></small><h1 id="title">Новый диалог</h1></div>
   <div id="conversation" class="scroll"><div id="messages"></div><div id="approval"></div><div id="runStatus" role="status"></div></div>
-  <label id="newModelPicker" hidden>Модель для нового чата
-    <select id="newModel">
-      <option value="">Из настроек агента</option>
-      <optgroup label="OpenRouter">
-        <option value="deepseek/deepseek-v4.1-flash" data-provider="openrouter">DeepSeek V4.1 Flash</option>
-        <option value="deepseek/deepseek-v3.2" data-provider="openrouter">DeepSeek V3.2</option>
-        <option value="openai/gpt-4.1-mini" data-provider="openrouter">GPT-4.1 mini</option>
-        <option value="anthropic/claude-sonnet-4.6" data-provider="openrouter">Claude Sonnet 4.6</option>
-        <option value="qwen/qwen3-coder" data-provider="openrouter">Qwen3 Coder</option>
-      </optgroup>
-      <optgroup label="OpenAI">
-        <option value="gpt-4.1-mini" data-provider="openai">GPT-4.1 mini · OpenAI</option>
-      </optgroup>
-      <optgroup label="Ollama">
-        <option value="qwen3:4b" data-provider="ollama">Qwen3 4B · локально</option>
-        <option value="qwen3:4b-instruct" data-provider="ollama">Qwen3 4B Instruct · локально</option>
-      </optgroup>
-    </select>
-  </label>
+  <div id="newModelPicker" hidden>
+    <label>Модель <select id="newModel"><option value="">Из настроек агента</option></select></label>
+    <button id="chooseFolder" type="button">Выбрать папку…</button>
+    <span id="folderChoice">Новая папка с коротким ID</span>
+  </div>
   <form id="compose"><textarea id="prompt" rows="2" placeholder="Сообщение агенту…" aria-label="Сообщение агенту" required maxlength="32000"></textarea><button class="primary" id="send" title="Отправить" aria-label="Отправить">↑</button></form>
   </div>
-  <aside class="inspector"><div class="headRow"><h2>События</h2><span id="eventCount" class="chip">0</span></div><details class="scope"><summary>Фильтр событий</summary><select id="filter"><option value="">Все события</option><option value="skill">Скиллы</option><option value="mcp">MCP</option><option value="error">Ошибки и отказы</option></select></details>
+  <div class="divider" id="rightDivider" tabindex="0" role="separator" aria-orientation="vertical" aria-label="Ширина панели событий" aria-controls="inspector"></div>
+  <aside class="inspector" id="inspector"><div class="headRow"><h2>События</h2><span id="eventCount" class="chip">0</span></div><details class="scope"><summary>Фильтр событий</summary><select id="filter"><option value="">Все события</option><option value="skill">Скиллы</option><option value="mcp">MCP</option><option value="error">Ошибки и отказы</option></select></details>
   <div id="events"></div><section id="stats"></section></aside>
 </section>
+<section id="preferences" hidden>
+  <h1>Настройки</h1><div class="cards">
+    <article class="card"><h2>Новые диалоги</h2>
+      <form id="modelForm"><label class="field">Провайдер<select id="provider" required></select></label>
+      <label class="field">ID модели<input id="modelName" list="modelSuggestions" placeholder="Из окружения провайдера"><datalist id="modelSuggestions"></datalist></label>
+      <button class="primary">Сохранить модель</button></form>
+    </article>
+    <article class="card"><h2>Интерфейс</h2><label class="field">Оформление<select id="theme"><option value="system">Системное</option><option value="light">Светлое</option><option value="dark">Тёмное</option><option value="paper">Бумага</option></select></label>
+      <button id="resetLayout" type="button">Сбросить размеры панелей</button></article>
+  </div>
+</section>
+<dialog id="folderDialog" aria-labelledby="folderTitle"><h2 id="folderTitle">Рабочая папка чата</h2>
+  <p id="folderLocation"></p><button type="button" id="parentFolder">↑ На уровень выше</button>
+  <div id="folderList"></div><div class="buttons">
+    <button class="primary" id="useFolder" type="button">Выбрать эту папку</button>
+    <button id="autoFolder" type="button">Создать по ID</button><button id="cancelFolder" type="button">Отмена</button>
+  </div>
+</dialog>
 <section id="secondary" hidden></section>
 </main></div>
 </body></html>

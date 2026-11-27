@@ -74,6 +74,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def get_data(self, path, query):
         app = self.server.app
+        if path == "/api/chat-options":
+            return app.chat_options()
+        if path == "/api/folders":
+            return app.folders(query.get("path", "."))
         if path == "/api/sessions":
             return app.sessions()
         if path == "/api/chat":
@@ -93,7 +97,9 @@ class Handler(BaseHTTPRequestHandler):
     def mutate(self, path, body):
         app = self.server.app
         if path == "/api/new":
-            return app.new_chat(provider=body.get("provider"), model=body.get("model"))
+            return app.new_chat(provider=body.get("provider"), model=body.get("model"), folder=body.get("folder"))
+        if path == "/api/model":
+            return app.save_model(body)
         if path == "/api/send":
             return app.send(body["id"], body["prompt"], body.get("resume") is True)
         if path == "/api/decision":

@@ -25,6 +25,7 @@ const select = (id, label, items, selected) => "<label class=\"field\">" + esc(l
     "</select></label>";
 const pages = {
   chat: "Диалог",
+  preferences: "Настройки",
   settings: "Скиллы и MCP",
   doctor: "Доктор сессии",
   eval: "Eval и обновления"
@@ -59,6 +60,145 @@ async function api(action, data = null, query = {}) {
   if (!response.ok) throw Error(value.error || response.statusText);
   return value.data;
 }
+const providerNames = {openrouter: "OpenRouter", openai: "OpenAI", ollama: "Ollama"};
+let modelOptions;
+function renderModelOptions(options) {
+  modelOptions = options;
+  const picker = $("newModel");
+  const selected = picker.selectedOptions[0];
+  const defaultLabel = "Из настроек · " + providerNames[options.provider] +
+      (options.default_model ? " · " + options.default_model : "");
+  picker.replaceChildren(new Option(defaultLabel, ""));
+  for (const [provider, models] of Object.entries(options.models)) {
+    const group = document.createElement("optgroup");
+    group.label = providerNames[provider];
+    for (const [value, name] of models) {
+      const option = new Option(name, value);
+      option.dataset.provider = provider;
+      group.append(option);
+      if (selected?.dataset.provider === provider && selected.value === value) option.selected = true;
+    }
+    picker.append(group);
+  }
+}
+function modelSuggestions() {
+  const models = modelOptions.models[$("provider").value];
+  $("modelSuggestions").replaceChildren(...models.map(([value, label]) => new Option(label, value)));
+}
+function renderModelSettings(options) {
+  renderModelOptions(options);
+  $("provider").replaceChildren(...Object.keys(options.models).map(p => new Option(providerNames[p], p)));
+  $("provider").value = options.provider;
+  $("modelName").value = options.model;
+  modelSuggestions();
+}
+$("provider").onchange = () => {
+  $("modelName").value = "";
+  modelSuggestions();
+};
+$("modelForm").onsubmit = guard(async event => {
+  event.preventDefault();
+  const options = await api("model", {provider: $("provider").value, model: $("modelName").value});
+  renderModelSettings(options);
+  notice("Модель для новых диалогов сохранена.");
+});
+
+let selectedFolder = null, browsing = ".", folderRoot = "", folderRequest = 0;
+function chooseFolder(path) {
+  selectedFolder = path;
+  $("folderChoice").textContent = path === null ? "Новая папка с коротким ID" : path === "." ? folderRoot : path;
+}
+async function browseFolder(path) {
+  const request = ++folderRequest;
+  const result = await api("folders", null, {path});
+  if (request !== folderRequest) return;
+  browsing = result.path;
+  folderRoot = result.root;
+  $("folderLocation").textContent = browsing === "." ? folderRoot : folderRoot + "/" + browsing;
+  $("parentFolder").disabled = browsing === ".";
+  const list = $("folderList");
+  list.replaceChildren();
+  for (const name of result.folders) {
+    const child = document.createElement("button");
+    child.textContent = name + " ›";
+    child.onclick = guard(() => browseFolder(browsing === "." ? name : browsing + "/" + name));
+    list.append(child);
+  }
+  if (!result.folders.length) list.textContent = "Вложенных папок нет";
+}
+$("chooseFolder").onclick = guard(async () => {
+  await browseFolder(selectedFolder || ".");
+  $("folderDialog").showModal();
+});
+$("parentFolder").onclick = guard(() => browseFolder(browsing.split("/").slice(0, -1).join("/") || "."));
+$("useFolder").onclick = () => { chooseFolder(browsing); $("folderDialog").close(); };
+$("autoFolder").onclick = () => { chooseFolder(null); $("folderDialog").close(); };
+$("cancelFolder").onclick = () => $("folderDialog").close();
+
+function setEventsOpen(open) {
+  $("chatPage").classList.toggle("collapsed", !open);
+  $("rightDivider").hidden = $("inspector").hidden = !open;
+  $("toggleEvents").setAttribute("aria-expanded", String(open));
+  $("toggleEvents").textContent = open ? "Скрыть события" : "Показать события";
+  localStorage.setItem("agi.events", open ? "open" : "closed");
+}
+setEventsOpen(localStorage.getItem("agi.events") !== "closed");
+$("toggleEvents").onclick = () => setEventsOpen($("inspector").hidden);
+
+function setupDivider(side, pane) {
+  const handle = $(side + "Divider");
+  const property = "--" + side + "-width", key = "agi." + side + "Width";
+  const left = side === "left";
+  const container = handle.parentElement;
+  const minimum = left ? 150 : 180;
+  const maximum = () => Math.max(minimum, Math.floor(container.clientWidth * (left ? .32 : .46)));
+  const width = () => Math.round(pane.getBoundingClientRect().width);
+  function updateAria() {
+    if (!pane.clientWidth || !handle.offsetWidth) return;
+    handle.setAttribute("aria-valuemin", minimum);
+    handle.setAttribute("aria-valuemax", maximum());
+    handle.setAttribute("aria-valuenow", width());
+    handle.setAttribute("aria-valuetext", width() + " пикселей");
+  }
+  function resize(requested) {
+    const px = Math.max(minimum, Math.min(maximum(), requested));
+    container.style.setProperty(property, px + "px");
+    updateAria();
+  }
+  const saved = Number(localStorage.getItem(key));
+  if (saved >= minimum) container.style.setProperty(property, saved + "px");
+  new ResizeObserver(updateAria).observe(pane);
+  let origin = 0, initial = 0;
+  handle.onpointerdown = event => {
+    if (event.button !== 0 || !event.isPrimary) return;
+    origin = event.clientX;
+    initial = width();
+    handle.setPointerCapture(event.pointerId);
+    handle.classList.add("dragging");
+    event.preventDefault();
+  };
+  handle.onpointermove = event => {
+    if (handle.hasPointerCapture(event.pointerId))
+      resize(initial + (event.clientX - origin) * (left ? 1 : -1));
+  };
+  handle.onlostpointercapture = () => {
+    handle.classList.remove("dragging");
+    localStorage.setItem(key, width());
+  };
+  handle.onkeydown = event => {
+    const targets = {ArrowLeft: width() + (left ? -16 : 16), ArrowRight: width() + (left ? 16 : -16),
+                     Home: minimum, End: maximum()};
+    if (!(event.key in targets)) return;
+    event.preventDefault();
+    resize(targets[event.key]);
+    localStorage.setItem(key, width());
+  };
+  return () => { container.style.removeProperty(property); localStorage.removeItem(key); };
+}
+const resetLeft = setupDivider("left", $("sidebar"));
+const resetRight = setupDivider("right", $("inspector"));
+$("resetLayout").onclick = () => { resetLeft(); resetRight(); notice("Размеры панелей сброшены."); };
+
 async function listSessions() {
   sessions = await api("sessions");
   renderSessions();
@@ -131,6 +271,7 @@ function renderChat() {
       $("conversation").scrollHeight - $("conversation").scrollTop - $("conversation").clientHeight < 45;
   $("title").textContent = turns.length ? turns[0].prompt.slice(0, 75) : "Новый диалог";
   $("model").textContent = chat?.model || "";
+  $("workspacePath").textContent = chat?.workspace ? "Папка · " + chat.workspace : "";
   $("newModelPicker").hidden = Boolean(id);
   const pending = chat?.approval;
   $("messages").innerHTML = turns.length ?
@@ -183,7 +324,14 @@ async function show(target) {
   document.querySelectorAll("[data-page]")
       .forEach(b => b.classList.toggle("active", b.dataset.page === page));
   $("chatPage").hidden = page !== "chat";
-  $("secondary").hidden = page === "chat";
+  $("secondary").hidden = page === "chat" || page === "preferences";
+  $("preferences").hidden = page !== "preferences";
+  $("toggleEvents").hidden = page !== "chat";
+  if (page === "preferences") {
+    const options = await api("chat-options");
+    if (version === pageVersion) renderModelSettings(options);
+    return;
+  }
   if (page === "chat") {
     lastChat = "";
     await refreshChat();
@@ -214,12 +362,6 @@ function renderSettings() {
           .join("");
   $("secondary").innerHTML = "<h1>Скиллы и MCP</h1>" +
       info("Настройки диалога применяются при создании новой сессии.") + "<div class=\"cards\">" +
-      card("Модель",
-           select(
-               "provider", "Провайдер", Object.keys({ollama: 1, openrouter: 1, openai: 1}).map(x => [x, x]),
-               p.provider) +
-               input("modelName", "ID модели", p.model, "Из .env по умолчанию") +
-               info("Ключ берётся из окружения сервера.")) +
       card("MCP-серверы",
            input("mcpPath", "Путь к конфигурации MCP", p.mcp, "mcp/tracker.json") +
                button("mcp", "Инструменты подключения") + "<div id=\"mcpResult\"></div>") +
@@ -365,6 +507,7 @@ async function submit() {
     if (!id) {
       const selected = $("newModel").selectedOptions[0];
       const choice = selected.value ? {provider: selected.dataset.provider, model: selected.value} : {};
+      if (selectedFolder !== null) choice.folder = selectedFolder;
       id = await api("new", choice);
       localStorage.setItem("agi.chat", id);
     }
@@ -382,7 +525,10 @@ async function act(action, v) {
   if (action === "session" || action === "new") {
     if (submitBusy) return;
     id = action === "session" ? v : "";
-    if (!id) $("newModel").value = "";
+    if (!id) {
+      $("newModel").value = "";
+      chooseFolder(null);
+    }
     chat = null;
     localStorage.setItem("agi.chat", id);
     $("prompt").value = "";
@@ -399,6 +545,7 @@ async function act(action, v) {
     await refreshChat();
   } else if (action === "event") {
     await show("chat");
+    setEventsOpen(true);
     $("filter").value = "";
     renderEvents();
     const el = [...$("events").children].find(x => x.dataset.event === v);
@@ -417,8 +564,6 @@ async function act(action, v) {
     document.querySelectorAll("[data-skill]")
         .forEach(el => el.checked ? disabled.delete(el.dataset.skill) : disabled.add(el.dataset.skill));
     prefs = await api("settings", {
-      provider: $("provider").value,
-      model: $("modelName").value,
       mcp: $("mcpPath").value,
       source: $("source").value,
       demo: $("demo").checked,
@@ -513,7 +658,7 @@ async function refresh() {
 }
 (async () => {
   try {
-    await listSessions();
+    await Promise.all([listSessions(), api("chat-options").then(renderModelOptions)]);
     const saved = localStorage.getItem("agi.chat");
     if (sessions.some(s => s.id === saved)) id = saved;
     renderSessions();

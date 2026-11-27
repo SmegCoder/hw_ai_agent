@@ -960,7 +960,7 @@ def main() -> int:
             load_env(args.env_file)
             return 0 if doctor(choose_settings(args)) else 1
         if select_workspace:
-            args.workspace = choose_workspace(Path("workspace"))
+            args.workspace = choose_workspace(Path("workspace"), chat=args.action == "chat")
             if args.workspace is None:
                 print("\nВыбор рабочей папки отменён.", file=sys.stderr)
                 return 130

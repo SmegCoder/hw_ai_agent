@@ -13,6 +13,7 @@ from datetime import date
 from itertools import count
 from pathlib import Path
 
+from .filesystem import create_chat_folder
 from .planning import PlanApprovalDeferred, PlanError
 from .pricing import amount, usd
 from .tasks import passing_tests, test_command
@@ -383,7 +384,7 @@ def confirm_plan(plan: dict, *, verbose=False) -> bool:
     return decision
 
 
-def choose_workspace(root: Path) -> Path | None:
+def choose_workspace(root: Path, *, chat=False) -> Path | None:
     root = root.absolute()
     try:
         while True:
@@ -398,10 +399,15 @@ def choose_workspace(root: Path) -> Path | None:
                 print(f"  {number}. {visible_line(path.name)}")
             if not choices:
                 print("  Папок пока нет.")
-            print("  Enter — создать папку с датой · n — создать папку со своим именем")
+            suffix = "с коротким ID" if chat else "с датой"
+            print(f"  Enter — создать папку {suffix} · n — создать папку со своим именем")
             choice = input("Выбор › ").strip().casefold()
             if not choice:
                 root.mkdir(parents=True, exist_ok=True)
+                if chat:
+                    _, folder = create_chat_folder(root)
+                    print(f"Создана папка · workspace/{folder.name}")
+                    return folder
                 today = date.today().isoformat()
                 for number in count(1):
                     name = today if number == 1 else f"{today}-{number}"

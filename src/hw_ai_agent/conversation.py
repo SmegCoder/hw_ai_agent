@@ -157,8 +157,8 @@ class Conversation:
             print("Введите номер из списка.")
 
     @classmethod
-    def create(cls, store, configuration: dict) -> Conversation:
-        identifier = uuid.uuid4().hex
+    def create(cls, store, configuration: dict, *, identifier: str | None = None) -> Conversation:
+        identifier = identifier or uuid.uuid4().hex
         with store.transaction():
             store.db.execute("INSERT INTO conversations (id, configuration) VALUES (?, ?)",
                              (identifier, encoded(configuration)))
