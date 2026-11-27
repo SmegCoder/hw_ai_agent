@@ -15,13 +15,15 @@ from unittest.mock import patch
 from agent_fixtures import PLAN, tool_call
 from hw_ai_agent import cli
 from hw_ai_agent.agent import DEFAULT_SYSTEM_PROMPT
+from hw_ai_agent.anthropic_market import Publication
 from hw_ai_agent.conversation import Conversation
 from hw_ai_agent.journal import ChangeJournal
 from hw_ai_agent.mcp import TRACKER
 from hw_ai_agent.model_catalog import Model
 from hw_ai_agent.pricing import Price, estimate_tokens
 from hw_ai_agent.session import SessionStore, encoded
-from hw_ai_agent.skills import SkillCatalog
+from hw_ai_agent.skill_market import ANTHROPIC_MARKET, SkillMarket
+from hw_ai_agent.skills import Skill, SkillCatalog
 from hw_ai_agent.tools import ToolRuntime
 
 
@@ -41,6 +43,16 @@ class ConversationCLITests(unittest.TestCase):
         self.schemas = []
         self.output_limits = []
         self.window = 20_000
+
+        card = Skill.parse("brand-guidelines", b"""---
+name: brand-guidelines
+description: >-
+  Apply consistent colors, type and spacing to documents, slide decks, charts and website layouts.
+  Includes guidance for headings, backgrounds, accessibility and examples for reusable templates.
+---
+Brand styling guidelines.
+""")
+        publication = Publication("a" * 40, {card.name: card}, {})
 
         environment = patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}, clear=True)
         environment.start()
@@ -71,6 +83,7 @@ class ConversationCLITests(unittest.TestCase):
         for temporary_patch in (
             patch.object(cli, "OpenAICompatibleClient", Client),
             patch.object(cli, "catalog_for", side_effect=self.catalog),
+            patch("hw_ai_agent.skill_market.read_publication", return_value=publication),
             patch("sys.stdin.isatty", return_value=True),
         ):
             temporary_patch.start()
@@ -216,12 +229,15 @@ class ConversationCLITests(unittest.TestCase):
         identifier = self.conversation_id()
         code, out, err = self.invoke("chat", "--resume", identifier, inputs=("/stats", "/end"))
         self.assertEqual(code, 0, err)
-        self.assertIn("обнаружено 3 · загрузок 0", out)
-        self.assertIn("обнаружено 3 · загрузок 2 · уникальных скиллов 2 · deadline-report × 1, open-task-export × 1", out)
+        discovered = set(SkillCatalog(self.workspace).skills)
+        self.assertIn(f"обнаружено {len(discovered)} · загрузок 0", out)
+        self.assertIn(f"обнаружено {len(discovered)} · загрузок 2 · уникальных скиллов 2"
+                      " · deadline-report × 1, open-task-export × 1", out)
         code, log, err = self.invoke("events", identifier)
         self.assertEqual(code, 0, err)
         events = [json.loads(line) for line in log.splitlines()]
-        self.assertEqual(sum(event["type"] == "skills_discovered" for event in events), 3)
+        self.assertEqual([set(event["data"]["names"]) for event in events if event["type"] == "skills_discovered"],
+                         [discovered, discovered, discovered])
         self.assertEqual([(event["data"]["name"], event["data"]["tool_call_id"])
                           for event in events if event["type"] == "skill_loaded"],
                          [("open-task-export", "open-skill"), ("deadline-report", "deadline-skill")])
@@ -591,10 +607,12 @@ class ConversationCLITests(unittest.TestCase):
 
     def test_context_warning_and_refusal_happen_before_model_request(self):
         prompt = "Первый вопрос"
-        catalog = SkillCatalog(self.workspace)
-        messages = [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT + catalog.prompt()},
+        market = SkillMarket(ANTHROPIC_MARKET, self.db, self.workspace)
+        runtime = ToolRuntime(self.workspace, skills=SkillCatalog(self.workspace), market=market)
+        skill_prompt, _ = runtime.prepare_skills()
+        messages = [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT + skill_prompt},
                     {"role": "user", "content": prompt}]
-        self.window = estimate_tokens(messages, ToolRuntime(self.workspace, skills=catalog).tool_schemas) + 240
+        self.window = estimate_tokens(messages, runtime.tool_schemas) + 240
         self.responses = [{"content": "Ответ."}]
         oversized = "Очень большой запрос " * 1_000
         code, out, err = self.start(prompt, oversized, "/tokens", "/end")
@@ -602,6 +620,7 @@ class ConversationCLITests(unittest.TestCase):
         self.assertIn("Контекст близок к пределу", err)
         self.assertIn("Запрос не отправлен", out)
         self.assertEqual(len(self.requests), 1)
+        self.assertIn("install_skill", self.schemas[0])
         with SessionStore(self.db) as store:
             turns = Conversation(store, self.conversation_id()).turns()
             self.assertEqual(turns[-1].state.status, "context_limit")
